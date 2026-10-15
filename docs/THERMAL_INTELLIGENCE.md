@@ -49,10 +49,13 @@ needs coverage, provenance and issuance-time checks before using future points.
   Horizons start at issuance, not a backdated sample. Extrapolate the sample's age
   under the same passive assumption and flag that extra extrapolation explicitly.
 - Within a contiguous model cohort, issue at most three references per 30 minutes.
-  Duplicate timestamps cannot create predictions or additional validation samples.
-- Missing/stale data, a gap over five minutes or reversed clocks cancel pending
-  comparisons. A fresh segment can start from the next valid snapshot; completed
-  quality measurements survive gaps. Restarts start empty, with no fabricated
+  Within each contiguous segment, duplicate indoor timestamps cannot create
+  predictions or additional validation samples. An unchanged outdoor timestamp
+  is allowed while the sample stays fresh.
+- Missing/stale data, a gap over five minutes in either sensor or reversed clocks
+  or sensor timestamps cancel pending comparisons. A fresh segment can start
+  from the next valid snapshot; completed quality measurements survive gaps.
+  Restarts start empty, with no fabricated
   history or resurrected pending forecasts.
 - Match the first distinct actual indoor measurement at or after each target,
   within two minutes. Never match an early measurement or interpolate a gap.
@@ -66,6 +69,8 @@ needs coverage, provenance and issuance-time checks before using future points.
 Keep at most 24 pending forecasts, three current references, one current batch of
 comparisons and 64 completed errors per horizon. Retain no raw temperature history.
 Expose sample counts, missed counts, signed bias, MAE and maximum absolute error.
+Sample count and errors cover the last 64 matches per horizon; missed count is
+cumulative within the current model cohort. They do not define a coverage ratio.
 No completed samples means unavailable metrics. Counts are descriptive and neither
 an empirical confidence score nor evidence of a validated no-heating model.
 

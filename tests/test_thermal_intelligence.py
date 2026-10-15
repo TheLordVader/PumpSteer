@@ -338,3 +338,97 @@ def test_dst_horizons_and_validation_use_physical_utc_time(start):
     for p in first:
         assert p.due_at.timestamp() - p.issued_at.timestamp() == p.horizon_minutes * 60
     assert engine.quality()[60].count == 1
+
+
+@pytest.mark.parametrize("sensor", ["indoor", "outdoor"])
+def test_each_sensor_reversal_cancels_before_due_forecasts_are_scored(sensor):
+    engine = ThermalDiagnostics()
+    for minute in (0, 5, 10, 15, 20, 25, 29):
+        _observe(engine, minute)
+    now = START + timedelta(minutes=30)
+    data = dict(
+        indoor=TemperatureMeasurement(21, now),
+        outdoor=TemperatureMeasurement(5, now),
+    )
+    data[sensor] = TemperatureMeasurement(
+        21 if sensor == "indoor" else 5, START + timedelta(minutes=28)
+    )
+    assert engine.observe(now=now, k_per_hour=0.05, model_fitted=True, **data) == ()
+    assert engine.status == "insufficient_data"
+    assert engine.pending_count == 0
+    assert all(q.count == 0 and q.missed_count == 1 for q in engine.quality().values())
+
+
+@pytest.mark.parametrize("sensor", ["indoor", "outdoor"])
+def test_each_sensor_gap_cancels_pending_even_if_the_other_stays_contiguous(sensor):
+    engine = ThermalDiagnostics()
+    _observe(engine, 0)
+    now = START + timedelta(minutes=5)
+    data = dict(
+        indoor=TemperatureMeasurement(21, now),
+        outdoor=TemperatureMeasurement(5, now),
+    )
+    data[sensor] = TemperatureMeasurement(
+        21 if sensor == "indoor" else 5, START + timedelta(minutes=4)
+    )
+    engine.observe(now=now, k_per_hour=0.05, model_fitted=True, **data)
+    new = _observe(engine, 10)
+    assert len(new) == 3
+    assert engine.pending_count == 3
+    assert all(p.issued_at == START + timedelta(minutes=10) for p in new)
+    assert all(q.count == 0 and q.missed_count == 1 for q in engine.quality().values())
+
+
+def test_duplicate_indoor_sample_does_not_hide_reversed_outdoor_sample():
+    engine = ThermalDiagnostics()
+    _observe(engine, 0)
+    _observe(engine, 2)
+    assert (
+        engine.observe(
+            now=START + timedelta(minutes=3),
+            indoor=TemperatureMeasurement(21, START + timedelta(minutes=2)),
+            outdoor=TemperatureMeasurement(5, START + timedelta(minutes=1)),
+            k_per_hour=0.05,
+            model_fitted=True,
+        )
+        == ()
+    )
+    assert engine.status == "insufficient_data"
+    assert engine.pending_count == 0
+
+
+def test_repeated_fresh_outdoor_sample_does_not_prevent_indoor_validation():
+    engine = ThermalDiagnostics()
+    for minute in (0, 5, 10, 15, 20, 25, 29):
+        _observe(engine, minute)
+    engine.observe(
+        now=START + timedelta(minutes=30),
+        indoor=TemperatureMeasurement(21, START + timedelta(minutes=30)),
+        outdoor=TemperatureMeasurement(5, START + timedelta(minutes=29)),
+        k_per_hour=0.05,
+        model_fitted=True,
+    )
+    assert engine.quality()[30].count == 1
+    assert engine.quality()[30].missed_count == 0
+
+
+def test_outdoor_refresh_is_remembered_when_indoor_sample_is_duplicated():
+    engine = ThermalDiagnostics()
+    _observe(engine, 0)
+    engine.observe(
+        now=START + timedelta(minutes=4),
+        indoor=TemperatureMeasurement(21, START),
+        outdoor=TemperatureMeasurement(5, START + timedelta(minutes=4)),
+        k_per_hour=0.05,
+        model_fitted=True,
+    )
+    engine.observe(
+        now=START + timedelta(minutes=6),
+        indoor=TemperatureMeasurement(21, START + timedelta(minutes=5)),
+        outdoor=TemperatureMeasurement(5, START + timedelta(minutes=6)),
+        k_per_hour=0.05,
+        model_fitted=True,
+    )
+    assert engine.pending_count == 3
+    assert engine.predictions[0].issued_at == START
+    assert all(q.missed_count == 0 for q in engine.quality().values())

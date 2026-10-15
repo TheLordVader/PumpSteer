@@ -124,6 +124,7 @@ class ThermalDiagnostics:
         self._model: tuple[float, bool] | None = None
         self._last_now: datetime | None = None
         self._last_measurement: datetime | None = None
+        self._last_outdoor_measurement: datetime | None = None
         self._last_issue: datetime | None = None
 
     @property
@@ -137,6 +138,7 @@ class ThermalDiagnostics:
         self.predictions = ()
         self.last_comparisons = ()
         self._last_measurement = None
+        self._last_outdoor_measurement = None
         self._last_issue = None
         self.status = "insufficient_data"
         self.reason = reason
@@ -164,7 +166,7 @@ class ThermalDiagnostics:
         self._last_now = clock
 
         tin, at, reason = _reading(indoor, "indoor", clock)
-        tout, _, outdoor_reason = _reading(outdoor, "outdoor", clock)
+        tout, outdoor_at, outdoor_reason = _reading(outdoor, "outdoor", clock)
         if reason or outdoor_reason:
             self._invalidate(reason or outdoor_reason)
             return ()
@@ -174,7 +176,7 @@ class ThermalDiagnostics:
 
         # Validated inputs above are non-optional from here onward.
         assert tin is not None and tout is not None and at is not None
-        assert k_per_hour is not None
+        assert outdoor_at is not None and k_per_hour is not None
         model = (float(k_per_hour), model_fitted is True)
         if model != self._model:
             self._invalidate("model_changed")
@@ -184,18 +186,27 @@ class ThermalDiagnostics:
             self._missed = dict.fromkeys(HORIZONS_MINUTES, 0)
 
         gap = False
-        if self._last_measurement is not None:
-            elapsed = (at - self._last_measurement).total_seconds()
+        for observed, previous in (
+            (at, self._last_measurement),
+            (outdoor_at, self._last_outdoor_measurement),
+        ):
+            if previous is None:
+                continue
+            elapsed = (observed - previous).total_seconds()
             if elapsed < 0:
                 self._invalidate("out_of_order_measurement")
                 return ()
-            if elapsed == 0:
-                self.reason = "duplicate_measurement"
-                return ()
             if elapsed > _MAX_GAP_SECONDS:
-                self._invalidate("measurement_gap")
                 gap = True
+        if gap:
+            self._invalidate("measurement_gap")
+        elif at == self._last_measurement:
+            # A duplicate indoor reading can still carry a new outdoor sample.
+            self._last_outdoor_measurement = outdoor_at
+            self.reason = "duplicate_measurement"
+            return ()
         self._last_measurement = at
+        self._last_outdoor_measurement = outdoor_at
 
         comparisons = []
         retained: deque[ThermalPrediction] = deque(maxlen=_MAX_PENDING)
