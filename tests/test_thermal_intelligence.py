@@ -193,31 +193,34 @@ def test_duplicate_measurements_cannot_issue_or_score_forecasts():
     assert all(q.count == 0 for q in engine.quality().values())
 
 
-def test_gap_cancels_pending_comparisons_and_starts_a_fresh_segment():
+def test_gap_preserves_pending_until_an_authentic_target_measurement():
     engine = ThermalDiagnostics()
     for minute in (0, 5, 10):
         _observe(engine, minute)
-    new = _observe(engine, 16)
-    assert len(new) == 3
+    assert _observe(engine, 16) == ()
     assert engine.pending_count == 3
-    assert all(p.issued_at == START + timedelta(minutes=16) for p in new)
-    assert all(q.count == 0 and q.missed_count == 1 for q in engine.quality().values())
+    assert all(q.count == 0 and q.missed_count == 0 for q in engine.quality().values())
+    _observe(engine, 30)
+    assert engine.quality()[30].count == 1
 
 
-def test_invalid_reading_preserves_completed_quality_but_drops_pending_work():
+def test_invalid_reading_preserves_completed_quality_and_unrelated_pending_work():
     engine = ThermalDiagnostics()
     for minute in range(0, 31, 5):
         _observe(engine, minute)
     before = engine.quality()[30]
+    pending = engine.pending_count
     assert _observe(engine, 35, indoor=None) == ()
-    assert engine.pending_count == 0
+    assert engine.pending_count == pending
     assert engine.predictions == ()
     assert engine.quality()[30].count == before.count
     assert engine.quality()[30].mae_c == before.mae_c
 
 
 @pytest.mark.parametrize("reverse_wall_clock", [True, False])
-def test_reversed_time_invalidates_pending_forecasts_and_recovers(reverse_wall_clock):
+def test_reversed_clock_cancels_but_reversed_sample_only_blocks_issuance(
+    reverse_wall_clock,
+):
     engine = ThermalDiagnostics()
     _observe(engine, 0)
     _observe(engine, 1)
@@ -233,23 +236,26 @@ def test_reversed_time_invalidates_pending_forecasts_and_recovers(reverse_wall_c
         )
         == ()
     )
-    assert engine.pending_count == 0
+    assert engine.pending_count == (0 if reverse_wall_clock else 3)
     assert engine.status == "insufficient_data"
-    assert len(_observe(engine, 3)) == 3
+    assert len(_observe(engine, 3)) == (3 if reverse_wall_clock else 0)
 
 
 @pytest.mark.parametrize("change", ["k", "fitted"])
-def test_quality_cohorts_do_not_mix_model_snapshots(change):
+def test_quality_cohorts_keep_old_records_and_do_not_bypass_cadence(change):
     engine = ThermalDiagnostics()
     for minute in range(0, 31, 5):
         _observe(engine, minute, fitted=False)
+    previous_version = engine.model_version
+    previous_pending = engine.pending_count
     assert engine.quality()[30].count == 1
     new = _observe(
         engine, 31, k=0.1 if change == "k" else 0.05, fitted=change == "fitted"
     )
-    assert len(new) == 3
+    assert new == ()
     assert all(q.count == 0 and q.mae_c is None for q in engine.quality().values())
-    assert engine.pending_count == 3
+    assert engine.quality(previous_version)[30].count == 1
+    assert engine.pending_count == previous_pending
 
 
 def test_restart_has_no_old_forecasts_or_fabricated_validation():
@@ -341,45 +347,41 @@ def test_dst_horizons_and_validation_use_physical_utc_time(start):
 
 
 @pytest.mark.parametrize("sensor", ["indoor", "outdoor"])
-def test_each_sensor_reversal_cancels_before_due_forecasts_are_scored(sensor):
+def test_sensor_reversal_blocks_issuance_but_only_valid_indoor_scores(sensor):
     engine = ThermalDiagnostics()
     for minute in (0, 5, 10, 15, 20, 25, 29):
         _observe(engine, minute)
     now = START + timedelta(minutes=30)
     data = dict(
-        indoor=TemperatureMeasurement(21, now),
-        outdoor=TemperatureMeasurement(5, now),
+        indoor=TemperatureMeasurement(21, now), outdoor=TemperatureMeasurement(5, now)
     )
     data[sensor] = TemperatureMeasurement(
         21 if sensor == "indoor" else 5, START + timedelta(minutes=28)
     )
     assert engine.observe(now=now, k_per_hour=0.05, model_fitted=True, **data) == ()
     assert engine.status == "insufficient_data"
-    assert engine.pending_count == 0
-    assert all(q.count == 0 and q.missed_count == 1 for q in engine.quality().values())
+    assert engine.pending_count == (3 if sensor == "indoor" else 2)
+    assert engine.quality()[30].count == (0 if sensor == "indoor" else 1)
 
 
 @pytest.mark.parametrize("sensor", ["indoor", "outdoor"])
-def test_each_sensor_gap_cancels_pending_even_if_the_other_stays_contiguous(sensor):
+def test_sensor_gap_does_not_cancel_unrelated_pending_targets(sensor):
     engine = ThermalDiagnostics()
     _observe(engine, 0)
     now = START + timedelta(minutes=5)
     data = dict(
-        indoor=TemperatureMeasurement(21, now),
-        outdoor=TemperatureMeasurement(5, now),
+        indoor=TemperatureMeasurement(21, now), outdoor=TemperatureMeasurement(5, now)
     )
     data[sensor] = TemperatureMeasurement(
         21 if sensor == "indoor" else 5, START + timedelta(minutes=4)
     )
     engine.observe(now=now, k_per_hour=0.05, model_fitted=True, **data)
-    new = _observe(engine, 10)
-    assert len(new) == 3
+    assert _observe(engine, 10) == ()
     assert engine.pending_count == 3
-    assert all(p.issued_at == START + timedelta(minutes=10) for p in new)
-    assert all(q.count == 0 and q.missed_count == 1 for q in engine.quality().values())
+    assert all(q.count == 0 and q.missed_count == 0 for q in engine.quality().values())
 
 
-def test_duplicate_indoor_sample_does_not_hide_reversed_outdoor_sample():
+def test_duplicate_indoor_sample_does_not_hide_untrustworthy_outdoor_issuance():
     engine = ThermalDiagnostics()
     _observe(engine, 0)
     _observe(engine, 2)
@@ -394,7 +396,7 @@ def test_duplicate_indoor_sample_does_not_hide_reversed_outdoor_sample():
         == ()
     )
     assert engine.status == "insufficient_data"
-    assert engine.pending_count == 0
+    assert engine.pending_count == 3
 
 
 def test_repeated_fresh_outdoor_sample_does_not_prevent_indoor_validation():
