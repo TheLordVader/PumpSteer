@@ -1,0 +1,20 @@
+SYNTHETISKA KONTRAKTSTESTER
+8 observationsfall + 5 värmescenarier; godkända assertions. Ingen husnoggrannhet eller HA-källsemantik validerad.
+1 Verifierad mättid: 3 passiva referenser; origin 12:00:00, registrerat 12:00:01, utfärdat 12:00:02.
+2 Endast mottagning/registrering: ingen TemperatureMeasurement; strikt utvärdering otillgänglig, givaren underkänns inte.
+3 Oförändrat 21 C med ny mättid: ett accepterat utfall; temperaturändring krävs inte.
+4 Samma mättid trots ny läsning/registrering: duplicate_measurement, inga nya prognoser eller utfall.
+5 Gles utomhusrapport: ålder 6 min blockerar nya referenser; gammalt 30-minutersutfall bedöms ändå; ny uteobservation återöppnar utfärdande.
+6 normal -> preheating: ny kontextepisod, heating_kind fortsatt unknown; ingen värmeintervallprognos begärs.
+7 Källbyte: gammalt värde spärras; ny session väntar på nya verifierade mätningar, inga korsvisa jämförelser.
+8 Omstart: restored eller för gammal mättid avvisas trots ny registrering; ingen replay eller återställd prognoshistorik.
+Värme: Vanlig avkylning utan identifierat tillskott: Tin=20.7 C, läge=braking, fel=+0.0950 C; värmebidrag okänt; utvärdering ja, k-inlärning nej.
+Värme: Brasa tänds (syntetiskt facit): Tin=21.3 C, läge=braking, fel=+0.6950 C; möjligt tillskott/modellavvikelse; utvärdering ja, k-inlärning nej.
+Värme: Eldning avtar, restvärme finns (syntetiskt facit): Tin=20.95 C, läge=braking, fel=+0.3450 C; värmebidrag okänt; utvärdering ja, k-inlärning nej.
+Värme: Sol ger samma förlopp (syntetiskt facit): Tin=21.3 C, läge=braking, fel=+0.6950 C; möjligt tillskott/modellavvikelse; utvärdering ja, k-inlärning nej.
+Värme: Normal värmepump och kvarvarande extern värme (facit): Tin=21.3 C, läge=normal, fel=+0.6950 C; möjligt tillskott/modellavvikelse; utvärdering ja, k-inlärning nej.
+Kompletterande värmekälla: endast designförslag i planen; ingen inställning eller framtida träningsgrind är implementerad/testad här.
+
+Verifiering: Python 3.14.8; auditfilens Ruff lint/format godkända.
+Git: HEAD d010a8d0715d8c25c978f6d0e16302ac09447e05, branch fix/thermal-evaluation-review, arbetsyta ren; inga spårade filer ändrade.
+Leverans: endast PLAN.md, dry_run.py och detta resultat i lokal auditkatalog.
