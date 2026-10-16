@@ -19,7 +19,18 @@ _MAX_EVALUATIONS_PER_HORIZON: Final = 64
 _MAX_SAMPLE_AGE_SECONDS: Final = 300
 _MATCH_TOLERANCE_SECONDS: Final = 120
 _ISSUE_INTERVAL_SECONDS: Final = 1800
-_OPERATING_MODES: Final = ("unknown", "braking", "preheating", "normal")
+_OPERATING_MODES: Final = (
+    "unknown",
+    "braking",
+    "preheating",
+    "normal",
+    "pre_braking",
+    "brake_hold",
+    "recovery",
+    "precool",
+    "safe_mode",
+    "sensor_interruption",
+)
 _WARNINGS: Final = (
     "heating_input_unknown",
     "residual_heat_unmodelled",
