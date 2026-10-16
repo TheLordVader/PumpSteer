@@ -135,3 +135,32 @@ def test_invalid_context_breaks_continuity_before_later_valid_observations(bad):
     assert tracker.observe(when, "normal", **kwargs) is None
     recovered = tracker.observe(at(2), "normal", heating_kind="estimated")
     assert recovered.number != first.number
+
+
+@pytest.mark.parametrize("bad", ["heat", "time", "flag"])
+def test_invalid_context_cannot_hide_clock_reversal_or_reuse_old_history(bad):
+    tracker = EpisodeTracker("run-a")
+    old = tracker.observe(at(0), "normal", heating_kind="estimated")
+    tracker.observe(at(4), "normal", heating_kind="estimated")
+    when = at(5).replace(tzinfo=None) if bad == "time" else at(5)
+    kwargs = {"heating_kind": "invented" if bad == "heat" else "estimated"}
+    if bad == "flag":
+        kwargs["sensor_valid"] = "not-a-boolean"
+    assert tracker.observe(when, "normal", **kwargs) is None
+    assert tracker.observe(at(2), "normal", heating_kind="estimated") is None
+    assert tracker.reason == "clock_reset"
+    assert tracker.episode_at(at(1)) is None
+    recovered = tracker.observe(at(3), "normal", heating_kind="estimated")
+    assert recovered.epoch != old.epoch
+    assert recovered.boundary_reason == "clock_reset"
+    assert tracker.episode_at(at(3)) == recovered
+    assert tracker.episode_at(at(1)) is None
+
+
+def test_valid_timestamp_with_invalid_metadata_still_advances_trusted_clock():
+    tracker = EpisodeTracker("run-a")
+    tracker.observe(at(0), "normal")
+    assert tracker.observe(at(5), "normal", heating_kind="invalid") is None
+    assert tracker.observe(at(4), "normal") is None
+    assert tracker.reason == "clock_reset"
+    assert tracker.observe(at(4.5), "normal") is not None

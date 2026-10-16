@@ -9,7 +9,11 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from .thermal_episodes import ThermalEpisode, episode_exposure, utc_time
-from .thermal_intelligence import ThermalComparison, ThermalPrediction
+from .thermal_intelligence import (
+    _MATCH_TOLERANCE_SECONDS,
+    ThermalComparison,
+    ThermalPrediction,
+)
 
 
 @dataclass(frozen=True)
@@ -48,6 +52,10 @@ class ForecastAssessment:
     covered: bool | None
     lower_breach_c: float | None
     interval_status: str
+    interval_kind: str | None
+    interval_at: datetime | None
+    interval_lower_c: float | None
+    interval_upper_c: float | None
 
 
 def _range(value: tuple[float, float], low: float, high: float) -> bool:
@@ -81,6 +89,24 @@ def _extreme(
     if hours <= crossing:
         return _response(tin, tout, k_below, heat, hours)
     return _response(tout, tout, k_above, heat, hours - crossing)
+
+
+def _interval_at(
+    reference: ThermalPrediction, assumptions: ForecastAssumptions, at: datetime
+) -> tuple[float, float]:
+    """Only issuance-frozen inputs and target time; never an observed outcome."""
+    kl, kh = assumptions.k_bounds
+    tl, th = assumptions.outdoor_bounds
+    ql, qh = assumptions.heat_bounds
+    error = assumptions.sensor_error_c
+    hours = (at - reference.origin_at).total_seconds() / 3600
+    lower = (
+        _extreme(reference.indoor_temperature_c - error, tl, kl, kh, ql, hours) - error
+    )
+    upper = (
+        _extreme(reference.indoor_temperature_c + error, th, kh, kl, qh, hours) + error
+    )
+    return lower, upper
 
 
 def make_episode_forecast(
@@ -142,12 +168,7 @@ def make_episode_forecast(
     ):
         return None, "source_outside_assumed_bounds"
     hours = (reference.due_at - reference.origin_at).total_seconds() / 3600
-    lower = (
-        _extreme(reference.indoor_temperature_c - error, tl, kl, kh, ql, hours) - error
-    )
-    upper = (
-        _extreme(reference.indoor_temperature_c + error, th, kh, kl, qh, hours) + error
-    )
+    lower, upper = _interval_at(reference, assumptions, reference.due_at)
     point = _response(
         reference.indoor_temperature_c,
         reference.outdoor_temperature_c,
@@ -174,7 +195,11 @@ def assess_forecast(
     observation: ThermalComparison,
     target_episode: ThermalEpisode | None = None,
 ) -> ForecastAssessment:
-    """Keep transitions/unknown context separate; never discard their errors."""
+    """Keep nominal point error; assess bounds separately at authentic sample time.
+
+    Late samples need frozen assumptions covering the full source-to-sample span.
+    Exact-target and time-adjusted intervals must be reported separately.
+    """
     if observation.prediction is not forecast.reference:
         raise ValueError(
             "Observation belongs to a different original forecast instance"
@@ -184,14 +209,29 @@ def assess_forecast(
     )
     exposure = episode_exposure(forecast.episode, target_episode, observation.actual_at)
     error = actual - forecast.point_c if actual is not None else None
-    on_target = (
-        actual is not None and observation.actual_at == forecast.reference.due_at
-    )
-    interval_status = (
-        "no_observation"
-        if actual is None
-        else ("evaluated" if on_target else "off_target_time")
-    )
+    at = utc_time(observation.actual_at)
+    interval_kind = interval_at = lower = upper = None
+    if actual is None:
+        interval_status = "no_observation"
+    elif at is None:
+        interval_status = "invalid_observation_time"
+    elif (
+        not 0
+        <= (at - forecast.reference.due_at).total_seconds()
+        <= _MATCH_TOLERANCE_SECONDS
+    ):
+        interval_status = "outside_match_tolerance"
+    elif forecast.assumptions.valid_until < at:
+        interval_status = "insufficient_time_coverage"
+    else:
+        interval_status = "evaluated"
+        interval_at = at
+        if at == forecast.reference.due_at:
+            interval_kind = "exact_target"
+            lower, upper = forecast.lower_c, forecast.upper_c
+        else:
+            interval_kind = "time_adjusted"
+            lower, upper = _interval_at(forecast.reference, forecast.assumptions, at)
     return ForecastAssessment(
         forecast,
         observation,
@@ -199,7 +239,11 @@ def assess_forecast(
         exposure,
         error,
         max(0.0, -error) if error is not None else None,
-        forecast.lower_c <= actual <= forecast.upper_c if on_target else None,
-        max(0.0, forecast.lower_c - actual) if on_target else None,
+        lower <= actual <= upper if lower is not None else None,
+        max(0.0, lower - actual) if lower is not None else None,
         interval_status,
+        interval_kind,
+        interval_at,
+        lower,
+        upper,
     )

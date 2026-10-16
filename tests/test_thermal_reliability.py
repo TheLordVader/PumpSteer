@@ -196,7 +196,7 @@ def test_late_actual_keeps_point_error_but_cannot_score_due_time_interval():
     result = assess_forecast(f, c, replace(e, observed_until=actual_at))
     assert result.error_c < 0 and result.cooling_underestimation_c > 0
     assert result.covered is None and result.lower_breach_c is None
-    assert result.interval_status == "off_target_time"
+    assert result.interval_status == "insufficient_time_coverage"
 
 
 def test_structurally_identical_foreign_reference_cannot_cross_run_boundaries():
@@ -210,3 +210,142 @@ def test_structurally_identical_foreign_reference_cannot_cross_run_boundaries():
     )
     with pytest.raises(ValueError):
         assess_forecast(f, c, replace(e, observed_until=p.due_at))
+
+
+@pytest.mark.parametrize(
+    "offset,status,kind",
+    [
+        (-1, "outside_match_tolerance", None),
+        (0, "evaluated", "exact_target"),
+        (1, "evaluated", "time_adjusted"),
+        (59, "evaluated", "time_adjusted"),
+        (120, "evaluated", "time_adjusted"),
+        (121, "outside_match_tolerance", None),
+    ],
+)
+def test_interval_time_contract_preserves_nominal_point_and_checks_tolerance(
+    offset, status, kind
+):
+    refs, e, a = setup()
+    p = refs[0]
+    f, _ = make_episode_forecast(p, e, a)
+    before = replace(f)
+    actual_at = p.due_at + timedelta(seconds=offset)
+    actual = 5 + 16 * math.exp(-0.05 * (1800 + offset) / 3600)
+    c = ThermalComparison(
+        p, actual_at, actual, actual - p.temperature_c, offset, actual_at, "evaluated"
+    )
+    result = assess_forecast(f, c)
+    assert result.interval_status == status
+    assert result.interval_kind == kind
+    assert result.error_c == pytest.approx(actual - f.point_c)
+    assert c.error_c == actual - p.temperature_c
+    if kind is None:
+        assert result.covered is None and result.interval_lower_c is None
+        assert result.interval_at is None
+    else:
+        assert result.interval_at == actual_at
+        assert result.interval_lower_c == pytest.approx(actual)
+        assert result.interval_upper_c == pytest.approx(actual)
+        assert result.lower_breach_c == pytest.approx(0, abs=1e-12)
+    assert f == before and f.reference is p
+
+
+@pytest.mark.parametrize("coverage_seconds", [58, 59])
+def test_one_second_issue_offset_uses_frozen_inputs_despite_revision_and_missing_outdoor(
+    coverage_seconds,
+):
+    engine = ThermalDiagnostics()
+    issued_at = START + timedelta(seconds=1)
+    tracker = EpisodeTracker("run-a")
+    tracker.observe(START, "normal", heating_kind="estimated")
+    episode = tracker.observe(issued_at, "normal", heating_kind="estimated")
+    p = engine.observe(
+        now=issued_at,
+        indoor=TemperatureMeasurement(21, START),
+        outdoor=TemperatureMeasurement(5, START),
+        k_per_hour=0.05,
+        operating_mode="normal",
+    )[0]
+    _, _, a = setup()
+    a = replace(a, valid_until=p.due_at + timedelta(seconds=coverage_seconds))
+    f, _ = make_episode_forecast(p, episode, a)
+    original = replace(f)
+    actual_at = START + timedelta(minutes=31)
+    engine.observe(
+        now=actual_at,
+        indoor=TemperatureMeasurement(20.1, actual_at),
+        outdoor=None,
+        k_per_hour=0.09,
+        model_fitted=True,
+        operating_mode="normal",
+    )
+    c = engine.last_comparisons[0]
+    assert c.prediction is p and c.lateness_seconds == 59
+    assert engine.model_version != p.model_version
+    assert engine.reason == "missing_outdoor"
+    result = assess_forecast(f, c)
+    other = assess_forecast(f, replace(c, actual_temperature_c=22))
+    assert result.interval_status == (
+        "evaluated" if coverage_seconds == 59 else "insufficient_time_coverage"
+    )
+    assert result.error_c == pytest.approx(20.1 - p.temperature_c)
+    assert result.interval_lower_c == other.interval_lower_c
+    assert result.interval_upper_c == other.interval_upper_c
+    if coverage_seconds == 59:
+        assert result.interval_lower_c == pytest.approx(20.591958153837354)
+        assert result.interval_kind == "time_adjusted"
+        assert result.covered is False and other.covered is False
+    else:
+        assert result.covered is None and result.interval_kind is None
+    assert f == original and f.reference is p and f.assumptions is original.assumptions
+
+
+def test_interval_is_independent_of_whether_later_outcome_is_contained():
+    refs, e, a = setup()
+    p = refs[0]
+    f, _ = make_episode_forecast(p, e, replace(a, heat_bounds=(0.0, 1.0)))
+    actual_at = p.due_at + timedelta(seconds=59)
+    c = ThermalComparison(p, actual_at, 20.8, None, 59, actual_at, "evaluated")
+    inside = assess_forecast(f, c)
+    outside = assess_forecast(f, replace(c, actual_temperature_c=30))
+    assert inside.covered is True and outside.covered is False
+    assert inside.interval_lower_c == outside.interval_lower_c
+    assert inside.interval_upper_c == outside.interval_upper_c
+    assert inside.interval_at == outside.interval_at == actual_at
+
+
+def test_four_hours_of_minute_samples_and_one_second_issue_lag_have_17_intervals():
+    engine = ThermalDiagnostics()
+    tracker = EpisodeTracker("minute-samples")
+    forecasts = {}
+    assessments = []
+    for minute in range(241):
+        measured_at = START + timedelta(minutes=minute)
+        now = measured_at + timedelta(seconds=1)
+        tracker.observe(measured_at, "normal", heating_kind="estimated")
+        episode = tracker.observe(now, "normal", heating_kind="estimated")
+        refs = engine.observe(
+            now=now,
+            indoor=TemperatureMeasurement(21, measured_at),
+            outdoor=TemperatureMeasurement(5, measured_at),
+            k_per_hour=0.05,
+            operating_mode="normal",
+        )
+        for p in refs:
+            _, _, a = setup()
+            f, reason = make_episode_forecast(
+                p,
+                episode,
+                replace(
+                    a, valid_from=measured_at, valid_until=now + timedelta(minutes=122)
+                ),
+            )
+            assert reason == ""
+            forecasts[id(p)] = f
+        for c in engine.last_comparisons:
+            assessments.append(assess_forecast(forecasts.pop(id(c.prediction)), c))
+    assert len(assessments) == 17
+    assert all(a.interval_kind == "time_adjusted" for a in assessments)
+    assert all(a.interval_status == "evaluated" for a in assessments)
+    assert all(a.observation.lateness_seconds == 59 for a in assessments)

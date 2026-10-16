@@ -68,6 +68,7 @@ class EpisodeTracker:
         self._history: deque[ThermalEpisode] = deque(maxlen=32)
         self.current: ThermalEpisode | None = None
         self._last: datetime | None = None
+        self._last_clock: datetime | None = None
         self.reason = "start"
 
     @property
@@ -108,6 +109,17 @@ class EpisodeTracker:
         brake_releasing: bool = False,
     ) -> ThermalEpisode | None:
         at = utc_time(at)
+        # Metadata can break continuity without erasing authentic clock evidence.
+        if at is not None:
+            reversed_clock = self._last_clock is not None and at < self._last_clock
+            self._last_clock = at
+            if reversed_clock:
+                if self._last is not None:
+                    self._close(self._last)
+                self._epoch += 1
+                self._last = None
+                self.reason = "clock_reset"
+                return None
         invalid_flags = not isinstance(sensor_valid, bool) or not isinstance(
             brake_releasing, bool
         )
@@ -129,12 +141,6 @@ class EpisodeTracker:
             category = "sensor_interruption"
         elif source == "normal" and brake_releasing:
             category = "recovery"
-        if self._last is not None and at < self._last:
-            self._close(self._last)
-            self._epoch += 1
-            self._last = None
-            self.reason = "clock_reset"
-            return None
         signature = (category, source, heating_kind)
         previous = (
             (self.current.mode, self.current.source_mode, self.current.heating_kind)

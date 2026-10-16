@@ -1,6 +1,7 @@
 """Finite independent-episode shadow validation; no runtime or live integration."""
 
 import math
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 
 from custom_components.pumpsteer.thermal_episodes import (
@@ -110,6 +111,15 @@ def truth(c):
             heat = residual = 0.0
         elif shift == "solar_gain":
             heat += 3.0
+        # Separate paired surprises: inputs/history are identical through t=40.
+        # This metadata is consumed only by ground truth, never by issuance.
+        disturbance = c.get("disturbance") if minute >= 40 else None
+        if disturbance == "heat_loss":
+            heat = residual = 0.0
+        elif disturbance == "heat_gain":
+            heat += 2.0
+        elif disturbance == "cold_front":
+            tout -= 5 * (minute - 40) / 60
         measured = tin + 0.015 * math.sin(1.9 * minute + c["id"] / 3)
         readings[minute] = (measured, tout)
         dt = 1 / 60
@@ -328,11 +338,18 @@ def records(data, calibration):
                     else ("evaluated" if on_target else "off_target_time")
                 )
             )
+            interval_kind = "exact_target" if covered is not None else None
+            assessed_low, assessed_high = (low, high) if on_target else (None, None)
             if method == "bounded_heat_balance" and assessment is not None:
                 covered, lower_breach, interval_status = (
                     assessment.covered,
                     assessment.lower_breach_c,
                     assessment.interval_status,
+                )
+                interval_kind = assessment.interval_kind
+                assessed_low, assessed_high = (
+                    assessment.interval_lower_c,
+                    assessment.interval_upper_c,
                 )
             rejection = None
             if values is None:
@@ -354,6 +371,7 @@ def records(data, calibration):
                     initial_mode=c["initial_mode"],
                     variant=c["variant"],
                     shift_kind=c["shift_kind"],
+                    scenario=c.get("disturbance", "reference"),
                     heating_kind=c["heating_kind"],
                     horizon=h,
                     method=method,
@@ -361,9 +379,28 @@ def records(data, calibration):
                     status=status if values is not None else "rejected",
                     rejection=rejection,
                     error=error,
+                    point_c=point,
+                    nominal_lower_c=low,
+                    nominal_upper_c=high,
+                    origin_at=p.origin_at.isoformat() if p else None,
+                    issued_at=p.issued_at.isoformat() if p else None,
+                    due_at=p.due_at.isoformat() if p else None,
+                    actual_at=outcome.actual_at.isoformat()
+                    if outcome and outcome.actual_at
+                    else None,
+                    actual_temperature_c=actual,
                     covered=covered,
                     lower_breach=lower_breach,
                     interval_status=interval_status,
+                    interval_kind=interval_kind,
+                    interval_at=outcome.actual_at.isoformat()
+                    if interval_kind
+                    else None,
+                    assessed_lower_c=assessed_low,
+                    assessed_upper_c=assessed_high,
+                    assessed_width=assessed_high - assessed_low
+                    if assessed_low is not None
+                    else None,
                     width=high - low if low is not None else None,
                     exposure=exposure,
                     model_k=p.k_per_hour if p else None,
@@ -383,13 +420,13 @@ def summarize(rows, by=("dataset", "method", "horizon")):
     result = []
     for key, group in sorted(groups.items()):
         errors = [r["error"] for r in group if r["error"] is not None]
-        intervals = [r for r in group if r["covered"] is not None]
         widths = [r["width"] for r in group if r["width"] is not None]
         issued = sum(r["issued"] for r in group)
         metric = dict(zip(by, key))
         metric.update(
             attempted=len(group),
             issued=issued,
+            observed=sum(r.get("actual_temperature_c") is not None for r in group),
             evaluated=len(errors),
             admission=issued / len(group),
             evaluation_coverage=len(errors) / issued if issued else None,
@@ -403,19 +440,45 @@ def summarize(rows, by=("dataset", "method", "horizon")):
             worst_cooling_underestimation_c=max(max(0.0, -e) for e in errors)
             if errors
             else None,
-            uncertainty_evaluated=len(intervals),
-            interval_timing_coverage=len(intervals)
-            / sum(r["error"] is not None and r["width"] is not None for r in group)
-            if any(r["error"] is not None and r["width"] is not None for r in group)
-            else None,
-            uncertainty_coverage=sum(r["covered"] for r in intervals) / len(intervals)
-            if intervals
-            else None,
-            worst_lower_breach_c=max(r["lower_breach"] for r in intervals)
-            if intervals
-            else None,
-            mean_interval_width_c=sum(widths) / len(widths) if widths else None,
+            mean_nominal_interval_width_c=sum(widths) / len(widths) if widths else None,
+            rejections=dict(
+                Counter(
+                    r.get("rejection", "unspecified") for r in group if not r["issued"]
+                )
+            ),
+            missing_outcomes=dict(
+                Counter(
+                    r["status"] for r in group if r["issued"] and r["error"] is None
+                )
+            ),
+            unassessable_intervals=dict(
+                Counter(
+                    r["interval_status"]
+                    for r in group
+                    if r["width"] is not None and r["covered"] is None
+                )
+            ),
+            intervals={},
         )
+        for kind in ("exact_target", "time_adjusted"):
+            intervals = [
+                r
+                for r in group
+                if r.get("interval_kind") == kind and r["covered"] is not None
+            ]
+            metric["intervals"][kind] = dict(
+                count=len(intervals),
+                coverage=sum(r["covered"] for r in intervals) / len(intervals)
+                if intervals
+                else None,
+                mean_width_c=sum(r["assessed_width"] for r in intervals)
+                / len(intervals)
+                if intervals
+                else None,
+                worst_lower_breach_c=max(r["lower_breach"] for r in intervals)
+                if intervals
+                else None,
+            )
         result.append(metric)
     return result
 
@@ -428,27 +491,43 @@ def benchmark():
         case(85, "holdout", 0, special="sensor_interruption"),
     ]
     shifted = [case(i + 86, "shift", i) for i in range(21)]
+    surprises = []
+    for i, disturbance in enumerate(("heat_loss", "heat_gain", "cold_front")):
+        reference = case(107 + i, "surprise", 7)
+        reference.update(variant="regular", heating_kind="known")
+        surprises.extend((reference, dict(reference, disturbance=disturbance)))
     calibration = calibrate(training)
     before = dict(calibration)
     all_rows = [
-        row for c in holdout + shifted for row in records(run_case(c), calibration)
+        row
+        for c in holdout + shifted + surprises
+        for row in records(run_case(c), calibration)
     ]
-    paired = {
-        (r["id"], r["horizon"])
-        for r in all_rows
-        if r["method"] == "bounded_heat_balance" and r["issued"]
-    }
+    groups = {}
+    for r in all_rows:
+        key = (r["dataset"], r["id"], r["scenario"], r["horizon"])
+        groups.setdefault(key, []).append(r)
+    common = [
+        r
+        for group in groups.values()
+        if all(r["error"] is not None for r in group)
+        for r in group
+    ]
     return dict(
         training_ids=[c["id"] for c in training],
         holdout_ids=[c["id"] for c in holdout],
         shift_ids=[c["id"] for c in shifted],
+        surprise_pair_ids=sorted({c["id"] for c in surprises}),
         calibration_frozen_before_holdout=calibration == before,
         calibration={
             f"{mode}:{h}": values for (mode, h), values in calibration.items()
         },
         summary=summarize(all_rows),
-        paired_summary=summarize(
-            [r for r in all_rows if (r["id"], r["horizon"]) in paired]
+        paired_summary=summarize(common),
+        common_records=common,
+        surprise_summary=summarize(
+            [r for r in all_rows if r["dataset"] == "surprise"],
+            by=("scenario", "method", "horizon"),
         ),
         conditions=summarize(
             all_rows,
