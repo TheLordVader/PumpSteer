@@ -42,7 +42,7 @@ never a control/safety guarantee. No PI or brake tuning follows from these score
 
 Validation:
 
-- Upstream baseline: 292 tests passed; candidate follow-up: 427 tests passed.
+- Upstream baseline: 292 tests passed; candidate follow-up: 432 tests passed.
 - New tests first failed for qualification/persistence/bounds; review findings
   (source changes mixing series, historical fit counts and ambiguous legacy restore) were reproduced and fixed.
 - Ruff, targeted Ruff format, fatal/import Flake8, version check and diff check passed.

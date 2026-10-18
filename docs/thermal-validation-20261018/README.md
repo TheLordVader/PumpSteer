@@ -34,7 +34,10 @@ integration probe, not a full HA configuration or physical hardware test.
 
 `runtime-sha256.json`, `native-runtime-sha256.json` and `final-checks.json` now
 refer to the corrected candidate. The original results below are retained as
-history; current CI results follow after publication. The 20 synthetic control
+history. Fork CI for runtime commit `5f697084` passed:
+[Python 3.12/3.13/3.14, Ruff and format](https://github.com/TheLordVader/PumpSteer/actions/runs/39109194408),
+[Hassfest](https://github.com/TheLordVader/PumpSteer/actions/runs/39109194685), and
+[HACS](https://github.com/TheLordVader/PumpSteer/actions/runs/39109194684). The 20 synthetic control
 output cases still match the original upstream snapshot. 41 existing controller
 methods match upstream AST after removing only the old training calls; control,
 price, forecast, Ohmigo, Relay Guard and settings modules remain byte-identical.
