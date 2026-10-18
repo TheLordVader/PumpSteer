@@ -1,0 +1,20 @@
+{
+  "methods_same_except_removed_learning_calls": {
+    "_do_update": true,
+    "_set_state": true,
+    "_enter_safe_mode": true,
+    "_pi_output": true,
+    "_update_brake_ramp": true,
+    "_update_preheat_ramp": true
+  },
+  "byte_identical_modules": [
+    "ohmigo.py",
+    "relay_guard.py",
+    "control.py",
+    "forecast.py",
+    "electricity_price.py",
+    "settings.py",
+    "utils.py",
+    "__init__.py"
+  ]
+}

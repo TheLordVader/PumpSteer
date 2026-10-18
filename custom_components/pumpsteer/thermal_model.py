@@ -99,7 +99,7 @@ class ThermalModel:
         self._sample_count: int = 0
 
         # Braking samples accumulated since the last fit cycle.
-        self._samples: list[ThermalSample] = []
+        self._samples: Deque[ThermalSample] = deque(maxlen=240)
 
         # Ring buffer of (timestamp, indoor_temp) used to estimate cooling rate.
         self._temp_history: Deque[tuple[datetime, float]] = deque(
@@ -130,21 +130,33 @@ class ThermalModel:
 
     # ── Persistence ────────────────────────────────────────────────────────────
 
-    def restore_k(self, k: float) -> None:
+    def restore_k(self, k: float, sample_count: int = 0) -> None:
         """
         Restore k from previously saved state.
 
         Intended to be called once during startup before the first
         update cycle.
         """
-        if _K_MIN < k < _K_MAX:
-            self._k = k
+        if (
+            isinstance(k, (int, float))
+            and not isinstance(k, bool)
+            and math.isfinite(k)
+            and _K_MIN < k < _K_MAX
+        ):
+            self._k = float(k)
             self._valid = True
+            self._sample_count = (
+                sample_count if type(sample_count) is int and sample_count >= 0 else 0
+            )
             _LOGGER.debug("ThermalModel: restored k=%.4f from state", k)
         else:
-            _LOGGER.debug(
-                "ThermalModel: restored k=%.4f is out of range, using fallback", k
-            )
+            _LOGGER.debug("ThermalModel: invalid restored coefficient ignored")
+
+    def clear_history(self, *, samples: bool = False) -> None:
+        """Break observation continuity without discarding a valid fitted k."""
+        self._temp_history.clear()
+        if samples:
+            self._samples.clear()
 
     # ── Sample collection ──────────────────────────────────────────────────────
 

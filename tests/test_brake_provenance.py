@@ -41,7 +41,10 @@ def _sensor():
     )
     hass = SimpleNamespace(
         states=SimpleNamespace(get=states.get),
-        bus=SimpleNamespace(async_listen_once=lambda event, callback: None),
+        bus=SimpleNamespace(
+            async_listen_once=lambda event, callback: None,
+            async_listen=lambda event, callback: lambda: None,
+        ),
         is_running=False,
     )
     return PumpSteerSensor(hass, entry), states

@@ -42,7 +42,12 @@ def _sensor():
 def _cycle(sensor, monkeypatch, minute):
     now = datetime(2026, 10, 11, 8, tzinfo=timezone.utc) + timedelta(minutes=minute)
     monkeypatch.setattr(sensor_module.dt_util, "now", lambda: now)
-    asyncio.run(sensor._do_update())
+    for name in ("sensor.indoor", "sensor.outdoor"):
+        state = sensor.hass.states.get(name)
+        if state is not None:
+            state.last_reported = now
+            state.attributes["unit_of_measurement"] = "°C"
+    asyncio.run(sensor.async_update())
 
 
 @pytest.mark.parametrize(

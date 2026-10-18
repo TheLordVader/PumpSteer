@@ -1,0 +1,44 @@
+[
+  {
+    "name": "pytest",
+    "command": "python3 -m pytest -q",
+    "exit_code": 0,
+    "output": "........................................................................ [ 17%]\n........................................................................ [ 34%]\n........................................................................ [ 52%]\n........................................................................ [ 69%]\n........................................................................ [ 87%]\n.....................................................                    [100%]\n413 passed in 0.39s\n"
+  },
+  {
+    "name": "ruff",
+    "command": "ruff check custom_components/pumpsteer tests",
+    "exit_code": 0,
+    "output": "All checks passed!\n"
+  },
+  {
+    "name": "format",
+    "command": "ruff format --check custom_components/pumpsteer/thermal_model.py custom_components/pumpsteer/thermal_observer.py custom_components/pumpsteer/thermal_intelligence.py custom_components/pumpsteer/sensor.py tests/test_thermal_observer.py tests/test_thermal_intelligence.py tests/test_thermal_evaluation.py tests/test_thermal_measurement_hygiene.py tests/test_brake_provenance.py tests/thermal_core_probe.py",
+    "exit_code": 0,
+    "output": "10 files already formatted\n"
+  },
+  {
+    "name": "flake8",
+    "command": "python3 -m flake8 custom_components/pumpsteer --select=E9,F63,F7,F82,F401",
+    "exit_code": 0,
+    "output": ""
+  },
+  {
+    "name": "version",
+    "command": "python3 scripts/check_version.py",
+    "exit_code": 0,
+    "output": "PumpSteer version validation passed: 2.2.3\n"
+  },
+  {
+    "name": "diff",
+    "command": "git diff --check",
+    "exit_code": 0,
+    "output": ""
+  },
+  {
+    "name": "control_outputs",
+    "command": "cmp docs/thermal-validation-20261018/output-base.json docs/thermal-validation-20261018/output-head.json",
+    "exit_code": 0,
+    "output": ""
+  }
+]

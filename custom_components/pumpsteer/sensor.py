@@ -6,13 +6,14 @@ from typing import Any, Dict, List, Optional, Tuple
 import homeassistant.util.dt as dt_util
 from homeassistant.components.sensor import SensorEntity
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers.typing import StateType
 
-from .thermal_model import ThermalModel
+from .thermal_model import ThermalModel, _MIN_SAMPLES
+from .thermal_observer import ThermalObserver
 
 from .control import PIController
 from .electricity_price import (
@@ -118,6 +119,9 @@ class PumpSteerSensor(RestoreEntity):
         self._pi = PIController()
         self._pi_precool_paused: bool = False
         self._thermal_model = ThermalModel()
+        self._thermal_observer = ThermalObserver(self._thermal_model)
+        self._thermal_reload_unsub = None
+        self._thermal_sources = self._thermal_source_ids()
         self._last_outlook: Optional[Any] = None
         self._last_pi_result = None
 
@@ -223,16 +227,23 @@ class PumpSteerSensor(RestoreEntity):
 
         class _BrakeData(ExtraStoredData):
             def __init__(
-                self, brake_ramp, brake_last_t, brake_last_expensive_t, was_braking
+                self,
+                brake_ramp,
+                brake_last_t,
+                brake_last_expensive_t,
+                was_braking,
+                thermal_model,
             ):
                 self.brake_ramp = brake_ramp
                 self.brake_last_t = brake_last_t
                 self.brake_last_expensive_t = brake_last_expensive_t
                 self.was_braking = was_braking
+                self.thermal_model = thermal_model
 
             def as_dict(self):
                 return {
                     _RESTORE_WAS_BRAKING: self.was_braking,
+                    "thermal_model": self.thermal_model,
                     _RESTORE_BRAKE_RAMP: self.brake_ramp,
                     _RESTORE_BRAKE_LAST_T: (
                         self.brake_last_t.isoformat() if self.brake_last_t else None
@@ -249,6 +260,11 @@ class PumpSteerSensor(RestoreEntity):
             self._brake_last_t,
             self._brake_last_expensive_t,
             self._was_braking_last_cycle,
+            {
+                "k": self._thermal_model.k,
+                "valid": self._thermal_model.is_valid,
+                "sample_count": self._thermal_model.sample_count,
+            },
         )
 
     async def async_added_to_hass(self) -> None:
@@ -299,9 +315,30 @@ class PumpSteerSensor(RestoreEntity):
             self._brake_last_expensive_t,
         )
 
-        saved_k = self._attributes.get("thermal_k")
-        if saved_k is not None:
-            self._thermal_model.restore_k(float(saved_k))
+        saved_model = (
+            extra.as_dict().get("thermal_model", {}) if extra is not None else {}
+        )
+        if isinstance(saved_model, dict) and saved_model.get("valid") is True:
+            self._thermal_model.restore_k(
+                saved_model.get("k"), saved_model.get("sample_count", 0)
+            )
+        elif (
+            (extra is None or "thermal_model" not in extra.as_dict())
+            and self._attributes.get("thermal_k_valid") is True
+            and type(self._attributes.get("thermal_k_samples")) is int
+            and self._attributes["thermal_k_samples"] >= _MIN_SAMPLES
+        ):
+            # Older code could restore fallback as valid with count=0.
+            # Without a qualifying fit count, that legacy state is ambiguous.
+            self._thermal_model.restore_k(
+                self._attributes.get("thermal_k"),
+                self._attributes.get("thermal_k_samples", 0),
+            )
+        self._thermal_observer.start(dt_util.now())
+        self._attributes["thermal_diagnostics"] = self._thermal_observer.attributes()
+        self._thermal_reload_unsub = self.hass.bus.async_listen(
+            "event_template_reloaded", self._thermal_template_reloaded
+        )
 
         # Wait until Home Assistant is fully started before the first real update.
         self.hass.bus.async_listen_once(
@@ -316,6 +353,9 @@ class PumpSteerSensor(RestoreEntity):
 
     async def async_will_remove_from_hass(self) -> None:
         """Cancel options update listener on unload."""
+        if self._thermal_reload_unsub is not None:
+            self._thermal_reload_unsub()
+            self._thermal_reload_unsub = None
         if self._remove_update_listener is not None:
             self._remove_update_listener()
             self._remove_update_listener = None
@@ -328,8 +368,13 @@ class PumpSteerSensor(RestoreEntity):
         self._config_entry = entry
         await self.async_update()
 
+    @callback
+    def _thermal_template_reloaded(self, event) -> None:
+        self._thermal_observer.start(dt_util.now())
+
     async def _handle_ha_started(self, event) -> None:
         """Run when HA is fully started and entities are ready."""
+        self._thermal_observer.start(dt_util.now())
         await self.async_update()
         self.async_write_ha_state()
 
@@ -845,8 +890,22 @@ class PumpSteerSensor(RestoreEntity):
         self._last_pi_result = result
         return -result.offset
 
+    def _thermal_source_ids(self):
+        cfg = self._cfg()
+        return cfg.get("indoor_temp_entity"), cfg.get("real_outdoor_entity")
+
+    def _thermal_source_boundary(self):
+        sources = self._thermal_source_ids()
+        if sources != self._thermal_sources:
+            self._thermal_sources = sources
+            self._thermal_observer.start(dt_util.now())
+
     async def async_update(self) -> None:
         """Update sensor state."""
+        try:
+            self._thermal_source_boundary()
+        except Exception:
+            _LOGGER.exception("Thermal source qualification failed; control unchanged")
         try:
             await self._do_update()
         except Exception as err:
@@ -858,6 +917,30 @@ class PumpSteerSensor(RestoreEntity):
                 "last_error": str(err),
                 "last_updated": dt_util.now().isoformat(),
             }
+
+        # Observe only after the existing state machine/output has completed.
+        # Failures here must never change control state or hardware dispatch.
+        try:
+            self._thermal_source_boundary()
+            cfg = self._cfg()
+            self._thermal_observer.observe(
+                dt_util.now(),
+                self.hass.states.get(cfg.get("indoor_temp_entity")),
+                self.hass.states.get(cfg.get("real_outdoor_entity")),
+                braking=self._attributes.get("mode") in (MODE_BRAKING, MODE_BRAKE_HOLD)
+                and self._attributes.get("brake_factor", 0) > 0,
+            )
+            self._attributes.update(
+                {
+                    "thermal_k": round(self._thermal_model.k, 4),
+                    "thermal_k_valid": self._thermal_model.is_valid,
+                    "thermal_k_samples": self._thermal_model.sample_count,
+                    "thermal_pending_samples": self._thermal_model.pending_samples,
+                    "thermal_diagnostics": self._thermal_observer.attributes(),
+                }
+            )
+        except Exception:
+            _LOGGER.exception("Thermal diagnostics failed; control output unchanged")
 
     async def _do_update(self) -> None:
         """Run the main control state machine."""
@@ -878,8 +961,6 @@ class PumpSteerSensor(RestoreEntity):
         )
         aggressiveness = self._aggressiveness(cfg)
         house_inertia = self._house_inertia(cfg)
-
-        self._thermal_model.record_temp(now, indoor)
 
         if indoor is None or outdoor is None:
             missing = []
@@ -1086,8 +1167,6 @@ class PumpSteerSensor(RestoreEntity):
             )
 
             if factor > 0.0:
-                self._thermal_model.collect_braking_sample(indoor, outdoor)
-
                 # Mark that this cycle had active braking so we can fit the thermal
                 # model once the brake phase has fully ended.
                 self._was_braking_last_cycle = True

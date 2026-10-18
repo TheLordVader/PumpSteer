@@ -1,0 +1,6 @@
+{
+  "custom_components/pumpsteer/sensor.py": "49837bc6e2d3cf96abecb6dd08851c4f8b1b8141226ae5ae4088e5bdcff2f40e",
+  "custom_components/pumpsteer/thermal_model.py": "3ca7045b9bb1743ca8d5fb73292922c13e19a544b01477184ec352b34f4b66b5",
+  "custom_components/pumpsteer/thermal_intelligence.py": "1383f30e79b47f4b5722fea6324a8fee3c7c96a19d2a2f04b56f153e815c20bd",
+  "custom_components/pumpsteer/thermal_observer.py": "ec30bf401dea452946f7093e86d38478cb7ef96334982aaf998ca6d765910baa"
+}

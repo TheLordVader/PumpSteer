@@ -1,0 +1,9 @@
+{
+  "synthetic_updates": 10000,
+  "microseconds_per_update": 52.69836090737954,
+  "diagnostic_attribute_bytes": 1278,
+  "raw_training_points": 240,
+  "pending_forecasts": 7,
+  "resolved_forecasts": 192,
+  "production_measurement": false
+}
