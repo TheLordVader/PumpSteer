@@ -39,7 +39,8 @@
           "modbus_interval_minutes": "Generic output push interval",
           "ohmigo_relay_entity": "Ohmigo Active/Bypass relay (optional)",
           "notification_level": "Price notification level",
-          "notification_cooldown_minutes": "Repeat notification cooldown"
+          "notification_cooldown_minutes": "Repeat notification cooldown",
+          "external_heat_entity": "External heat source (optional, diagnostics only)"
         },
         "data_description": {
           "pid_kp": "How strongly PumpSteer reacts to current temperature error. Typical range: 2.0 to 5.0.",
@@ -56,7 +57,8 @@
           "modbus_interval_minutes": "Minimum time between Generic Output System service calls.",
           "ohmigo_relay_entity": "Optional switch entity for the Ohmigo Active/Bypass relay. When configured, PumpSteer exposes a separate Relay Guard switch. The guard only recovers an explicit OFF state while Ohmigo Push is ON; unknown or unavailable states never cause a relay command.",
           "notification_level": "Choose all price alerts, braking only, or none. The existing Notifications switch remains the master on/off control.",
-          "notification_cooldown_minutes": "Minimum time between repeated alerts of the same type. Choose 0 for no limit; 60 minutes is recommended. Braking and preheating have independent timers."
+          "notification_cooldown_minutes": "Minimum time between repeated alerts of the same type. Choose 0 for no limit; 60 minutes is recommended. Braking and preheating have independent timers.",
+          "external_heat_entity": "Select an existing on/off entity. On or unknown status pauses learning and breaks observations. Leave empty for existing behavior. Does not affect control or outputs."
         }
       }
     },

@@ -30,13 +30,19 @@ neither temperature-control fix is duplicated or required here.
 Limitations: distinct post-start HA reports are checked, including explicit
 restore flags, units, age and continuity. `last_reported` proves HA reception,
 not physical measurement age; unmarked re-reports of cached values cannot be
-detected. Braking does not prove zero heat input. Residual radiator heat, sun and
+detected. An optional existing on/off external-heat entity pauses learning and breaks
+observations while active, unknown or restored; after the first observed off,
+new temperature reports are required. No entity is selected by default.
+Ten-minute reports now work within an explicit 15-minute report/history limit;
+repeated polling never invents samples. The HA minimum is 2024.4 and startup
+qualification uses actual event time with conservative fallback.
+Braking does not prove zero heat input. Residual radiator heat, sun and
 outdoor changes remain unmodelled, so quality is descriptive and conditional,
 never a control/safety guarantee. No PI or brake tuning follows from these scores.
 
 Validation:
 
-- Upstream baseline: 292 tests passed; candidate: 413 tests passed.
+- Upstream baseline: 292 tests passed; candidate follow-up: 427 tests passed.
 - New tests first failed for qualification/persistence/bounds; review findings
   (source changes mixing series, historical fit counts and ambiguous legacy restore) were reproduced and fixed.
 - Ruff, targeted Ruff format, fatal/import Flake8, version check and diff check passed.
@@ -44,10 +50,11 @@ Validation:
 - Real isolated HA Core 2026.10.1: actual template/integration reload, disk-backed
   ordinary restart and restart after four synthetic days; fitted `k` and count
   retained, unfinished samples discarded, 30-minute comparison observed, 24
-  simulated receiver dispatches and zero PumpSteer error logs.
+  simulated receiver dispatches and zero PumpSteer error logs. The corrected
+  runtime also passes real HA external-heat options, on/unknown/off and recovery.
 - The Core probe uses synthetic time/inputs/receiver. Optional unrelated HA
   components lacked dependencies in the reused environment; it is not a full
-  all-integrations HA validation or a production test. Hassfest was not run.
+  all-integrations HA validation or a production test. Current Hassfest/HACS results are recorded in the validation receipt.
 - Internal separate code review completed; no external independent verification
   is claimed. Evidence and limitations are in `docs/thermal-validation-20261018/`.
 

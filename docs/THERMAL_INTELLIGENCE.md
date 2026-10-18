@@ -2,7 +2,7 @@
 
 This candidate observes the existing controller. It does not change PI tuning,
 price categories, brake depth, comfort protection, forecasts used by control, or
-Ohmigo commands. There are no new entities, options, services, cloud calls,
+Ohmigo commands. There are no new entities, services, cloud calls,
 polling loops or storage components. It is independent of PRs #279 and #280.
 
 ## What is learned and displayed
@@ -50,15 +50,19 @@ uninterrupted qualified brake period; short brakes may never produce an outcome.
 `last_updated` tracks HA state/attribute changes. `last_reported` tracks HA
 reception, including identical reports. This adapter uses distinct, timezone-aware
 `last_reported` values after its lifecycle boundary, finite Celsius values,
-monotonic report order and no explicit `restored` flag. Reports older than five
-minutes or from the future are rejected. An unchanged value with a new qualifying
+monotonic report order and no explicit `restored` flag. Reports older than 15
+minutes or from the future are rejected. Home Assistant 2024.4 or later is required
+for `last_reported`. The startup boundary uses the actual aware startup event time,
+with current time as fallback for missing, invalid, naive or future event time. An unchanged value with a new qualifying
 report is accepted; repeated polling of the same report does not add samples.
 
 **HA reception is not proof of a new physical measurement.** An integration or
 template can re-report a cached value without a restore marker. These inputs do
 not provide a verified hardware measurement timestamp, so this cannot be detected
-generically. Results explicitly say `physical_age_unverified`. The five-minute
-report/gap limit is a continuity bound, not a hardware watchdog or claim about
+generically. Results explicitly say `physical_age_unverified`. The 15-minute
+report/rate-history limit tolerates ordinary sparse (for example ten-minute)
+reporting. A gap in PumpSteer observations longer than five minutes still breaks
+continuity. These bounds are not a hardware watchdog or claim about
 physical freshness. The existing rate estimator also requires three minutes of
 history and rejects implausible rates and small indoor/outdoor differences.
 
@@ -100,6 +104,28 @@ representative diagnostic attribute to 1,278 bytes. These are test measurements,
 not production CPU, database growth or SSD measurements. Timestamp attributes can
 increase bytes in existing Recorder rows but do not create additional polling.
 
+## Optional external heat marker
+
+In PumpSteer options, `external_heat_entity` selects an existing `binary_sensor`,
+`input_boolean` or `switch`. No entity is selected by default; existing behavior
+is preserved. `on` means active external heating (for example a fire or air-source
+heat pump); `off` allows qualified observations. Other states, a missing entity,
+or an explicitly restored marker conservatively pause observation and learning.
+A temporarily unavailable marker can remain selected.
+
+The existing update path reads this marker before and after control calculation.
+Active or unknown heat discards unfinished training samples, rate history and
+pending comparisons. A genuinely fitted coefficient and completed comparisons
+survive. After the first observed `off`, both temperature sources must report
+again before a new series can start. Changing/removing the selected entity also
+starts a new lifecycle segment. No new subscription, polling loop, integration,
+automatic fire detection or control dependency is added.
+
+The marker affects only diagnostics. PI, prices, brake depth, comfort protection
+and Ohmigo outputs are unchanged. A short on/off pulse entirely between updates
+can be missed. Residual radiator or stove heat after `off`, sunlight and unmarked
+external heat remain model limitations; `off` is not proof of zero heat input.
+
 ## Validation and delivery
 
 See [the validation receipt](thermal-validation-20261018/README.md) for commands,
@@ -109,8 +135,8 @@ startup, reloads, SQLite and restore files are real.
 
 Upstream review should precede any installation. Normal installation would use
 the official integration update followed by the supported HA lifecycle action,
-under separate deployment approval. There is no configuration migration or new
-option to enable. Rollback restores the prior integration directory/version and
+under separate deployment approval. There is no configuration migration. The external heat marker is optional;
+leaving it unselected preserves existing behavior. Rollback restores the prior integration directory/version and
 uses the corresponding supported reload/restart, also separately approved.
 Older code ignores the added thermal extra-data field. The existing controller,
 source entity selections and hardware configuration remain untouched.

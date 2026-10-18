@@ -62,6 +62,18 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
                         {"entity": {"domain": "sensor", "device_class": "temperature"}}
                     ),
                     vol.Optional(
+                        "external_heat_entity",
+                        description={
+                            "suggested_value": current_data.get("external_heat_entity")
+                        },
+                    ): selector(
+                        {
+                            "entity": {
+                                "domain": ["binary_sensor", "input_boolean", "switch"]
+                            }
+                        }
+                    ),
+                    vol.Optional(
                         "weather_entity",
                         description={
                             "suggested_value": current_data.get("weather_entity")
@@ -215,6 +227,10 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
         cooldown = user_input.get(NOTIFICATION_COOLDOWN_OPTION, "0")
         if str(cooldown) not in {str(value) for value in NOTIFICATION_COOLDOWN_CHOICES}:
             errors[NOTIFICATION_COOLDOWN_OPTION] = "invalid_notification_setting"
+
+        heat = user_input.get("external_heat_entity")
+        if heat and not self._entity_exists(heat):
+            errors["external_heat_entity"] = "entity_not_found"
 
         # weather_entity is optional — validate only if set
         weather = user_input.get("weather_entity")

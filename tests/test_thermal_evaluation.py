@@ -159,7 +159,7 @@ def test_missing_and_stale_indoor_samples_expire_only_due_forecasts():
     engine = ThermalDiagnostics()
     observe(engine, 0)
     engine.observe(
-        now=START + timedelta(minutes=38),
+        now=START + timedelta(minutes=48),
         indoor=TemperatureMeasurement(21, START + timedelta(minutes=30)),
         outdoor=None,
         k_per_hour=None,

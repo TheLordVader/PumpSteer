@@ -4,11 +4,41 @@ Publication branch: `feature/thermal-intelligence-review-20261018`.
 Baseline: JohanAlvedal/PumpSteer upstream main
 `78cbd853497c4ee84c2e53cff3b29a2461b0b026` (version 2.2.3).
 
-Runtime code and tests are byte-identical to the previously verified local
+At the initial `ad05274` publication, runtime code and tests were byte-identical to the previously verified local
 candidate. That original branch, commit and raw test evidence remain preserved
 locally. The publication starts directly from the public upstream baseline;
 the unsanitized local commit is not an ancestor. No configuration, credentials,
 production observations, raw Core logs or machine-specific paths are included.
+
+## Follow-up correction
+
+The original receipt below describes `ad05274`, not the later corrected runtime.
+The follow-up raises the HA minimum to 2024.4, uses the startup event time, supports
+reports ten minutes apart within a 15-minute reception/history bound, and adds an
+optional external-heat marker on the existing options/update paths. A five-minute
+polling outage still interrupts the series. New regressions reproduced the early
+startup report, sparse-report blocking and report-during-heat-pause defects before
+correction. External heat defaults to absent, conservatively pauses on unknown or
+restored state, and requires fresh reports after the first observed off.
+
+Current offline suite: **432 passed**. Full Ruff lint/format, critical Flake8,
+version and diff checks passed. Internal separate review found the heat-pause
+boundary defect; its regression failed before the correction and now passes.
+The corrected runtime also passed the updated isolated Core 2026.10.1 probe,
+including actual external-heat options/on/unknown/off/recovery, integration and
+template reload, disk restart, restart after four synthetic days, retained fit
+(`k=0.03717385546315693`, 27 samples), a real 30-minute comparison, 24 simulated
+receiver dispatches, no unfinished restored samples and no PumpSteer error logs.
+Optional unrelated HA dependencies still produced setup errors; this is a target
+integration probe, not a full HA configuration or physical hardware test.
+
+`runtime-sha256.json`, `native-runtime-sha256.json` and `final-checks.json` now
+refer to the corrected candidate. The original results below are retained as
+history; current CI results follow after publication. The 20 synthetic control
+output cases still match the original upstream snapshot. 41 existing controller
+methods match upstream AST after removing only the old training calls; control,
+price, forecast, Ohmigo, Relay Guard and settings modules remain byte-identical.
+
 
 ## Reused implementation
 
@@ -19,7 +49,7 @@ storage, passive evaluation and strict restore. Experimental episode/reliability
 research modules and their framework are excluded. PRs #279 and #280 are separate;
 neither patch is duplicated or required, and neither PR is changed.
 
-## Verified results
+## Initial publication results (ad05274)
 
 | Check | Observed result |
 | --- | --- |
@@ -35,10 +65,9 @@ neither patch is duplicated or required, and neither PR is changed.
 | Control AST and unchanged modules | Matched upstream |
 | Real isolated Core lifecycle probe | PASS, Core 2026.10.1 |
 
-`final-checks.json` preserves results from the original candidate; command paths
-are normalized to portable tool names and local tool-execution metadata is
-omitted. Raw logs, including intermediate failing runs and the native Core log,
-are preserved locally rather than published. No test result was changed.
+The original raw results, intermediate failing runs and native Core logs remain
+preserved locally rather than published. The current compact check receipt and
+runtime hashes are updated for the follow-up; raw machine-specific logs are excluded.
 
 The offline suite covers cooling fits, frozen forecast/outcome metadata,
 insufficient/invalid/missing input, duplicate/out-of-order reports, missed targets,
@@ -60,9 +89,7 @@ radio/IR and ffmpeg-related dependencies. The target integration loaded and all
 target assertions passed. This is not a successful full HA configuration check or
 an all-integrations validation. Hassfest was not run. The native run precedes only
 the final legacy-restore eligibility guard, which was checked by seven offline
-restore cases. The exercised new-format disk restore path is unchanged. Tested
-native runtime hashes are in `native-runtime-sha256.json`; final runtime hashes
-are in `runtime-sha256.json`.
+restore cases. The exercised new-format disk restore path is unchanged. Current corrected native/final runtime hashes are in the two SHA-256 receipts.
 
 ## Portable reproduction commands
 

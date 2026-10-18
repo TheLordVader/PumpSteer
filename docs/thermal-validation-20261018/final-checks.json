@@ -3,19 +3,19 @@
     "name": "pytest",
     "command": "python3 -m pytest -q",
     "exit_code": 0,
-    "output": "........................................................................ [ 17%]\n........................................................................ [ 34%]\n........................................................................ [ 52%]\n........................................................................ [ 69%]\n........................................................................ [ 87%]\n.....................................................                    [100%]\n413 passed in 0.39s\n"
+    "output": "........................................................................ [ 16%]\n........................................................................ [ 33%]\n........................................................................ [ 50%]\n........................................................................ [ 66%]\n........................................................................ [ 83%]\n........................................................................ [100%]\n432 passed in 0.33s\n"
   },
   {
     "name": "ruff",
-    "command": "ruff check custom_components/pumpsteer tests",
+    "command": "ruff check",
     "exit_code": 0,
     "output": "All checks passed!\n"
   },
   {
     "name": "format",
-    "command": "ruff format --check custom_components/pumpsteer/thermal_model.py custom_components/pumpsteer/thermal_observer.py custom_components/pumpsteer/thermal_intelligence.py custom_components/pumpsteer/sensor.py tests/test_thermal_observer.py tests/test_thermal_intelligence.py tests/test_thermal_evaluation.py tests/test_thermal_measurement_hygiene.py tests/test_brake_provenance.py tests/thermal_core_probe.py",
+    "command": "ruff format --check",
     "exit_code": 0,
-    "output": "10 files already formatted\n"
+    "output": "47 files already formatted\n"
   },
   {
     "name": "flake8",
@@ -40,5 +40,12 @@
     "command": "cmp docs/thermal-validation-20261018/output-base.json docs/thermal-validation-20261018/output-head.json",
     "exit_code": 0,
     "output": ""
+  },
+  {
+    "name": "native_core",
+    "command": "python -B tests/thermal_core_probe.py",
+    "exit_code": 0,
+    "output": "{\"core\": \"2026.10.1\", \"external_heat_options_and_recovery\": true, \"actual_integration_reload\": true, \"actual_template_reload\": true, \"normal_disk_restart\": true, \"disk_restart_after_days\": 4, \"target_errors\": [], \"restored_fit_count\": 27, \"restored_k\": 0.03717385546315693, \"receiver_dispatches\": 24, \"pending_measurements_after_restart\": 0, \"status\": \"PASS\"}\n",
+    "limitations": "Isolated Core 2026.10.1, synthetic inputs/clock/receiver; unrelated optional HA dependency errors; not a full configuration or physical hardware test."
   }
 ]

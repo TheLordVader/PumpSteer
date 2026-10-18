@@ -118,7 +118,7 @@ def test_naive_timestamps_are_rejected(field):
 
 
 @pytest.mark.parametrize("field", ["indoor", "outdoor"])
-@pytest.mark.parametrize("age_seconds", [-1, 301])
+@pytest.mark.parametrize("age_seconds", [-1, 901])
 def test_future_and_stale_measurements_are_rejected(field, age_seconds):
     engine = ThermalDiagnostics()
     data = dict(

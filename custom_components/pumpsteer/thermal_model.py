@@ -56,7 +56,7 @@ _MIN_RATE_WINDOW_MINUTES = 3.0
 
 # Tolerate ordinary polling jitter, but never estimate a continuous cooling
 # rate across a long outage or a known invalid observation.
-_MAX_TEMP_GAP_MINUTES = 5.0
+_MAX_TEMP_GAP_MINUTES = 15.0
 
 # Plausible bounds for measured indoor temperature rate (°C/h).
 # These are intentionally conservative and only reject obvious spikes/noise.

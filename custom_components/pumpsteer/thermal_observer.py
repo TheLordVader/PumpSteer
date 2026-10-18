@@ -3,7 +3,12 @@
 from datetime import datetime
 import math
 
-from .thermal_intelligence import ThermalDiagnostics, TemperatureMeasurement, _utc
+from .thermal_intelligence import (
+    ThermalDiagnostics,
+    TemperatureMeasurement,
+    _utc,
+    _MAX_SAMPLE_AGE_SECONDS,
+)
 from .thermal_model import ThermalModel
 
 
@@ -23,12 +28,14 @@ class ThermalObserver:
         self._indoor_at = None
         self._outdoor_at = None
         self._braking = False
+        self._external_heat_paused = False
         self._reason = "no_measurement"
         self._last_comparison = {}
 
     def start(self, now: datetime) -> None:
         """New lifecycle segment; only genuinely fitted parameters survive."""
         self._braking = False
+        self._external_heat_paused = False
         self._after = _utc(now)
         self._last_now = self._indoor_at = self._outdoor_at = None
         self.model.clear_history(samples=True)
@@ -43,7 +50,7 @@ class ThermalObserver:
         if attrs.get("restored") or attrs.get("unit_of_measurement") != "°C":
             return None
         at = _utc(getattr(state, "last_reported", None))
-        if at is None or not 0 <= (now - at).total_seconds() <= 300:
+        if at is None or not 0 <= (now - at).total_seconds() <= _MAX_SAMPLE_AGE_SECONDS:
             return None
         if self._after is not None and at <= self._after:
             return None
@@ -63,7 +70,23 @@ class ThermalObserver:
         self.diagnostics.cancel_pending(now)
         self._reason = reason
 
-    def observe(self, now, indoor_state, outdoor_state, *, braking):
+    def pause_for_external_heat(self, now, active):
+        """Discard this series when configured heat is active or unqualified."""
+        if active is False:
+            if self._external_heat_paused:
+                # Reports received during the pause cannot seed the new series.
+                self._after = _utc(now)
+                self._external_heat_paused = False
+            return False
+        self._external_heat_paused = True
+        self._after = _utc(now)
+        self.model.clear_history(samples=True)
+        self._break(now, "external_heat_active" if active else "external_heat_unknown")
+        return True
+
+    def observe(
+        self, now, indoor_state, outdoor_state, *, braking, external_heat=False
+    ):
         clock = _utc(now)
         if clock is None:
             self._break(self._last_now, "invalid_clock")
@@ -78,6 +101,8 @@ class ThermalObserver:
         ):
             self._break(clock, "observation_gap")
         self._last_now = clock
+        if self.pause_for_external_heat(clock, external_heat):
+            return
         indoor, outdoor = (
             self._reading(indoor_state, clock),
             self._reading(outdoor_state, clock),
@@ -92,7 +117,8 @@ class ThermalObserver:
             return
         if (
             self._indoor_at is not None
-            and (indoor.measured_at - self._indoor_at).total_seconds() > 300
+            and (indoor.measured_at - self._indoor_at).total_seconds()
+            > _MAX_SAMPLE_AGE_SECONDS
         ):
             self._break(clock, "measurement_gap")
         distinct = indoor.measured_at != self._indoor_at

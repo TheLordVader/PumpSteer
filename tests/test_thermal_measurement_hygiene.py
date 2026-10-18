@@ -154,10 +154,10 @@ def test_dst_boundary_rate_uses_real_elapsed_minutes(month, day):
     assert model._samples[0].rate == pytest.approx(-1.2)
 
 
-def test_gap_exceeding_five_minutes_breaks_history():
+def test_gap_exceeding_fifteen_minutes_breaks_history():
     model = ThermalModel()
     now = datetime(2026, 10, 11, 8, tzinfo=timezone.utc)
     model.record_temp(now, 21)
-    model.record_temp(now + timedelta(minutes=5, seconds=1), 20.9)
+    model.record_temp(now + timedelta(minutes=15, seconds=1), 20.9)
     model.collect_braking_sample(20.9, 5)
     assert model.pending_samples == 0

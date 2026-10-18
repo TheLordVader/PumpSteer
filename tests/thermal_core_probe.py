@@ -195,6 +195,32 @@ async def main():
                     ]["count"]
                     >= 1
                 )
+                # Exercise real HA options/state reception for the voluntary marker.
+                hass.states.async_set("input_boolean.external_heat", "on")
+                hass.config_entries.async_update_entry(
+                    entry,
+                    options={
+                        **entry.options,
+                        "external_heat_entity": "input_boolean.external_heat",
+                    },
+                )
+                await hass.async_block_till_done()
+                await sample(entity, 20.9)
+                assert model.pending_samples == 0
+                assert entity._thermal_observer.diagnostics.pending_count == 0
+                hass.states.async_set("input_boolean.external_heat", "unknown")
+                await sample(entity, 20.89)
+                assert model.pending_samples == 0
+                hass.states.async_set("input_boolean.external_heat", "off")
+                await entity.async_update()
+                assert not model._temp_history
+                await sample(entity, 20.88)
+                assert len(model._temp_history) == 1
+                assert (model.k, model.sample_count) == fitted
+                options = dict(entry.options)
+                options.pop("external_heat_entity")
+                hass.config_entries.async_update_entry(entry, options=options)
+                await hass.async_block_till_done()
                 await hass.services.async_call("template", "reload", blocking=True)
                 await hass.async_block_till_done()
                 assert (model.k, model.sample_count) == fitted
@@ -255,6 +281,7 @@ async def main():
                     json.dumps(
                         {
                             "core": __version__,
+                            "external_heat_options_and_recovery": True,
                             "actual_integration_reload": True,
                             "actual_template_reload": True,
                             "normal_disk_restart": True,

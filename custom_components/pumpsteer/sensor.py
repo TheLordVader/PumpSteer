@@ -14,6 +14,7 @@ from homeassistant.helpers.typing import StateType
 
 from .thermal_model import ThermalModel, _MIN_SAMPLES
 from .thermal_observer import ThermalObserver
+from .thermal_intelligence import _utc
 
 from .control import PIController
 from .electricity_price import (
@@ -121,6 +122,7 @@ class PumpSteerSensor(RestoreEntity):
         self._thermal_model = ThermalModel()
         self._thermal_observer = ThermalObserver(self._thermal_model)
         self._thermal_reload_unsub = None
+        self._thermal_start_unsub = None
         self._thermal_sources = self._thermal_source_ids()
         self._last_outlook: Optional[Any] = None
         self._last_pi_result = None
@@ -341,10 +343,10 @@ class PumpSteerSensor(RestoreEntity):
         )
 
         # Wait until Home Assistant is fully started before the first real update.
-        self.hass.bus.async_listen_once(
-            "homeassistant_started",
-            self._handle_ha_started,
-        )
+        if not self.hass.is_running:
+            self._thermal_start_unsub = self.hass.bus.async_listen_once(
+                "homeassistant_started", self._handle_ha_started
+            )
 
         # If HA is already running (for example on reload), update immediately.
         if self.hass.is_running:
@@ -353,6 +355,9 @@ class PumpSteerSensor(RestoreEntity):
 
     async def async_will_remove_from_hass(self) -> None:
         """Cancel options update listener on unload."""
+        if self._thermal_start_unsub is not None:
+            self._thermal_start_unsub()
+            self._thermal_start_unsub = None
         if self._thermal_reload_unsub is not None:
             self._thermal_reload_unsub()
             self._thermal_reload_unsub = None
@@ -374,7 +379,12 @@ class PumpSteerSensor(RestoreEntity):
 
     async def _handle_ha_started(self, event) -> None:
         """Run when HA is fully started and entities are ready."""
-        self._thermal_observer.start(dt_util.now())
+        self._thermal_start_unsub = None
+        now = dt_util.now()
+        fired = _utc(getattr(event, "time_fired", None))
+        self._thermal_observer.start(
+            fired if fired is not None and fired <= now else now
+        )
         await self.async_update()
         self.async_write_ha_state()
 
@@ -892,7 +902,20 @@ class PumpSteerSensor(RestoreEntity):
 
     def _thermal_source_ids(self):
         cfg = self._cfg()
-        return cfg.get("indoor_temp_entity"), cfg.get("real_outdoor_entity")
+        return (
+            cfg.get("indoor_temp_entity"),
+            cfg.get("real_outdoor_entity"),
+            cfg.get("external_heat_entity"),
+        )
+
+    def _thermal_external_heat(self):
+        entity_id = self._cfg().get("external_heat_entity")
+        if not entity_id:
+            return False
+        state = self.hass.states.get(entity_id)
+        if state is None or state.attributes.get("restored"):
+            return None
+        return {"on": True, "off": False}.get(state.state)
 
     def _thermal_source_boundary(self):
         sources = self._thermal_source_ids()
@@ -904,6 +927,9 @@ class PumpSteerSensor(RestoreEntity):
         """Update sensor state."""
         try:
             self._thermal_source_boundary()
+            self._thermal_observer.pause_for_external_heat(
+                dt_util.now(), self._thermal_external_heat()
+            )
         except Exception:
             _LOGGER.exception("Thermal source qualification failed; control unchanged")
         try:
@@ -927,6 +953,7 @@ class PumpSteerSensor(RestoreEntity):
                 dt_util.now(),
                 self.hass.states.get(cfg.get("indoor_temp_entity")),
                 self.hass.states.get(cfg.get("real_outdoor_entity")),
+                external_heat=self._thermal_external_heat(),
                 braking=self._attributes.get("mode") in (MODE_BRAKING, MODE_BRAKE_HOLD)
                 and self._attributes.get("brake_factor", 0) > 0,
             )
