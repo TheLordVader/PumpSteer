@@ -329,3 +329,27 @@ Heating is a critical system. In safe mode PumpSteer passes through the real out
 temperature when that sensor is still available, so the heat pump can continue on its
 own heating curve. If the outdoor sensor itself is unavailable, PumpSteer's output is
 also unavailable. Monitor the system after installation and configuration changes.
+
+### Offline temperature-validation candidate — not approved for active operation
+
+Temperature inputs marked `restored` are rejected. Startup/reload requires a
+non-restored numeric HA report with `last_reported` later than activation (or
+the HA-start event). An unchanged value can qualify through a new report.
+Missing timestamp metadata cannot qualify after activation. This is a HA-report
+barrier, **not proof of a fresh physical measurement**; a source may republish cache.
+
+Inputs and configured source identities are rechecked after asynchronous data
+retrieval and immediately before each output service call. Changed or invalid
+inputs abort that cycle; `temperature_input_status: interrupted` and
+`receiver_state: unverified` describe this condition. Overlapping updates are
+skipped and reevaluated by the next normal poll. No additional polling is added.
+A brief invalid state followed by the same valid number entirely between checks
+is not detected. No maximum measurement-age policy is inferred from HA timestamps.
+
+PI formulas, valid-input output payloads, send intervals, receiver fallback and
+Relay Guard are unchanged. Suppressing a write does not clear a receiver's last
+command. Dispatch is not physical acknowledgement, and existing service-error
+reporting does not prove delivery. Verify the installed receiver model, firmware,
+protocol, timeout/bypass wiring and source startup/cache contract before deployment.
+Rollback requires the prior integration version **and** a verified safe physical
+signal path; a code rollback alone does not reset the receiver.
