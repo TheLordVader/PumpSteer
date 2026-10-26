@@ -35,11 +35,16 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
 
         if user_input is not None:
             try:
-                entity_errors = self._validate_entities(user_input)
+                options = {**user_input}
+                options.setdefault(
+                    "external_heat_sources",
+                    current_data.get("external_heat_sources", False),
+                )
+                entity_errors = self._validate_entities(options)
                 errors = {**entity_errors}
 
                 if not errors:
-                    return self.async_create_entry(title="", data={**user_input})
+                    return self.async_create_entry(title="", data=options)
 
             except Exception as err:
                 _LOGGER.exception("Options flow save failed: %s", err)
@@ -61,18 +66,10 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
                     ): selector(
                         {"entity": {"domain": "sensor", "device_class": "temperature"}}
                     ),
-                    vol.Optional(
-                        "external_heat_entity",
-                        description={
-                            "suggested_value": current_data.get("external_heat_entity")
-                        },
-                    ): selector(
-                        {
-                            "entity": {
-                                "domain": ["binary_sensor", "input_boolean", "switch"]
-                            }
-                        }
-                    ),
+                    vol.Required(
+                        "external_heat_sources",
+                        default=current_data.get("external_heat_sources", False),
+                    ): selector({"boolean": {}}),
                     vol.Optional(
                         "weather_entity",
                         description={
@@ -199,6 +196,9 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
         """Validate that entities exist and are available."""
         errors = {}
 
+        if not isinstance(user_input.get("external_heat_sources", False), bool):
+            errors["external_heat_sources"] = "invalid_external_heat_sources"
+
         required_entities = {
             "indoor_temp_entity": "Indoor temperature sensor",
             "real_outdoor_entity": "Outdoor temperature sensor",
@@ -227,10 +227,6 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
         cooldown = user_input.get(NOTIFICATION_COOLDOWN_OPTION, "0")
         if str(cooldown) not in {str(value) for value in NOTIFICATION_COOLDOWN_CHOICES}:
             errors[NOTIFICATION_COOLDOWN_OPTION] = "invalid_notification_setting"
-
-        heat = user_input.get("external_heat_entity")
-        if heat and not self._entity_exists(heat):
-            errors["external_heat_entity"] = "entity_not_found"
 
         # weather_entity is optional — validate only if set
         weather = user_input.get("weather_entity")

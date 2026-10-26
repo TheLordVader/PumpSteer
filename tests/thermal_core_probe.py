@@ -3,11 +3,15 @@
 Run with the existing HA test interpreter: python -B tests/thermal_core_probe.py.
 Time, temperatures, price categories and receiver are synthetic. Core startup,
 integration/template reload, SQLite and restore storage are real.
+This probe starts/reloads an isolated Core; do not execute when those actions
+are excluded by the task. The local self-learning turn uses offline lifecycle
+tests and the State API without running this probe.
 """
 
 import asyncio
 import json
 import logging
+import math
 from pathlib import Path
 import shutil
 import socket
@@ -173,8 +177,8 @@ async def main():
                 ),
             ):
                 entity, entry = await boot()
-                for minute in range(30):
-                    await sample(entity, 21.3 - minute * 0.01)
+                for minute in range(211):
+                    await sample(entity, 21.3 - minute * 0.005)
                 assert entity._thermal_model.pending_samples >= 20, (
                     entity.extra_state_attributes
                 )
@@ -187,40 +191,42 @@ async def main():
                 )
                 fitted = (model.k, model.sample_count)
                 braking[0] = True
-                for minute in range(32):
-                    await sample(entity, 20.95 - minute * 0.001)
+                for minute in range(91):
+                    await sample(
+                        entity, 5 + 16 * math.exp(-model.k * (minute + 1) / 60)
+                    )
                 assert (
                     entity.extra_state_attributes["thermal_diagnostics"]["quality"][
                         "30"
                     ]["count"]
                     >= 1
                 )
-                # Exercise real HA options/state reception for the voluntary marker.
-                hass.states.async_set("input_boolean.external_heat", "on")
-                hass.config_entries.async_update_entry(
-                    entry,
-                    options={
-                        **entry.options,
-                        "external_heat_entity": "input_boolean.external_heat",
-                    },
+                # Future explicitly authorized Core run: automatic evidence
+                # with existing temperature inputs and no source preferences.
+                for minute in range(91):
+                    await sample(
+                        entity, 5 + 16 * math.exp(-model.k * (minute + 1) / 60)
+                    )
+                before = model.pending_samples
+                warm_start = float(hass.states.get("sensor.inside").state)
+                for minute in range(20):
+                    await sample(entity, warm_start + 0.02 * (minute + 1))
+                assert model.pending_samples == before
+                assert (
+                    entity.extra_state_attributes["thermal_diagnostics"][
+                        "heat_evidence"
+                    ]["status"]
+                    == "suspected_extra_heat"
                 )
-                await hass.async_block_till_done()
-                await sample(entity, 20.9)
-                assert model.pending_samples == 0
-                assert entity._thermal_observer.diagnostics.pending_count == 0
-                hass.states.async_set("input_boolean.external_heat", "unknown")
-                await sample(entity, 20.89)
-                assert model.pending_samples == 0
-                hass.states.async_set("input_boolean.external_heat", "off")
-                await entity.async_update()
-                assert not model._temp_history
-                await sample(entity, 20.88)
-                assert len(model._temp_history) == 1
+                recover_start = float(hass.states.get("sensor.inside").state)
+                for minute in range(10):
+                    await sample(
+                        entity,
+                        5
+                        + (recover_start - 5) * math.exp(-model.k * (minute + 1) / 60),
+                    )
+                assert model.pending_samples == before + 1
                 assert (model.k, model.sample_count) == fitted
-                options = dict(entry.options)
-                options.pop("external_heat_entity")
-                hass.config_entries.async_update_entry(entry, options=options)
-                await hass.async_block_till_done()
                 await hass.services.async_call("template", "reload", blocking=True)
                 await hass.async_block_till_done()
                 assert (model.k, model.sample_count) == fitted
@@ -281,7 +287,7 @@ async def main():
                     json.dumps(
                         {
                             "core": __version__,
-                            "external_heat_options_and_recovery": True,
+                            "automatic_heat_evidence_and_recovery": True,
                             "actual_integration_reload": True,
                             "actual_template_reload": True,
                             "normal_disk_restart": True,

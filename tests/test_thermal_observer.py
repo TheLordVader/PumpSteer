@@ -71,13 +71,13 @@ def test_unqualified_reports_never_train(kind):
 
 def test_distinct_reports_learn_existing_model_during_braking_only():
     obs = observer()
-    for minute in range(30):
+    for minute in range(201):
         now = NOW + timedelta(minutes=minute)
         obs.observe(now, report(21 - minute * 0.01, now), report(5, now), braking=True)
     assert obs.model.pending_samples >= 20
     obs.model.fit()
     assert obs.model.is_valid
-    assert obs.model.k == pytest.approx(0.6 / 15.85, abs=0.001)
+    assert obs.model.k == pytest.approx(0.04, abs=0.001)
     before = obs.model.pending_samples
     now += timedelta(minutes=1)
     obs.observe(now, report(20.7, now), report(5, now), braking=False)
@@ -329,6 +329,7 @@ def test_start_qualifies_against_actual_event_with_safe_fallback(
 ):
     sensor, states = _sensor()
     sensor._attributes = {"mode": "braking", "brake_factor": 1}
+    sensor._state = 5.0  # explicit known command; temperature alone is insufficient
     monkeypatch.setattr(sensor, "_do_update", AsyncMock())
     monkeypatch.setattr(
         sensor_module.dt_util, "now", lambda: NOW + timedelta(seconds=2)
@@ -347,9 +348,8 @@ def test_start_qualifies_against_actual_event_with_safe_fallback(
     }[event_time]
     sensor.async_write_ha_state = lambda: None
     asyncio.run(sensor._handle_ha_started(SimpleNamespace(time_fired=fired)))
-    assert len(sensor._thermal_model._temp_history) == (
-        1 if event_time == "valid" else 0
-    )
+    assert (sensor._thermal_observer._response_window is not None) is (event_time == "valid")
+    assert sensor._thermal_model.response_pending_samples == 0
 
 
 def test_ten_minute_reports_learn_without_counting_repeated_polls():
@@ -377,117 +377,13 @@ def test_unchanged_distinct_ten_minute_reports_score_real_outcome():
         )
     result = obs.attributes()
     assert obs.model.pending_samples == 0  # flat temperature is not cooling evidence
-    assert len(obs.model._temp_history) == 4
+    assert result["learning_windows"]["accepted"] == 0
     assert result["last_comparison"]["30"]["actual_change_c"] == 0
     assert result["quality"]["30"]["count"] == 1
 
 
-@pytest.mark.parametrize("heat", [True, None])
-def test_external_heat_breaks_learning_and_forecasts_until_new_reports(heat):
-    obs = observer()
-    obs.model.restore_k(0.04, sample_count=25)
-    for minute in range(5):
-        now = NOW + timedelta(minutes=minute)
-        obs.observe(now, report(21 - minute * 0.01, now), report(5, now), braking=True)
-    assert obs.model.pending_samples > 0
-    now += timedelta(minutes=1)
-    inside, outside = report(20.9, now), report(5, now)
-    obs.observe(now, inside, outside, braking=True, external_heat=heat)
-    assert obs.model.pending_samples == 0
-    assert not obs.model._temp_history
-    assert obs.diagnostics.pending_count == 0
-    assert obs.attributes()["reason"] == (
-        "external_heat_active" if heat else "external_heat_unknown"
-    )
-    obs.observe(
-        now + timedelta(seconds=1), inside, outside, braking=True, external_heat=False
-    )
-    assert not obs.model._temp_history
-    now += timedelta(minutes=1)
-    obs.observe(
-        now, report(20.8, now), report(5, now), braking=True, external_heat=False
-    )
-    assert len(obs.model._temp_history) == 1
-    assert obs.model.k == 0.04
-
-
-@pytest.mark.parametrize(
-    "heat_state", ["on", "unknown", "unavailable", None, "restored"]
-)
-def test_configured_external_heat_pauses_before_control_can_fit(
-    monkeypatch, heat_state
-):
-    sensor, states = _sensor()
-    sensor._config_entry.options["external_heat_entity"] = "input_boolean.fire"
-    if heat_state is not None:
-        states["input_boolean.fire"] = SimpleNamespace(
-            state="off" if heat_state == "restored" else heat_state,
-            attributes={"restored": heat_state == "restored"},
-        )
-    for minute in range(25):
-        now = NOW + timedelta(minutes=minute)
-        sensor._thermal_observer.observe(
-            now, report(21 - minute * 0.01, now), report(5, now), braking=True
-        )
-    assert sensor._thermal_model.pending_samples >= 20
-    # Match source configuration so the test exercises heat, not source reset.
-    sensor._thermal_sources = sensor._thermal_source_ids()
-    monkeypatch.setattr(sensor_module.dt_util, "now", lambda: now)
-
-    async def finish_brake():
-        sensor._thermal_model.fit()
-
-    monkeypatch.setattr(sensor, "_do_update", finish_brake)
-    asyncio.run(sensor.async_update())
-    assert not sensor._thermal_model.is_valid
-    assert sensor._thermal_model.pending_samples == 0
-
-
-def test_report_during_heat_pause_cannot_start_recovery_series():
-    obs = observer()
-    obs.model.restore_k(0.04, 25)
-    obs.observe(NOW, report(21), report(5), braking=True, external_heat=True)
-    # Report arrived after last on-poll, but before the first observed off state.
-    at = NOW + timedelta(seconds=30)
-    obs.observe(
-        NOW + timedelta(minutes=1),
-        report(20.9, at),
-        report(5, at),
-        braking=True,
-        external_heat=False,
-    )
-    assert not obs.model._temp_history
-    assert obs.diagnostics.pending_count == 0
-    now = NOW + timedelta(minutes=2)
-    obs.observe(
-        now, report(20.8, now), report(5, now), braking=True, external_heat=False
-    )
-    assert len(obs.model._temp_history) == 1
-
-
-@pytest.mark.parametrize("heat", ["off", "on", "unknown", "missing"])
-def test_external_heat_setting_does_not_change_controller_or_output(monkeypatch, heat):
-    monkeypatch.setattr(sensor_module.dt_util, "now", lambda: NOW)
-    outputs = []
-
-    async def send(hass, entry, fake, last):
-        outputs.append(fake)
-        return last
-
-    monkeypatch.setattr(sensor_module, "async_push_ohmigo", send)
-    baseline, _ = _sensor()
-    candidate, states = _sensor()
-    candidate._config_entry.options["external_heat_entity"] = "input_boolean.fire"
-    if heat != "missing":
-        states["input_boolean.fire"] = SimpleNamespace(state=heat, attributes={})
-    asyncio.run(baseline.async_update())
-    asyncio.run(candidate.async_update())
-    assert outputs[0] == outputs[1]
-    for key in ("mode", "brake_factor", "fake_outdoor_temperature", "price_category"):
-        assert baseline.extra_state_attributes.get(
-            key
-        ) == candidate.extra_state_attributes.get(key)
-    assert baseline._pi._integral == candidate._pi._integral
+# The former manual-marker/pause cases are replaced by automatic anomaly,
+# recovery and all-setting output-equivalence cases in test_thermal_self_learning.
 
 
 def test_unload_cancels_thermal_startup_and_template_listeners(monkeypatch):
@@ -503,3 +399,18 @@ def test_unload_cancels_thermal_startup_and_template_listeners(monkeypatch):
     asyncio.run(sensor.async_added_to_hass())
     asyncio.run(sensor.async_will_remove_from_hass())
     assert sorted(removed) == ["startup", "template"]
+
+
+def test_passive_attributes_expose_matched_persistence_and_no_data_honestly():
+    obs = observer()
+    quality = obs.attributes()["quality"]["30"]
+    assert quality["persistence_mae_c"] is None
+    assert quality["mae_gain_c"] is None
+    obs.model.restore_k(0.04, 25)
+    for minute in range(31):
+        at = NOW + timedelta(minutes=minute)
+        obs.observe(at, report(21, at), report(5, at), braking=True)
+    quality = obs.attributes()["quality"]["30"]
+    assert quality["count"] == 1
+    assert quality["persistence_mae_c"] == 0
+    assert quality["mae_gain_c"] == pytest.approx(-0.3168, abs=0.00001)

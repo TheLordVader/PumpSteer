@@ -16,12 +16,15 @@ used only when ThermalOutlook cannot be built.
 from __future__ import annotations
 
 import logging
+import math
+from collections.abc import Iterable, Mapping
+from itertools import islice
 from dataclasses import dataclass
-from datetime import datetime, timedelta
-from typing import Any, Optional
+from datetime import datetime, timedelta, timezone
+from typing import TYPE_CHECKING, Any, Optional
 
-from homeassistant.core import HomeAssistant
-import homeassistant.util.dt as dt_util
+if TYPE_CHECKING:
+    from homeassistant.core import HomeAssistant
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -40,6 +43,338 @@ class ForecastPoint:
     humidity: Optional[float] = None
     source_price: str = "unknown"
     source_weather: str = "unknown"
+
+
+# Snapshot bounds are independent of the legacy control-facing hourly normalizer.
+_THERMAL_MAX_ROWS = 512
+_THERMAL_RECEIPT_TTL = timedelta(minutes=90)
+_THERMAL_WEATHER_TTL = timedelta(hours=6)
+_THERMAL_PRICE_TTL = timedelta(hours=36)
+_THERMAL_MAX_SLOT = timedelta(hours=1)
+
+
+def _thermal_datetime(value: Any) -> datetime | None:
+    """Parse genuine aware source timestamps, without assuming a local timezone."""
+    try:
+        parsed = value if isinstance(value, datetime) else datetime.fromisoformat(value)
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            return None
+        return parsed.astimezone(timezone.utc)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _thermal_number(value: Any) -> float | None:
+    try:
+        number = _as_float(value)
+    except OverflowError:
+        return None
+    return (
+        number
+        if not isinstance(value, bool) and number is not None and math.isfinite(number)
+        else None
+    )
+
+
+@dataclass(frozen=True)
+class WeatherSlot:
+    """An actual forecast temperature valid for at most one hour."""
+
+    start: datetime
+    end: datetime
+    temperature_c: float
+
+
+@dataclass(frozen=True)
+class PriceSlot:
+    """A price interval retaining the source's original resolution."""
+
+    start: datetime
+    end: datetime
+    price: float
+
+
+@dataclass(frozen=True)
+class ThermalForecast:
+    """Immutable as-of inputs; absence and unknown issue times stay explicit.
+
+    Freshness is assessed at the requested start, so a fresh snapshot may describe
+    a longer future horizon. Receipt is never proof of weather issue time or of
+    the time Home Assistant last reported a price.
+    """
+
+    received_at: datetime
+    weather_source: str = ""
+    price_source: str = ""
+    weather_issued_at: datetime | None = None
+    weather: tuple[WeatherSlot, ...] = ()
+    prices: tuple[PriceSlot, ...] = ()
+    price_reported_at: datetime | None = None
+    price_unit: str | None = None
+
+    def __post_init__(self) -> None:
+        received = _thermal_datetime(self.received_at)
+        if received is None:
+            raise ValueError("received_at must be an aware datetime")
+        object.__setattr__(self, "received_at", received)
+        object.__setattr__(self, "weather", tuple(self.weather))
+        object.__setattr__(self, "prices", tuple(self.prices))
+
+    def _window(
+        self, start: datetime, end: datetime
+    ) -> tuple[datetime, datetime] | None:
+        start_utc, end_utc = _thermal_datetime(start), _thermal_datetime(end)
+        if start_utc is None or end_utc is None or end_utc <= start_utc:
+            return None
+        if not timedelta(0) <= start_utc - self.received_at <= _THERMAL_RECEIPT_TTL:
+            return None
+        return start_utc, end_utc
+
+    def weather_path(
+        self, start: datetime, end: datetime, current_outdoor: float
+    ) -> tuple[tuple[datetime, float], ...] | None:
+        """Return contiguous step ends/temperatures, or no usable forecast.
+
+        The current observation can bridge only to the first future forecast
+        point, for at most one hour. No weather value fills a forecast gap.
+        """
+        window = self._window(start, end)
+        if window is None or not self.weather:
+            return None
+        start, end = window
+        if self.weather_issued_at is not None:
+            if not timedelta(0) <= self.received_at - self.weather_issued_at:
+                return None
+            if (
+                not timedelta(0)
+                <= start - self.weather_issued_at
+                <= _THERMAL_WEATHER_TTL
+            ):
+                return None
+        cursor = start
+        path: list[tuple[datetime, float]] = []
+        first = self.weather[0]
+        if cursor < first.start:
+            outdoor = _thermal_number(current_outdoor)
+            if outdoor is None or first.start - cursor > _THERMAL_MAX_SLOT:
+                return None
+            cursor = min(first.start, end)
+            path.append((cursor, outdoor))
+        for slot in self.weather:
+            if cursor >= end:
+                break
+            if slot.end <= cursor:
+                continue
+            if slot.start > cursor:
+                return None
+            cursor = min(slot.end, end)
+            path.append((cursor, slot.temperature_c))
+        return tuple(path) if cursor == end else None
+
+    def prices_between(
+        self, start: datetime, end: datetime
+    ) -> tuple[PriceSlot, ...] | None:
+        """Return clipped real price intervals only with full fresh coverage."""
+        window = self._window(start, end)
+        if window is None or not self.prices or self.price_reported_at is None:
+            return None
+        start, end = window
+        if not timedelta(0) <= self.received_at - self.price_reported_at:
+            return None
+        if not timedelta(0) <= start - self.price_reported_at <= _THERMAL_PRICE_TTL:
+            return None
+        cursor = start
+        result: list[PriceSlot] = []
+        for slot in self.prices:
+            if cursor >= end:
+                break
+            if slot.end <= cursor:
+                continue
+            if slot.start > cursor:
+                return None
+            stop = min(slot.end, end)
+            result.append(PriceSlot(cursor, stop, slot.price))
+            cursor = stop
+        return tuple(result) if cursor == end else None
+
+
+def _thermal_weather(
+    points: Iterable[ForecastPoint], unit: str
+) -> tuple[WeatherSlot, ...]:
+    rows = list(islice(points, _THERMAL_MAX_ROWS + 1))
+    if len(rows) > _THERMAL_MAX_ROWS or unit not in (
+        "°C",
+        "C",
+        "celsius",
+        "°F",
+        "F",
+        "fahrenheit",
+    ):
+        return ()
+    temperatures: dict[datetime, float] = {}
+    for point in rows:
+        # Price-only ForecastPoints have no weather observation.
+        if point.outdoor_temp is None:
+            continue
+        at = _thermal_datetime(point.timestamp)
+        temperature = _thermal_number(point.outdoor_temp)
+        if at is None or temperature is None or at in temperatures:
+            return ()
+        if unit in ("°F", "F", "fahrenheit"):
+            temperature = (temperature - 32.0) / 9.0 * 5.0
+        temperatures[at] = temperature
+    starts = sorted(temperatures)
+    slots: list[WeatherSlot] = []
+    for i, at in enumerate(starts):
+        try:
+            end = at + _THERMAL_MAX_SLOT
+        except OverflowError:
+            return ()
+        if i + 1 < len(starts):
+            end = min(end, starts[i + 1])
+        slots.append(WeatherSlot(at, end, temperatures[at]))
+    return tuple(slots)
+
+
+def _thermal_prices(
+    *states: Any, received_at: datetime
+) -> tuple[tuple[PriceSlot, ...], datetime | None]:
+    rows: list[dict[str, Any]] = []
+    reported_times: list[datetime] = []
+    for state in states:
+        if state is None:
+            continue
+        if getattr(state, "state", None) in ("unknown", "unavailable"):
+            return (), None
+        attrs = getattr(state, "attributes", None)
+        if not isinstance(attrs, Mapping):
+            return (), None
+        state_rows: list[dict[str, Any]] = []
+        for name in ("raw_today", "raw_tomorrow", "prices", "forecast"):
+            source = attrs.get(name)
+            if source is None:
+                continue
+            if (
+                not isinstance(source, (list, tuple))
+                or len(source) + len(rows) + len(state_rows) > _THERMAL_MAX_ROWS
+            ):
+                return (), None
+            if any(not isinstance(row, dict) for row in source):
+                return (), None
+            state_rows.extend(source)
+        if not state_rows:
+            continue
+        # Both fields are genuine HA state provenance; receipt is never a fallback.
+        report_value = getattr(state, "last_reported", None)
+        if report_value is None:
+            report_value = getattr(state, "last_updated", None)
+        reported = _thermal_datetime(report_value)
+        if reported is None or reported > received_at:
+            return (), None
+        reported_times.append(reported)
+        rows.extend(state_rows)
+    parsed: dict[datetime, tuple[datetime | None, float]] = {}
+    for row in rows:
+        start = next(
+            (
+                _thermal_datetime(row[key])
+                for key in ("start", "startsAt", "datetime", "time", "hour")
+                if key in row
+            ),
+            None,
+        )
+        end = next(
+            (
+                _thermal_datetime(row[key])
+                for key in ("end", "endsAt", "end_time")
+                if key in row
+            ),
+            None,
+        )
+        try:
+            price = _thermal_number(_extract_price_value(row))
+            raw_value = next(
+                (
+                    row[key]
+                    for key in ("value", "price", "total", "spot", "cost")
+                    if key in row and _as_float(row[key]) is not None
+                ),
+                None,
+            )
+        except OverflowError:
+            return (), None
+        if isinstance(raw_value, bool):
+            price = None
+        explicit_end = any(key in row for key in ("end", "endsAt", "end_time"))
+        if (
+            start is None
+            or price is None
+            or start in parsed
+            or (explicit_end and end is None)
+        ):
+            return (), None
+        parsed[start] = (end, price)
+    starts = sorted(parsed)
+    result: list[PriceSlot] = []
+    for i, start in enumerate(starts):
+        end, price = parsed[start]
+        next_start = starts[i + 1] if i + 1 < len(starts) else None
+        if end is None:
+            # Only a following real timestamp establishes an otherwise absent end.
+            if next_start is None:
+                continue
+            end = next_start
+        if not timedelta(0) < end - start <= _THERMAL_MAX_SLOT:
+            return (), None
+        if next_start is not None and end > next_start:
+            return (), None
+        result.append(PriceSlot(start, end, price))
+    return tuple(result), min(reported_times) if reported_times else None
+
+
+def make_thermal_forecast(
+    points: Iterable[ForecastPoint],
+    *,
+    received_at: datetime,
+    weather_source: str = "",
+    price_source: str = "",
+    price_state: Any = None,
+    tomorrow_state: Any = None,
+    weather_issued_at: datetime | None = None,
+    weather_unit: str = "°C",
+) -> ThermalForecast:
+    """Copy bounded source inputs for thermal diagnostics without HA imports.
+
+    Invalid channels become unavailable, independently. Naive timestamps never
+    receive an invented timezone. Numeric-only price arrays have no real slot
+    times and are deliberately unavailable; a final row without an explicit end
+    remains uncovered. No receipt timestamp is substituted for source provenance.
+    """
+    received = _thermal_datetime(received_at)
+    if received is None:
+        raise ValueError("received_at must be an aware datetime")
+    issued = _thermal_datetime(weather_issued_at)
+    weather = _thermal_weather(points, weather_unit)
+    if weather_issued_at is not None and (
+        issued is None or not timedelta(0) <= received - issued <= _THERMAL_WEATHER_TTL
+    ):
+        weather = ()
+    prices, reported = _thermal_prices(
+        price_state, tomorrow_state, received_at=received
+    )
+    if (
+        reported is not None
+        and not timedelta(0) <= received - reported <= _THERMAL_PRICE_TTL
+    ):
+        prices = ()
+    units={getattr(state,'attributes',{}).get('unit_of_measurement')
+           for state in (price_state,tomorrow_state) if state is not None}
+    unit=next(iter(units)) if len(units)==1 and isinstance(next(iter(units)),str) else None
+    if len(units)>1:
+        prices=()
+    return ThermalForecast(
+        received, weather_source, price_source, issued, weather, prices, reported,unit
+    )
 
 
 @dataclass
@@ -91,6 +426,8 @@ def _as_float(value: Any) -> Optional[float]:
 
 def _parse_datetime(value: Any) -> Optional[datetime]:
     """Parse datetime and normalize to aware UTC datetime."""
+    import homeassistant.util.dt as dt_util
+
     if not value:
         return None
 
@@ -166,6 +503,8 @@ async def _async_extract_weather_points(
         )
         return {}
 
+    import homeassistant.util.dt as dt_util
+
     now_utc = dt_util.utcnow()
     current_hour = now_utc.replace(minute=0, second=0, microsecond=0)
     end_utc = now_utc + timedelta(hours=horizon_hours)
@@ -237,6 +576,8 @@ def _extract_price_points(
     if state is None:
         _LOGGER.debug("Price entity not found: %s", price_entity_id)
         return {}
+
+    import homeassistant.util.dt as dt_util
 
     now_utc = dt_util.utcnow()
     current_hour = now_utc.replace(minute=0, second=0, microsecond=0)

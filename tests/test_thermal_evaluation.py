@@ -267,3 +267,43 @@ def test_restart_has_no_cross_instance_predictions_or_quality():
     observe(restarted, 120)
     assert restarted.evaluation_history == ()
     assert restarted.quality()[120].eligible_count == 0
+
+
+def test_quality_compares_persistence_on_exactly_the_same_pairs():
+    engine = ThermalDiagnostics()
+    observe(engine, 0)
+    at = START + timedelta(minutes=30)
+    engine.observe(
+        now=at,
+        indoor=TemperatureMeasurement(21, at),
+        outdoor=TemperatureMeasurement(5, at),
+        k_per_hour=0.05,
+        model_fitted=True,
+    )
+    quality = engine.quality()[30]
+    assert quality.count == 1
+    assert quality.persistence_mae_c == 0
+    assert quality.mae_gain_c == pytest.approx(-0.3950414, abs=1e-6)
+
+
+def test_missing_outcomes_do_not_become_zero_persistence_errors():
+    engine = ThermalDiagnostics()
+    observe(engine, 0)
+    observe(engine, 40)  # missed 30-minute target; no invented result
+    quality = engine.quality()[30]
+    assert quality.count == 0
+    assert quality.persistence_mae_c is None
+    assert quality.mae_gain_c is None
+
+
+def test_persistence_quality_remains_separate_for_model_revisions():
+    engine = ThermalDiagnostics()
+    observe(engine, 0, k=0.04)
+    version = engine.model_version
+    observe(engine, 30, k=0.08)
+    assert engine.quality(version)[30].count == 1
+    assert engine.quality(version)[30].persistence_mae_c == pytest.approx(
+        0.3950414, abs=1e-6
+    )
+    assert engine.quality()[30].count == 0
+    assert engine.quality()[30].persistence_mae_c is None

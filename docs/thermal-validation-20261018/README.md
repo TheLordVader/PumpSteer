@@ -1,3 +1,8 @@
+> Historical validation receipt for the published e1a74402 candidate.
+> Runtime hashes, marker tests and CI links below refer to that candidate,
+> not the local self-learning follow-up. Current local results and the
+> no-start/reload verification limit are in ../THERMAL_INTELLIGENCE.md.
+
 # Thermal Intelligence validation summary — 2026-10-18
 
 Publication branch: `feature/thermal-intelligence-review-20261018`.

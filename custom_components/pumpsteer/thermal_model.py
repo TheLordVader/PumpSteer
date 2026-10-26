@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import math
+from statistics import median
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
@@ -46,8 +47,8 @@ _FALLBACK_K = 0.05
 _K_MIN = 0.005
 _K_MAX = 0.5
 
-# Ring buffer size for indoor temperature samples used to compute dT/dt.
-# 10 samples × ~60 s polling gives roughly a 10 minute window.
+# Bounded temperature history used to compute dT/dt. The observer supplies
+# the endpoints of a qualified, independent observation interval.
 _TEMP_BUFFER_SIZE = 10
 
 # Minimum history span before rate is considered reliable.
@@ -57,6 +58,8 @@ _MIN_RATE_WINDOW_MINUTES = 3.0
 # Tolerate ordinary polling jitter, but never estimate a continuous cooling
 # rate across a long outage or a known invalid observation.
 _MAX_TEMP_GAP_MINUTES = 15.0
+# Only the passive observer may explicitly qualify a longer interval.
+_MAX_QUALIFIED_INTERVAL_SECONDS = 120 * 60
 
 # Plausible bounds for measured indoor temperature rate (°C/h).
 # These are intentionally conservative and only reject obvious spikes/noise.
@@ -71,6 +74,86 @@ class ThermalSample:
     indoor_temp: float
     outdoor_temp: float
     rate: float  # °C/h, negative when indoor temperature is falling
+    rate_uncertainty: float = (
+        0.0  # Empirical report-step allowance, not a confidence bound.
+    )
+    interval_hours: float = 0.0
+
+
+@dataclass(frozen=True)
+class ResponseFit:
+    """Local empirical net response, NOT delivered power or physical heat loss."""
+    coefficients: tuple[float, float, float]
+    delta_range: tuple[float, float]
+    command_range: tuple[float, float]
+    noise_c_per_hour: float
+    sample_count: int
+    revision: int
+    modes: tuple[str, ...]
+
+    def supports(self, indoor, outdoor, command, mode):
+        return (
+            mode in self.modes
+            and self.delta_range[0]-1 <= outdoor-indoor <= self.delta_range[1]+1
+            and self.command_range[0] <= command <= self.command_range[1]
+        )
+
+    def rate(self, indoor, outdoor, command):
+        a,b,c=self.coefficients
+        return a+b*(outdoor-indoor)+c*command
+
+    def project(self, indoor, command, now, weather_path, mode, outdoor_now=None, bounds=None):
+        """Exact affine propagation at frozen command through as-of weather slots."""
+        a,b,c=self.coefficients
+        value=indoor
+        for end,outdoor in weather_path:
+            hours=(end-now).total_seconds()/3600
+            future_command=command if outdoor_now is None else command+outdoor_now-outdoor
+            if not 0<hours<=2 or not self.supports(value,outdoor,future_command,mode):
+                return None
+            equilibrium=outdoor+(a+c*future_command)/b
+            value=equilibrium+(value-equilibrium)*math.exp(-b*hours)
+            if (not self.supports(value,outdoor,future_command,mode)
+                or (bounds is not None and not bounds[0]<=value<=bounds[1])):
+                return None
+            now=end
+        return value
+
+    def uncertainty(self, hours):
+        # Empirical allowance, not a calibrated probability or physical guarantee.
+        return .1+max(.05,3*self.noise_c_per_hour)*hours
+
+
+def _response_regression(samples):
+    """Three-parameter weighted least squares, fail closed on dependent inputs."""
+    means=[sum(s[j]*s[3]**2 for s in samples)/sum(s[3]**2 for s in samples) for j in (0,1)]
+    scales=[max(s[j] for s in samples)-min(s[j] for s in samples) for j in (0,1)]
+    if min(scales)<2:
+        return None
+    matrix=[[0.]*4 for _ in range(3)]
+    for delta,command,rate,hours,_ in samples:
+        x=(1.,(delta-means[0])/scales[0],(command-means[1])/scales[1])
+        for i in range(3):
+            for j in range(3):
+                matrix[i][j]+=hours**2*x[i]*x[j]
+            matrix[i][3]+=hours**2*x[i]*rate
+    # Reject nearly collinear closed-loop observations too: a formal nonzero
+    # determinant alone does not identify independent weather/command response.
+    if matrix[1][1]*matrix[2][2]<=0 or 1-matrix[1][2]**2/(matrix[1][1]*matrix[2][2])<.05:
+        return None
+    for col in range(3):
+        pivot=max(range(col,3),key=lambda i:abs(matrix[i][col]))
+        matrix[col],matrix[pivot]=matrix[pivot],matrix[col]
+        if abs(matrix[col][col])<1e-6:
+            return None
+        divisor=matrix[col][col]
+        matrix[col]=[v/divisor for v in matrix[col]]
+        for row in range(3):
+            if row!=col:
+                amount=matrix[row][col]
+                matrix[row]=[a-amount*b for a,b in zip(matrix[row],matrix[col])]
+    b,c=matrix[1][3]/scales[0],matrix[2][3]/scales[1]
+    return matrix[0][3]-b*means[0]-c*means[1],b,c
 
 
 class ThermalModel:
@@ -94,9 +177,14 @@ class ThermalModel:
     """
 
     def __init__(self) -> None:
+        self._response_samples = deque(maxlen=240)
+        self.response = None
+        self._response_revision = self._response_since_fit = self.response_matches = 0
+        self.response_reason = "insufficient_response_intervals"
         self._k: float = _FALLBACK_K
         self._valid: bool = False
         self._sample_count: int = 0
+        self.rate_noise: Optional[float] = None
 
         # Braking samples accumulated since the last fit cycle.
         self._samples: Deque[ThermalSample] = deque(maxlen=240)
@@ -144,6 +232,9 @@ class ThermalModel:
             and _K_MIN < k < _K_MAX
         ):
             self._k = float(k)
+            self.rate_noise = (
+                None  # Restored parameters are not fresh calibration evidence.
+            )
             self._valid = True
             self._sample_count = (
                 sample_count if type(sample_count) is int and sample_count >= 0 else 0
@@ -160,19 +251,30 @@ class ThermalModel:
 
     # ── Sample collection ──────────────────────────────────────────────────────
 
-    def record_temp(self, now: datetime, indoor_temp: Optional[float]) -> None:
+    def record_temp(
+        self,
+        now: datetime,
+        indoor_temp: Optional[float],
+        *,
+        qualified_interval: bool = False,
+    ) -> None:
         """
         Record indoor temperature for later cooling-rate estimation.
 
-        Call every polling cycle, including missing readings, so an invalid
-        observation breaks the rate history instead of inventing a temperature.
+        The observer supplies qualified window endpoints. A missing reading
+        breaks the rate history instead of inventing a temperature.
         """
         if indoor_temp is None or not math.isfinite(indoor_temp):
             self._temp_history.clear()
             return
         if self._temp_history:
             elapsed_seconds = now.timestamp() - self._temp_history[-1][0].timestamp()
-            if elapsed_seconds <= 0.0 or elapsed_seconds > _MAX_TEMP_GAP_MINUTES * 60:
+            limit = (
+                _MAX_QUALIFIED_INTERVAL_SECONDS
+                if qualified_interval
+                else _MAX_TEMP_GAP_MINUTES * 60
+            )
+            if elapsed_seconds <= 0.0 or elapsed_seconds > limit:
                 self._temp_history.clear()
         self._temp_history.append((now, indoor_temp))
 
@@ -180,7 +282,10 @@ class ThermalModel:
         self,
         indoor_temp: float,
         outdoor_temp: float,
-    ) -> None:
+        *,
+        rate_uncertainty: float = 0.0,
+        reset_samples: bool = False,
+    ) -> bool:
         """
         Collect one sample during braking periods.
 
@@ -190,35 +295,45 @@ class ThermalModel:
         Samples are skipped when:
         - the history window is too short
         - the indoor/outdoor temperature delta is too small to be meaningful
-        - the measured rate does not indicate actual cooling
+        - the measured rate exceeds the empirical report-step allowance
         - the measured rate is clearly implausible
         """
         rate = self._compute_rate()
         if rate is None:
-            return
+            return False
 
-        # Only use real cooling samples.
-        # If indoor temperature is still flat/rising, the sample is not useful
-        # for estimating passive heat loss during braking.
-        if rate >= 0.0:
-            return
+        # Keep quantized flat/slightly rising windows only within the observed
+        # report-step allowance, so coarse reporting does not bias the fit.
+        if rate >= 0.0 and (rate_uncertainty <= 0 or rate > rate_uncertainty):
+            return False
 
         # Reject obvious spikes/noise before they contaminate the fit.
         if rate < _MIN_RATE_C_PER_HOUR or rate > _MAX_RATE_C_PER_HOUR:
-            return
+            return False
 
         delta_t = indoor_temp - outdoor_temp
         if abs(delta_t) < 2.0:
             # Too small a delta — measurement noise dominates.
-            return
+            return False
 
+        # Change the calibration cohort only when this window is admitted.
+        # A rejected/unfinished ramp must not erase earlier qualified samples.
+        if reset_samples:
+            self._samples.clear()
         self._samples.append(
             ThermalSample(
                 indoor_temp=indoor_temp,
                 outdoor_temp=outdoor_temp,
                 rate=rate,
+                interval_hours=(
+                    self._temp_history[-1][0] - self._temp_history[0][0]
+                ).total_seconds()
+                / 3600,
+                rate_uncertainty=rate_uncertainty,
             )
         )
+
+        return True
 
     def _compute_rate(self) -> Optional[float]:
         """
@@ -262,9 +377,39 @@ class ThermalModel:
             )
             return
 
+        # Robust admission before the existing OLS fit. This limits minority
+        # heat/noise contamination; it cannot identify a uniformly heated batch.
+        candidates = [
+            (sample, -sample.rate / (sample.indoor_temp - sample.outdoor_temp))
+            for sample in self._samples
+            if sample.indoor_temp - sample.outdoor_temp >= 2.0
+        ]
+        candidates = [
+            (s, k)
+            for s, k in candidates
+            if k + s.rate_uncertainty / (s.indoor_temp - s.outdoor_temp) > _K_MIN
+            and k - s.rate_uncertainty / (s.indoor_temp - s.outdoor_temp) < _K_MAX
+        ]
+        if len(candidates) < _MIN_SAMPLES:
+            return
+        center = median(k for _, k in candidates)
+        mad = median(abs(k - center) for _, k in candidates)
+        tolerance = max(0.003, 0.15 * center, 3 * 1.4826 * mad)
+        retained = [
+            sample
+            for sample, k in candidates
+            if abs(k - center)
+            <= max(
+                tolerance,
+                sample.rate_uncertainty / (sample.indoor_temp - sample.outdoor_temp),
+            )
+        ]
+        if len(retained) < _MIN_SAMPLES:
+            return
+
         sum_xy = 0.0
         sum_xx = 0.0
-        for sample in self._samples:
+        for sample in retained:
             delta_t = sample.indoor_temp - sample.outdoor_temp
             sum_xy += sample.rate * delta_t
             sum_xx += delta_t**2
@@ -278,7 +423,14 @@ class ThermalModel:
         if _K_MIN < k < _K_MAX:
             self._k = k
             self._valid = True
-            self._sample_count = len(self._samples)
+            self._sample_count = len(retained)
+            residuals = [
+                s.rate + k * (s.indoor_temp - s.outdoor_temp) for s in retained
+            ]
+            residual_center = median(residuals)
+            self.rate_noise = 1.4826 * median(
+                abs(r - residual_center) for r in residuals
+            )
             _LOGGER.debug(
                 "ThermalModel: fitted k=%.4f from %d samples",
                 k,
@@ -295,6 +447,90 @@ class ThermalModel:
 
         # Clear samples after fit so a new learning window can begin.
         self._samples.clear()
+
+    @property
+    def response_pending_samples(self):
+        return len(self._response_samples)
+
+    def reset_response(self, *, samples=True, discard_fit=False):
+        self.response_matches=0
+        if samples:
+            self._response_samples.clear()
+            self._response_since_fit=0
+        if discard_fit:
+            self.response=None
+            self.response_reason="temperature_definition_changed"
+
+    def collect_response_sample(self, delta, command, rate, hours, mode):
+        if (any(type(v) not in (float,int) or not math.isfinite(v) for v in (delta,command,rate,hours))
+            or not -5<=rate<=3 or not 1/6<=hours<=2 or not -60<=command<=60
+            or not -100<=delta<=100 or mode not in ("normal","braking","brake_hold","preheating","recovery","pre_braking","holiday")):
+            return False
+        self._response_samples.append((delta,command,rate,hours,mode))
+        self._response_since_fit+=1
+        return True
+
+    def fit_response(self):
+        self._response_since_fit=0
+        samples=list(self._response_samples)
+        if len(samples)<20:
+            self.response_reason="insufficient_response_intervals"
+            return False
+        coefficients=_response_regression(samples)
+        if coefficients is None:
+            self.response_reason="insufficient_independent_variation"
+            return False
+        residuals=[s[2]-sum(a*b for a,b in zip(coefficients,(1,s[0],s[1]))) for s in samples]
+        center=median(residuals)
+        spread=max(.10,3*1.4826*median(abs(v-center) for v in residuals))
+        retained=[s for s,e in zip(samples,residuals) if abs(e-center)<=max(spread,.1/s[3])]
+        coefficients=_response_regression(retained) if len(retained)>=20 else None
+        if coefficients is None or not (.005<coefficients[1]<.5 and 0<=coefficients[2]<=1 and abs(coefficients[0])<=5):
+            self.response_reason="unidentified_or_implausible_response"
+            return False
+        errors=[s[2]-sum(a*b for a,b in zip(coefficients,(1,s[0],s[1]))) for s in retained]
+        noise=math.sqrt(sum(e*e for e in errors)/len(errors))
+        if noise>.5:
+            self.response_reason="unstable_response"
+            return False
+        self._response_revision+=1
+        self.response=ResponseFit(coefficients,
+            (min(s[0] for s in retained),max(s[0] for s in retained)),
+            (min(s[1] for s in retained),max(s[1] for s in retained)),noise,len(retained),
+            self._response_revision,tuple(sorted({s[4] for s in retained if sum(t[4]==s[4] for t in retained)>=5})))
+        self.response_matches=0
+        self._response_since_fit=0
+        self.response_reason="unconfirmed_response"
+        return True
+
+    def response_state(self):
+        from dataclasses import asdict
+        return asdict(self.response) if self.response else None
+
+    def restore_response(self, saved):
+        try:
+            if not isinstance(saved,dict):
+                return False
+            if (len(saved.get('coefficients',()))!=3 or len(saved.get('delta_range',()))!=2
+                or len(saved.get('command_range',()))!=2):
+                return False
+            a,b,c=saved['coefficients']
+            values=(*saved['coefficients'],*saved['delta_range'],*saved['command_range'],saved['noise_c_per_hour'])
+            if (any(type(v) not in (int,float) or not math.isfinite(v) for v in values)
+                or not (.005<b<.5 and 0<=c<=1 and abs(a)<=5 and 0<=saved['noise_c_per_hour']<=.5)
+                or type(saved['sample_count']) is not int or saved['sample_count']<20
+                or type(saved['revision']) is not int or saved['revision']<1
+                or any(saved[r][0]>saved[r][1] for r in ('delta_range','command_range'))
+                or not saved['modes'] or any(m not in ('normal','braking','brake_hold','preheating','recovery','pre_braking','holiday') for m in saved['modes'])):
+                return False
+            self.response=ResponseFit(tuple(saved['coefficients']),tuple(saved['delta_range']),
+                tuple(saved['command_range']),saved['noise_c_per_hour'],saved['sample_count'],saved['revision'],tuple(saved['modes']))
+            self._response_revision=self.response.revision
+            self.reset_response()
+            self.response_reason="restored_response_unconfirmed"
+            return True
+        except (KeyError,TypeError,ValueError):
+            return False
 
     # ── Prediction helpers (diagnostic / future-facing) ───────────────────────
 

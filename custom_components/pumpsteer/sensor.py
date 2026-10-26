@@ -14,7 +14,8 @@ from homeassistant.helpers.typing import StateType
 
 from .thermal_model import ThermalModel, _MIN_SAMPLES
 from .thermal_observer import ThermalObserver
-from .thermal_intelligence import _utc
+from .thermal_intelligence import _utc, PIProjection
+from .thermal_assist import assess_assistance
 
 from .control import PIController
 from .electricity_price import (
@@ -119,6 +120,7 @@ class PumpSteerSensor(RestoreEntity):
 
         self._pi = PIController()
         self._pi_precool_paused: bool = False
+        self._thermal_forecast = None
         self._thermal_model = ThermalModel()
         self._thermal_observer = ThermalObserver(self._thermal_model)
         self._thermal_reload_unsub = None
@@ -266,6 +268,9 @@ class PumpSteerSensor(RestoreEntity):
                 "k": self._thermal_model.k,
                 "valid": self._thermal_model.is_valid,
                 "sample_count": self._thermal_model.sample_count,
+                "response_fit": self._thermal_model.response_state(),
+                "response_sources": list(self._thermal_source_ids()),
+                "response_identity": self._thermal_observer._response_identity,
             },
         )
 
@@ -320,7 +325,12 @@ class PumpSteerSensor(RestoreEntity):
         saved_model = (
             extra.as_dict().get("thermal_model", {}) if extra is not None else {}
         )
-        if isinstance(saved_model, dict) and saved_model.get("valid") is True:
+        if (
+            isinstance(saved_model, dict)
+            and saved_model.get("valid") is True
+            and type(saved_model.get("sample_count")) is int
+            and saved_model["sample_count"] >= _MIN_SAMPLES
+        ):
             self._thermal_model.restore_k(
                 saved_model.get("k"), saved_model.get("sample_count", 0)
             )
@@ -336,6 +346,9 @@ class PumpSteerSensor(RestoreEntity):
                 self._attributes.get("thermal_k"),
                 self._attributes.get("thermal_k_samples", 0),
             )
+        if (isinstance(saved_model,dict) and saved_model.get("response_sources")==list(self._thermal_source_ids())):
+            if self._thermal_model.restore_response(saved_model.get("response_fit")):
+                self._thermal_observer.restore_response_identity(saved_model.get("response_identity"))
         self._thermal_observer.start(dt_util.now())
         self._attributes["thermal_diagnostics"] = self._thermal_observer.attributes()
         self._thermal_reload_unsub = self.hass.bus.async_listen(
@@ -628,6 +641,22 @@ class PumpSteerSensor(RestoreEntity):
                 return True
         return False
 
+    def _capture_thermal_forecast(self, points, received_at):
+        try:
+            from .forecast import make_thermal_forecast
+            cfg=self._cfg()
+            weather=self.hass.states.get(cfg.get("weather_entity"))
+            today=cfg.get("electricity_price_entity")
+            tomorrow=cfg.get("price_tomorrow_entity")
+            self._thermal_forecast=make_thermal_forecast(points,received_at=received_at,
+                weather_source=cfg.get("weather_entity", ""),price_source=today or "",
+                price_state=self.hass.states.get(today),
+                tomorrow_state=self.hass.states.get(tomorrow) if tomorrow and tomorrow!=today else None,
+                weather_unit=weather.attributes.get("temperature_unit") if weather else None)
+        except Exception:
+            self._thermal_forecast=None
+            _LOGGER.debug("Thermal snapshot unavailable; existing control unchanged",exc_info=True)
+
     async def _forecast_temps(self) -> Optional[List[float]]:
         cfg = self._cfg()
         weather_entity = cfg.get("weather_entity")
@@ -905,17 +934,7 @@ class PumpSteerSensor(RestoreEntity):
         return (
             cfg.get("indoor_temp_entity"),
             cfg.get("real_outdoor_entity"),
-            cfg.get("external_heat_entity"),
         )
-
-    def _thermal_external_heat(self):
-        entity_id = self._cfg().get("external_heat_entity")
-        if not entity_id:
-            return False
-        state = self.hass.states.get(entity_id)
-        if state is None or state.attributes.get("restored"):
-            return None
-        return {"on": True, "off": False}.get(state.state)
 
     def _thermal_source_boundary(self):
         sources = self._thermal_source_ids()
@@ -927,9 +946,6 @@ class PumpSteerSensor(RestoreEntity):
         """Update sensor state."""
         try:
             self._thermal_source_boundary()
-            self._thermal_observer.pause_for_external_heat(
-                dt_util.now(), self._thermal_external_heat()
-            )
         except Exception:
             _LOGGER.exception("Thermal source qualification failed; control unchanged")
         try:
@@ -949,21 +965,48 @@ class PumpSteerSensor(RestoreEntity):
         try:
             self._thermal_source_boundary()
             cfg = self._cfg()
+            thermal_now = dt_util.now()
+            pi_projection=PIProjection.from_control(cfg,self._attributes,thermal_now)
             self._thermal_observer.observe(
-                dt_util.now(),
+                thermal_now,
                 self.hass.states.get(cfg.get("indoor_temp_entity")),
                 self.hass.states.get(cfg.get("real_outdoor_entity")),
-                external_heat=self._thermal_external_heat(),
+                control_context=(
+                    self._attributes.get("mode"),
+                    self._attributes.get("brake_factor"),
+                ),
                 braking=self._attributes.get("mode") in (MODE_BRAKING, MODE_BRAKE_HOLD)
                 and self._attributes.get("brake_factor", 0) > 0,
+                operation={"mode":self._attributes.get("mode"),
+                    "brake_factor":self._attributes.get("brake_factor",0),
+                    "fake_outdoor_temperature":self._state,
+                    "external_heat_sources":cfg.get("external_heat_sources",False) is True,
+                    "pi_projection":pi_projection},
+                forecast=self._thermal_forecast,
             )
+            diagnostics = self._thermal_observer.attributes()
+            inside=self._attributes.get("indoor_temperature")
+            outside=self._attributes.get("outdoor_temperature")
+            target=self._attributes.get("target_temperature")
+            aggressiveness=self._aggressiveness(cfg)
+            floor=self._comfort_floor(target,aggressiveness) if type(target) in (int,float) else None
+            ceiling=target+self._preheat_headroom(aggressiveness) if type(target) in (int,float) else None
+            recommendation=assess_assistance(True,diagnostics,now=thermal_now,
+                forecast=self._thermal_forecast,indoor=inside,outdoor=outside,target=target,
+                comfort_floor=floor,ceiling=ceiling,mode=self._attributes.get("mode"),
+                control_signal=-self._state if type(self._state) in (int,float) else None,
+                response=self._thermal_model.response,preheat_enabled=self._preheat_enabled(cfg),
+                pi_projection=pi_projection)
             self._attributes.update(
                 {
                     "thermal_k": round(self._thermal_model.k, 4),
                     "thermal_k_valid": self._thermal_model.is_valid,
                     "thermal_k_samples": self._thermal_model.sample_count,
                     "thermal_pending_samples": self._thermal_model.pending_samples,
-                    "thermal_diagnostics": self._thermal_observer.attributes(),
+                    "thermal_diagnostics": diagnostics,
+                    # Advice is computed only AFTER PI and hardware dispatch.
+                    # It is never read by _do_update or any output adapter.
+                    "thermal_assist": recommendation,
                 }
             )
         except Exception:
@@ -973,6 +1016,7 @@ class PumpSteerSensor(RestoreEntity):
         """Run the main control state machine."""
         now = dt_util.now()
         cfg = self._cfg()
+        self._thermal_forecast = None
 
         indoor = safe_float(get_state(self.hass, cfg.get("indoor_temp_entity")))
         outdoor = safe_float(get_state(self.hass, cfg.get("real_outdoor_entity")))
@@ -1064,6 +1108,7 @@ class PumpSteerSensor(RestoreEntity):
                     _outlook_points,
                     summer_threshold=summer_threshold,
                 )
+                self._capture_thermal_forecast(_outlook_points, dt_util.now())
             except Exception as _err:
                 _LOGGER.debug("ThermalOutlook computation failed: %s", _err)
 

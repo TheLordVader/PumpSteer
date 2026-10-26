@@ -1,0 +1,17 @@
+{
+  "options": {
+    "step": {
+      "init": {
+        "data": {
+          "external_heat_sources": "Använder du ibland en extra värmekälla?"
+        },
+        "data_description": {
+          "external_heat_sources": "Exempelvis braskamin, luftvärmepump eller annan tillskottsvärme. PumpSteer kan automatiskt försöka ta hänsyn till extra uppvärmning."
+        }
+      }
+    },
+    "error": {
+      "invalid_external_heat_sources": "Välj ja eller nej för extra värmekällor"
+    }
+  }
+}

@@ -63,13 +63,16 @@ def test_missing_indoor_does_not_record_an_invented_zero(monkeypatch, missing):
     _cycle(sensor, monkeypatch, 1)
     assert sensor.extra_state_attributes["mode"] == "safe_mode"
     assert not sensor._thermal_model._temp_history
+    assert sensor._thermal_observer._response_window is None
 
 
 def test_real_zero_degree_indoor_observation_is_retained(monkeypatch):
     sensor, states = _sensor()
     states["sensor.indoor"].state = "0"
     _cycle(sensor, monkeypatch, 0)
-    assert [temp for _, temp in sensor._thermal_model._temp_history] == [0.0]
+    window=sensor._thermal_observer._response_window
+    assert window is not None and window['indoor'].celsius==0.0
+    assert sensor._thermal_model.response_pending_samples==0
 
 
 @pytest.mark.parametrize("bad", [None, float("nan"), float("inf"), -float("inf")])

@@ -40,8 +40,7 @@
           "modbus_interval_minutes": "Intervall för generisk utgång",
           "ohmigo_relay_entity": "Ohmigo Active/Bypass-relä (valfritt)",
           "notification_level": "Prisnotiser",
-          "notification_cooldown_minutes": "Spärrtid för upprepade prisnotiser",
-          "external_heat_entity": "Extern värmekälla (valfri, endast diagnostik)"
+          "notification_cooldown_minutes": "Spärrtid för upprepade prisnotiser"
         },
         "data_description": {
           "pid_kp": "Hur kraftigt PumpSteer reagerar på aktuell temperaturdifferens. Typiskt intervall: 2,0 till 5,0.",
@@ -58,8 +57,7 @@
           "modbus_interval_minutes": "Minsta tid mellan anrop från Generic Output System.",
           "ohmigo_relay_entity": "Valfri switch-entitet för Ohmigos Active/Bypass-relä. När den är konfigurerad skapar PumpSteer en separat Relay Guard-brytare. Skyddet återställer bara ett uttryckligt OFF-läge när Ohmigo Push är på; unknown eller unavailable skickar aldrig något reläkommando.",
           "notification_level": "Välj alla prisnotiser, endast bromsning eller inga. Den befintliga notisbrytaren är fortfarande huvudbrytare.",
-          "notification_cooldown_minutes": "Minsta tid mellan två notiser av samma typ. Välj 0 för ingen spärr; 60 minuter rekommenderas. Bromsning och förvärmning har separata spärrtider.",
-          "external_heat_entity": "Välj en befintlig på/av-entitet. På eller okänd status pausar inlärning och bryter observationerna. Tomt val bevarar beteendet. Påverkar inte reglering eller utgångar."
+          "notification_cooldown_minutes": "Minsta tid mellan två notiser av samma typ. Välj 0 för ingen spärr; 60 minuter rekommenderas. Bromsning och förvärmning har separata spärrtider."
         }
       }
     },

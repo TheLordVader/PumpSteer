@@ -1,3 +1,8 @@
+> Historical proposed PR text for the published e1a74402 candidate. No PR was
+> created. The local self-learning follow-up changes the external-heat design;
+> see THERMAL_INTELLIGENCE.md for current behavior, evidence and limitations.
+> Do not use this archived draft as the current PR description.
+
 # Proposed title
 
 Add passive braking forecasts and observed-error diagnostics to ThermalModel
