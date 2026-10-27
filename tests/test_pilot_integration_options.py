@@ -445,3 +445,43 @@ def test_options_offer_supply_mode_and_threshold(monkeypatch):
         if isinstance(key, tuple)
     )
     assert ("thermal_supply_threshold", 30) in schema
+
+
+def test_new_paired_bad_forecast_invalidates_cached_plan(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    sensor, states = _sensor()
+    sensor._config_entry.options.update(
+        thermal_intelligence_enabled=True,
+        thermal_heat_activity_entity="binary_sensor.house_heat",
+    )
+    start = datetime(2026, 10, 11, 8, tzinfo=timezone.utc)
+    for key in ("sensor.indoor", "sensor.outdoor"):
+        states[key].attributes["unit_of_measurement"] = "°C"
+        states[key].last_changed = start
+    states["binary_sensor.house_heat"] = SimpleNamespace(
+        state="on", last_reported=start, last_changed=start, attributes={}
+    )
+    _cycle(sensor, monkeypatch, 0)
+    audit = sensor._pilot.audit
+    audit.records = [
+        {
+            "revision": "r",
+            "error": 0.2,
+            "persistence_error": 0,
+            "horizon_seconds": 900,
+            "observed": start.isoformat(),
+        }
+        for _ in range(4)
+    ]
+    assert audit.issue(
+        start, 20.5, 5, 1, 0.02, 0.4, 0.1, "r", source_identity=(None, None)
+    )
+    sensor._pilot_plan = {"planning_status": "validated_passive"}
+    sensor._pilot_plan_next = start + timedelta(hours=1)
+    for minute in (5, 10):
+        at = start + timedelta(minutes=minute)
+        states["binary_sensor.house_heat"].last_reported = at
+        attrs = _cycle(sensor, monkeypatch, minute)
+    assert attrs["thermal_intelligence_planning_status"] != "validated_passive"
+    assert attrs["thermal_intelligence_forecast_quality"]["status"] == "degraded"

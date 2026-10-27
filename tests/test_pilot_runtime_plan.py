@@ -526,16 +526,47 @@ def test_ha_cycle_exposes_validated_passive_with_synthetic_qualified_fixture(
         reason="ready",
         parameters=ResponseParameters(),
         history=[(i, i % 2, i % 2, 5) for i in range(112)],
+        export_state=lambda: {"history": []},
     )
+    from custom_components.pumpsteer.pilot_forecast_audit import ForecastAudit
+
     sensor._pilot = SimpleNamespace(
         house_intervals=8,
-        manager=SimpleNamespace(pump=pump, response_state=lambda ts: (0.4, ())),
+        audit=ForecastAudit(),
+        last_indoor_report=at,
+        source_identity=(None, None),
+        manager=SimpleNamespace(
+            pump=pump,
+            model=SimpleNamespace(export_state=lambda: {"observations": []}),
+            recent=[(at.timestamp(), 0.5, 1.0)],
+            response_state=lambda ts: (0.4, ()),
+        ),
         validated_house=lambda now: house,
+    )
+    saved = []
+
+    class MemoryStore:
+        def async_delay_save(self, callback, delay):
+            saved.append(callback())
+
+    sensor._pilot_store = MemoryStore()
+    sensor._pilot_sources = (
+        "sensor.indoor",
+        "sensor.outdoor",
+        "binary_sensor.heat",
+        False,
     )
     monkeypatch.setattr(sensor, "_observe_pilot", lambda *args: None)
     attrs = _cycle(sensor, monkeypatch, 0)
     assert attrs["thermal_intelligence_planning_status"] == "validated_passive"
     assert attrs["thermal_intelligence_plan_detail"]["validation"]["samples"] == 8
+    assert saved[-1]["forecast_audit"]["pending"]["issued"] == at.isoformat()
+    assert (
+        attrs["thermal_intelligence_plan_detail"]["monitoring_forecast"][
+            "horizon_minutes"
+        ]
+        == 15
+    )
     assert (
         attrs["thermal_intelligence_plan_detail"]["cost_kind"] == "proxy_not_currency"
     )
@@ -559,3 +590,36 @@ def test_ha_cycle_exposes_validated_passive_with_synthetic_qualified_fixture(
         attrs["thermal_intelligence_plan_detail"]["reason"]
         == "inputs_changed_during_planning"
     )
+
+
+def test_extended_horizon_reports_terminal_state_without_claiming_savings():
+    price = price_state()
+    price.attributes["raw_today"] = [
+        {
+            "start": (T + timedelta(minutes=15 * i)).isoformat(),
+            "end": (T + timedelta(minutes=15 * (i + 1))).isoformat(),
+            "value": 1.0,
+        }
+        for i in range(32)
+    ]
+    forecasts = [
+        {"datetime": (T + timedelta(hours=i)).isoformat(), "temperature": 5}
+        for i in range(9)
+    ]
+    result = hypothetical_plan(
+        now=T,
+        indoor=20.8,
+        outdoor=5,
+        command=5,
+        target=21,
+        floor=20.5,
+        ceiling=21.5,
+        price_states=[price],
+        weather_rows=forecasts,
+        weather_unit="°C",
+    )
+    assert result["horizon_minutes"] == 480
+    assert result["comparison"]["baseline"] == "unavailable"
+    assert result["comparison"]["heat_storage"] == "unknown"
+    assert result["comparison"]["savings"] == "unverified"
+    assert result["comparison"]["final_temperature"] == result["temperatures"][-1]

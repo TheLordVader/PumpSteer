@@ -117,8 +117,9 @@ def hypothetical_plan(
         return {**unavailable, "reason": "price_forecast_unavailable"}
     if weather_unit != "°C" or _weather_intervals(weather_rows, now) is None:
         return {**unavailable, "reason": "weather_forecast_unavailable"}
-    # Limit the search to six hours and only use contiguous provider coverage.
-    for horizon in range(6, 1, -1):
+    # Bounded beam search: at most 48 quarter-hour steps per planning run.
+    max_steps = 48
+    for horizon in range(max_steps // 4, 1, -1):
         prices = price_window(price_states, now, timedelta(hours=horizon))
         weather = _weather_intervals(weather_rows, now, horizon)
         if prices is not None and weather is not None:
@@ -235,6 +236,35 @@ def hypothetical_plan(
         "duties": [round(x, 2) for x in plan.duty_sequence],
         "temperatures": [round(x, 2) for x in plan.predicted_temperatures],
         "comfort_status": plan.comfort_status,
+        "comparison": {
+            "baseline": "unavailable",
+            "baseline_reason": "future_pi_and_heat_delivery_unknown",
+            "recovery": "unknown",
+            "heat_storage": "unknown",
+            "savings": "unverified",
+            "final_temperature": round(plan.predicted_temperatures[-1], 2),
+            "minimum_temperature": round(min(plan.predicted_temperatures), 2),
+            "maximum_temperature": round(max(plan.predicted_temperatures), 2),
+            "below_floor_degree_hours": round(
+                sum(
+                    max(0, floor - temp) * 0.25
+                    for temp in plan.predicted_temperatures[1:]
+                ),
+                3,
+            ),
+            "above_ceiling_degree_hours": round(
+                sum(
+                    max(0, temp - ceiling) * 0.25
+                    for temp in plan.predicted_temperatures[1:]
+                ),
+                3,
+            ),
+            "cost": "unavailable",
+            "plan_score": round(plan.cost, 4),
+            "plan_score_kind": "pilot_mixed_comfort_price_proxy",
+            "period_complete": "unverified",
+            "resource_cap_reached": horizon * 4 == max_steps,
+        },
     }
     if validated:
         result["validation"] = {

@@ -140,6 +140,9 @@ class PumpSteerSensor(RestoreEntity):
         self._pilot_plan = {"planning_status": "unavailable", "reason": "not_evaluated"}
         self._pilot_plan_next = None
         self._pilot_plan_signature = None
+        self._pilot_house_candidate = None
+        self._pilot_house_candidate_at = None
+        self._pilot_house_candidate_owner = None
         self._pilot_weather_raw = None
         self._pilot_store = None
         self._pilot_saved = None
@@ -238,6 +241,7 @@ class PumpSteerSensor(RestoreEntity):
             "thermal_intelligence_external_heat",
             "thermal_intelligence_planning_status",
             "thermal_intelligence_plan_detail",
+            "thermal_intelligence_forecast_quality",
             "thermal_intelligence_heat_source",
             "thermal_intelligence_response",
         ):
@@ -285,6 +289,16 @@ class PumpSteerSensor(RestoreEntity):
             )
             attrs["thermal_intelligence_planning_status"] = plan["planning_status"]
             attrs["thermal_intelligence_plan_detail"] = plan
+            if (
+                self._pilot is not None
+                and self._pilot.audit.records
+                and not interrupted
+            ):
+                revision = self._pilot.audit.records[-1]["revision"]
+                attrs["thermal_intelligence_forecast_quality"] = {
+                    "model_revision": revision,
+                    **self._pilot.audit.summary(revision),
+                }
             attrs["thermal_intelligence_forecast"] = (
                 "weather_outlook_unverified"
                 if not interrupted and self._pilot_forecast_available
@@ -2308,7 +2322,19 @@ class PumpSteerSensor(RestoreEntity):
         pump_last = (
             pilot.manager.pump.history[-1][0] if pilot.manager.pump.history else None
         )
-        key = (self._pilot_sources, pilot.house_intervals, pump_last)
+        audit_last = (
+            pilot.audit.records[-1]["observed"] if pilot.audit.records else None
+        )
+        audit_pending = (
+            pilot.audit.pending["issued"].isoformat() if pilot.audit.pending else None
+        )
+        key = (
+            self._pilot_sources,
+            pilot.house_intervals,
+            pump_last,
+            audit_last,
+            audit_pending,
+        )
         if key == self._pilot_saved:
             return
         payload = {
@@ -2317,6 +2343,7 @@ class PumpSteerSensor(RestoreEntity):
             "identity": pilot.source_identity,
             "house": pilot.manager.model.export_state(),
             "pump": pilot.manager.pump.export_state(),
+            "forecast_audit": pilot.audit.export_state(),
         }
         try:
             self._pilot_store.async_delay_save(lambda: payload, 30)
@@ -2388,7 +2415,9 @@ class PumpSteerSensor(RestoreEntity):
                 return
             restored.manager.pump.restore(pump)
             restored.manager.pump.ready = False
+            restored.audit.restore(saved.get("forecast_audit"), now)
             pilot.manager = restored.manager
+            pilot.audit = restored.audit
             identity = saved.get("identity")
             if isinstance(identity, (tuple, list)) and len(identity) == 2:
                 first = (
@@ -2404,7 +2433,16 @@ class PumpSteerSensor(RestoreEntity):
                 if pilot.manager.pump.history
                 else None
             )
-            self._pilot_saved = (signature, pilot.house_intervals, pump_last)
+            audit_last = (
+                pilot.audit.records[-1]["observed"] if pilot.audit.records else None
+            )
+            self._pilot_saved = (
+                signature,
+                pilot.house_intervals,
+                pump_last,
+                audit_last,
+                None,
+            )
         except (TypeError, ValueError, KeyError, OverflowError):
             _LOGGER.warning("Passive thermal history was invalid and was ignored")
 
@@ -2560,16 +2598,27 @@ class PumpSteerSensor(RestoreEntity):
         snapshot = state_snapshot()
         config_snapshot = dict(cfg)
 
+        cached_house = (
+            self._pilot_house_candidate
+            if self._pilot_house_candidate_owner is pilot
+            and self._pilot_house_candidate_at is not None
+            and timedelta(0)
+            <= now - self._pilot_house_candidate_at
+            <= timedelta(hours=3)
+            else None
+        )
+
         def evaluate():
-            house = (
+            fresh_house = (
                 pilot.validated_house(now.timestamp())
                 if response_context is not None
                 and cfg.get("external_heat_sources") is not True
                 else None
             )
-            return task(house_context=house)
+            house = (cached_house or fresh_house) if fresh_house is not None else None
+            return task(house_context=house), house
 
-        result = await asyncio.to_thread(evaluate)
+        result, house = await asyncio.to_thread(evaluate)
         expected = {
             "indoor_temp_entity": extra.get("indoor_temperature"),
             "real_outdoor_entity": extra.get("outdoor_temperature"),
@@ -2588,7 +2637,71 @@ class PumpSteerSensor(RestoreEntity):
             }
             self._pilot_plan_next = None
             return
-        result["issued_at"] = now.isoformat()
+        issued_at = dt_util.now()
+        if issued_at < now or issued_at - now > timedelta(minutes=1):
+            self._pilot_plan = {
+                "planning_status": "unavailable",
+                "reason": "planning_result_delayed",
+            }
+            self._pilot_plan_next = None
+            return
+        if house is not None and pilot is not None:
+            if cached_house is None:
+                self._pilot_house_candidate = dict(house)
+                self._pilot_house_candidate_at = now
+                self._pilot_house_candidate_owner = pilot
+            import hashlib
+
+            raw = "pilot-house-v1:" + ":".join(
+                format(house[key], ".17g") for key in ("loss", "gain", "background")
+            )
+            revision = hashlib.sha256(raw.encode()).hexdigest()[:16]
+            quality = pilot.audit.summary(revision)
+            result["forecast_quality"] = quality
+            if quality["status"] == "degraded":
+                result = {
+                    "planning_status": "unavailable",
+                    "reason": "forecast_quality_degraded",
+                    "forecast_quality": quality,
+                }
+            elif (
+                result.get("planning_status") == "validated_passive"
+                and pilot.last_indoor_report is not None
+                and timedelta(0)
+                <= issued_at - pilot.last_indoor_report
+                <= timedelta(minutes=5)
+                and pilot.manager.recent
+            ):
+                tick, _, observed_heat = pilot.manager.recent[-1]
+                if 0 <= issued_at.timestamp() - tick <= 60:
+                    if pilot.audit.issue(
+                        issued_at,
+                        extra.get("indoor_temperature"),
+                        extra.get("outdoor_temperature"),
+                        observed_heat,
+                        house["loss"],
+                        house["gain"],
+                        house["background"],
+                        revision,
+                        source_identity=pilot.source_identity,
+                        source_reported=pilot.last_indoor_report,
+                    ):
+                        result["monitoring_forecast"] = {
+                            "kind": "conditional_unchanged_heat_and_outdoor",
+                            "horizon_minutes": 15,
+                            "temperature": round(pilot.audit.pending["forecast"], 2),
+                            "initial_temperature": pilot.audit.pending["indoor"],
+                            "rate_c_per_hour": pilot.audit.pending["rate"],
+                            "valid_horizon_minutes": [10, 20],
+                            "source_reported_at": pilot.audit.pending[
+                                "source_reported"
+                            ].isoformat(),
+                            "physical_measurement_time": "unknown",
+                            "model_revision": revision,
+                        }
+                        await self._save_pilot_store()
+        result["forecast_start"] = now.isoformat()
+        result["issued_at"] = issued_at.isoformat()
         self._pilot_plan = result
 
     def _observe_pilot(self, cfg, now, mode):
@@ -2699,6 +2812,25 @@ class PumpSteerSensor(RestoreEntity):
 
                 self._pilot = PilotPassive()
                 self._restore_pilot_history(self._pilot, signature, now)
+            if mode in {"normal", "preheating", "pre_braking", "braking", "brake_hold"}:
+                paired = self._pilot.audit.observe(
+                    now,
+                    self.hass.states.get(signature[0]),
+                    self.hass.states.get(signature[1]),
+                    heat_state,
+                )
+                if paired:
+                    revision = self._pilot.audit.records[-1]["revision"]
+                    quality = self._pilot.audit.summary(revision)
+                    if quality["status"] == "degraded":
+                        self._pilot_plan = {
+                            "planning_status": "unavailable",
+                            "reason": "forecast_quality_degraded",
+                            "forecast_quality": quality,
+                        }
+                        self._pilot_plan_next = None
+            else:
+                self._pilot.audit.pending = None
             self._pilot.observe(
                 now,
                 self.hass.states.get(signature[0]),

@@ -13,6 +13,9 @@ from .pilot_vendor.learning_manager import LearningManager
 class PilotPassive:
     def __init__(self):
         self.manager = LearningManager(AdaptiveThermalModel())
+        from .pilot_forecast_audit import ForecastAudit
+
+        self.audit = ForecastAudit()
         self.last_indoor_report = None
         self.last_indoor_value = None
         self.house_intervals = 0
@@ -23,6 +26,7 @@ class PilotPassive:
 
     def reset_interval(self, *, invalidate_validation=True, reset_pump=True):
         self.manager.house.reset()
+        self.audit.pending = None
         if reset_pump:
             self.manager.pump_intervals.reset()
             self.manager.recent.clear()
@@ -273,7 +277,11 @@ class PilotPassive:
         identity = (components, selected)
         if self.source_identity is not None and identity != self.source_identity:
             self.manager = LearningManager(AdaptiveThermalModel())
+            from .pilot_forecast_audit import ForecastAudit
+
+            self.audit = ForecastAudit()
             self.house_intervals = 0
+            self.validation_after = None
             self._context_reports = None
         self.source_identity = identity
         at, temp = current_in
