@@ -19,12 +19,17 @@ class PilotPassive:
         self.source_identity = None
         self._context_reports = None
         self.status = "waiting_for_heat_signal"
+        self.validation_after = None
 
-    def reset_interval(self):
+    def reset_interval(self, *, invalidate_validation=True, reset_pump=True):
         self.manager.house.reset()
-        self.manager.pump_intervals.reset()
-        self.manager.recent.clear()
-        self.manager.pump.ready = False
+        if reset_pump:
+            self.manager.pump_intervals.reset()
+            self.manager.recent.clear()
+            self.manager.pump.ready = False
+            self.manager.pump.reason = "interval_interrupted"
+        if invalidate_validation:
+            self.validation_after = None
         self._context_reports = None
 
     @staticmethod
@@ -64,6 +69,166 @@ class PilotPassive:
             return at, value
         except (AttributeError, TypeError, ValueError, OverflowError):
             return None
+
+    def validated_house(self, now):
+        """Validate a frozen Pilot house fit on later actual interval endpoints."""
+        rows = self.manager.model.history
+        if self.validation_after is None or len(rows) < 32:
+            return None
+        if rows[-1].end > now or now - rows[-1].end > 3 * 3600:
+            return None
+        training, validation = rows[:-8], rows[-8:]
+        if any(
+            row.end - row.hours * 3600 < self.validation_after for row in validation
+        ):
+            return None
+        if any(
+            row.end - row.hours * 3600 < prior.end - 1
+            for prior, row in zip(rows, rows[1:])
+        ):
+            return None
+        model = AdaptiveThermalModel()
+        for row in training:
+            model.add_interval(row)
+        if not model.gain_identified:
+            return None
+        outdoor_min, outdoor_max = (
+            min(row.outdoor for row in training),
+            max(row.outdoor for row in training),
+        )
+        indoor_min, indoor_max = (
+            min(row.start_temp for row in training),
+            max(row.start_temp for row in training),
+        )
+        heat_min, heat_max = (
+            min(row.heat for row in training),
+            max(row.heat for row in training),
+        )
+        if any(
+            not (
+                outdoor_min <= row.outdoor <= outdoor_max
+                and indoor_min <= row.start_temp <= indoor_max
+                and heat_min <= row.heat <= heat_max
+            )
+            for row in validation
+        ):
+            return None
+        errors, baseline = [], []
+        for row in validation:
+            prediction = row.start_temp + row.hours * (
+                model.heat_loss_coeff * (row.outdoor - row.start_temp)
+                + model.heat_gain_coeff * row.heat
+                + model.background_gain
+            )
+            errors.append(abs(prediction - row.end_temp))
+            baseline.append(abs(row.start_temp - row.end_temp))
+        mae, persistence = sum(errors) / len(errors), sum(baseline) / len(baseline)
+        if persistence < 0.02 or mae > persistence * 0.9:
+            return None
+        return {
+            "loss": model.heat_loss_coeff,
+            "gain": model.heat_gain_coeff,
+            "background": model.background_gain,
+            "mae": mae,
+            "persistence_mae": persistence,
+            "samples": len(validation),
+            "outdoor_min": outdoor_min,
+            "outdoor_max": outdoor_max,
+            "indoor_min": indoor_min,
+            "indoor_max": indoor_max,
+            "heat_min": heat_min,
+            "heat_max": heat_max,
+        }
+
+    def observe_response(
+        self,
+        now,
+        outdoor,
+        heat,
+        command,
+        mode,
+        *,
+        output_clamp,
+        reported_after=None,
+        defer_fit=False,
+    ):
+        """Collect actual HA-reported command and heat into Pilot's 15-minute bins.
+
+        The number entity reports HA state, not physical heat-pump acknowledgement.
+        """
+        from .pilot_vendor.pump_response import virtual_request
+
+        manager = self.manager
+        reports = (
+            self._report(outdoor, now, temperature=True, reported_after=reported_after),
+            self._report(heat, now, reported_after=reported_after),
+            self._report(command, now, temperature=True, reported_after=reported_after),
+        )
+        if mode not in {
+            "normal",
+            "preheating",
+            "pre_braking",
+            "braking",
+            "brake_hold",
+        } or any(value is None for value in reports):
+            manager.pump_intervals.reset()
+            manager.recent.clear()
+            manager.pump.ready = False
+            manager.pump.reason = "response_input_unavailable"
+            return
+        out, heat_report, actual = reports
+        request = virtual_request(out[1], actual[1], output_clamp)
+        if request is None:
+            manager.pump_intervals.reset()
+            manager.recent.clear()
+            manager.pump.ready = False
+            manager.pump.reason = "response_input_unavailable"
+            return
+        previous = manager.pump_intervals.last
+        if previous is not None and (
+            now.timestamp() <= previous or now.timestamp() - previous > 300
+        ):
+            manager.pump_intervals.reset()
+            manager.recent.clear()
+            manager.pump.ready = False
+            manager.pump.reason = "observation_gap"
+            previous = None
+        if previous is not None:
+            for source in (outdoor, heat, command):
+                changed = getattr(source, "last_changed", None)
+                if (
+                    changed is None
+                    or changed.tzinfo is None
+                    or (previous < changed.timestamp() < now.timestamp())
+                ):
+                    manager.pump_intervals.reset()
+                    manager.recent.clear()
+                    manager.pump.ready = False
+                    manager.pump.reason = "unobserved_transition"
+                    break
+        tick = now.timestamp()
+        if manager.recent and (
+            tick <= manager.recent[-1][0] or tick - manager.recent[-1][0] > 300
+        ):
+            manager.recent.clear()
+        manager.recent.append((tick, request, heat_report[1]))
+        while len(manager.recent) > 512 or (
+            len(manager.recent) > 1 and manager.recent[1][0] <= tick - 8100
+        ):
+            manager.recent.popleft()
+        sample = manager.pump_intervals.observe(
+            tick, None, out[1], heat_report[1], request
+        )
+        if sample is not None:
+            if defer_fit:
+                return sample
+            manager.pump.add_interval(sample)
+        elif manager.pump_intervals.last_status in {
+            "observation_gap",
+            "insufficient_coverage",
+        }:
+            manager.pump.ready = False
+            manager.pump.reason = manager.pump_intervals.last_status
 
     def observe(self, now, indoor, outdoor, heat, mode, *, reported_after=None):
         if (
@@ -121,7 +286,7 @@ class PilotPassive:
                     self.last_indoor_report is not None
                     and changed > self.last_indoor_report
                 ):
-                    self.reset_interval()
+                    self.reset_interval(invalidate_validation=False, reset_pump=False)
         except (TypeError, ValueError):
             self.reset_interval()
             self.status = "source_change_time_unavailable"
@@ -136,6 +301,8 @@ class PilotPassive:
                     self.status = "context_report_reordered"
                     return
         self._context_reports = (current_out, current_heat)
+        if self.validation_after is None:
+            self.validation_after = now.timestamp()
         new_indoor = self.last_indoor_report is None or at > self.last_indoor_report
         house = self.manager.house
         if not new_indoor:
@@ -201,3 +368,67 @@ class PilotPassive:
             self.manager.last_update = at.timestamp()
             self.house_intervals += 1
         self.status = self.manager.model.status
+
+
+class SupplyHeatDetector:
+    """Pilot hysteresis/debounce, conditioned on verified radiator mode.
+
+    Derived from Heat Pump Pilot's _update_heating_detected_from_supply,
+    Apache-2.0; this is an indicator, not measured thermal power.
+    """
+
+    def __init__(self, threshold=30.0):
+        self.threshold = threshold
+        self.value = None
+        self.candidate = None
+        self.candidate_since = None
+        self.changed_at = None
+        self.last_report = None
+
+    def observe(self, now, supply, heating_mode, *, reported_after=None):
+        temperature = PilotPassive._report(
+            supply, now, temperature=True, reported_after=reported_after
+        )
+        mode = PilotPassive._report(heating_mode, now, reported_after=reported_after)
+        if temperature is None or mode is None or mode[1] != 1.0:
+            self.value = self.candidate = self.candidate_since = self.changed_at = (
+                self.last_report
+            ) = None
+            return None
+        at, value = temperature
+        mode_changed = getattr(heating_mode, "last_changed", None)
+        if mode_changed is None or mode_changed.tzinfo is None or mode_changed > at:
+            self.value = self.candidate = self.candidate_since = self.changed_at = (
+                self.last_report
+            ) = None
+            return None
+        if self.last_report is not None and mode_changed > self.last_report:
+            self.value = self.candidate = self.candidate_since = self.changed_at = (
+                self.last_report
+            ) = None
+        if self.last_report is not None and at <= self.last_report:
+            return self.value
+        self.last_report = at
+        upper, lower = self.threshold + 0.5, self.threshold - 0.5
+        if self.value is True:
+            instantaneous = not value <= lower
+        elif self.value is False:
+            instantaneous = value >= upper
+        else:
+            instantaneous = (
+                True if value >= upper else False if value <= lower else None
+            )
+        if self.value is None and instantaneous is not None:
+            self.value, self.changed_at = instantaneous, at
+            self.candidate = self.candidate_since = None
+        elif instantaneous == self.value:
+            self.candidate = self.candidate_since = None
+        elif self.candidate != instantaneous:
+            self.candidate, self.candidate_since = instantaneous, at
+        elif (
+            self.candidate_since is not None
+            and (at - self.candidate_since).total_seconds() >= 60
+        ):
+            self.value, self.changed_at = instantaneous, at
+            self.candidate = self.candidate_since = None
+        return self.value

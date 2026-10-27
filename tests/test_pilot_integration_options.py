@@ -297,3 +297,151 @@ def test_plan_refusal_identifies_absent_heat_and_safe_mode(monkeypatch):
     states["sensor.indoor"].state = "unavailable"
     safe = _cycle(sensor, monkeypatch, 16)
     assert safe["thermal_intelligence_reason"] == "safe_mode"
+
+
+def test_response_observer_uses_reported_ohmigo_entity(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    sensor, states = _sensor()
+    sensor._config_entry.options.update(
+        thermal_intelligence_enabled=True,
+        thermal_heat_activity_entity="binary_sensor.house_heat",
+        ohmigo_entity="number.reported_command",
+        ohmigo_relay_entity="switch.active",
+    )
+    from custom_components.pumpsteer import ohmigo
+    from custom_components.pumpsteer.pilot_vendor.pump_response import PumpResponseModel
+    import threading
+
+    thread_ids = []
+    original = PumpResponseModel.add_interval
+
+    def record_thread(self, interval):
+        thread_ids.append(threading.get_ident())
+        return original(self, interval)
+
+    monkeypatch.setattr(PumpResponseModel, "add_interval", record_thread)
+    main_thread = threading.get_ident()
+
+    monkeypatch.setattr(
+        ohmigo, "_switch_entity_id", lambda hass, entry_id: "switch.push"
+    )
+    for key in ("sensor.indoor", "sensor.outdoor"):
+        states[key].attributes["unit_of_measurement"] = "°C"
+        states[key].last_changed = datetime(2026, 10, 11, 8, tzinfo=timezone.utc)
+
+    async def no_push(*args, **kwargs):
+        pass
+
+    monkeypatch.setattr(sensor, "_push_validated_temperature", no_push)
+    start = datetime(2026, 10, 11, 8, tzinfo=timezone.utc)
+    for minute in range(16):
+        at = start + timedelta(minutes=minute)
+        states["binary_sensor.house_heat"] = SimpleNamespace(
+            state="on", last_reported=at, last_changed=start, attributes={}
+        )
+        states["number.reported_command"] = SimpleNamespace(
+            state="4",
+            last_reported=at,
+            last_changed=start,
+            attributes={"unit_of_measurement": "°C"},
+        )
+        states["switch.push"] = SimpleNamespace(
+            state="on", last_reported=at, last_changed=start, attributes={}
+        )
+        states["switch.active"] = SimpleNamespace(
+            state="on", last_reported=at, last_changed=start, attributes={}
+        )
+        _cycle(sensor, monkeypatch, minute)
+    assert len(sensor._pilot.manager.pump.history) == 1
+    assert thread_ids and thread_ids[0] != main_thread
+    states["switch.active"].state = "off"
+    _cycle(sensor, monkeypatch, 16)
+    assert sensor._pilot.manager.pump.reason == "response_input_unavailable"
+
+    states["switch.active"].state = "on"
+    for minute in range(17, 33):
+        at = start + timedelta(minutes=minute)
+        for key in (
+            "binary_sensor.house_heat",
+            "number.reported_command",
+            "switch.push",
+            "switch.active",
+        ):
+            states[key].last_reported = at
+        if minute == 32:
+            import pytest
+
+            async def cancelled(*args, **kwargs):
+                raise asyncio.CancelledError
+
+            monkeypatch.setattr(asyncio, "to_thread", cancelled)
+            sensor._pilot.manager.pump.ready = True
+            with pytest.raises(asyncio.CancelledError):
+                _cycle(sensor, monkeypatch, minute)
+            assert not sensor._pilot.manager.pump.ready
+            assert sensor._pilot.manager.pump.reason == "interval_interrupted"
+        else:
+            _cycle(sensor, monkeypatch, minute)
+
+
+def test_supply_and_verified_heating_mode_feed_observer(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    sensor, states = _sensor()
+    sensor._config_entry.options.update(
+        thermal_intelligence_enabled=True,
+        thermal_supply_temp_entity="sensor.supply",
+        thermal_heating_mode_entity="binary_sensor.radiator_mode",
+        thermal_supply_threshold=30,
+    )
+    start = datetime(2026, 10, 11, 8, tzinfo=timezone.utc)
+    for key in ("sensor.indoor", "sensor.outdoor"):
+        states[key].attributes["unit_of_measurement"] = "°C"
+        states[key].last_changed = start
+    for minute in range(0, 66, 5):
+        at = start + timedelta(minutes=minute)
+        states["sensor.supply"] = SimpleNamespace(
+            state="32",
+            last_reported=at,
+            last_changed=start,
+            attributes={"unit_of_measurement": "°C"},
+        )
+        states["binary_sensor.radiator_mode"] = SimpleNamespace(
+            state="on", last_reported=at, last_changed=start, attributes={}
+        )
+        attrs = _cycle(sensor, monkeypatch, minute)
+    assert attrs["thermal_intelligence_learning_intervals"] == 1
+    assert attrs["thermal_intelligence_heat_source"] == "supply_temperature_indicator"
+    states["binary_sensor.radiator_mode"].state = "off"
+    attrs = _cycle(sensor, monkeypatch, 66)
+    assert attrs["thermal_intelligence_status"] == "heat_signal_unavailable"
+
+
+def test_options_offer_supply_mode_and_threshold(monkeypatch):
+    flow = options_flow.PumpSteerOptionsFlowHandler()
+    flow.config_entry = SimpleNamespace(data={}, options={})
+    flow.hass = SimpleNamespace(states=SimpleNamespace(async_all=lambda domain: []))
+    monkeypatch.setattr(
+        options_flow.vol,
+        "Optional",
+        lambda name, default=None, **kwargs: (name, default),
+    )
+    monkeypatch.setattr(
+        options_flow.vol,
+        "Required",
+        lambda name, default=None, **kwargs: (name, default),
+    )
+    flow.async_show_form = lambda **kwargs: kwargs
+    schema = asyncio.run(flow.async_step_init())["data_schema"]
+    assert any(
+        key[0] == "thermal_supply_temp_entity"
+        for key in schema
+        if isinstance(key, tuple)
+    )
+    assert any(
+        key[0] == "thermal_heating_mode_entity"
+        for key in schema
+        if isinstance(key, tuple)
+    )
+    assert ("thermal_supply_threshold", 30) in schema

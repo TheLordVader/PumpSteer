@@ -43,7 +43,10 @@
           "notification_cooldown_minutes": "Spärrtid för upprepade prisnotiser",
           "thermal_intelligence_enabled": "Thermal Intelligence (experimentell diagnostik)",
           "external_heat_sources": "Använder du ibland en extra värmekälla?",
-          "thermal_heat_activity_entity": "Verifierad värmetillförsel till huset (valfri)"
+          "thermal_heat_activity_entity": "Verifierad värmetillförsel till huset (valfri)",
+          "thermal_supply_temp_entity": "Framledning till radiatorer (valfri)",
+          "thermal_heating_mode_entity": "Verifierat radiatorvärmeläge (valfri)",
+          "thermal_supply_threshold": "Framledningens indikationströskel"
         },
         "data_description": {
           "pid_kp": "Hur kraftigt PumpSteer reagerar på aktuell temperaturdifferens. Typiskt intervall: 2,0 till 5,0.",
@@ -63,7 +66,10 @@
           "notification_cooldown_minutes": "Minsta tid mellan två notiser av samma typ. Välj 0 för ingen spärr; 60 minuter rekommenderas. Bromsning och förvärmning har separata spärrtider.",
           "thermal_intelligence_enabled": "Samlar passivt kvalificerade observationer om en verifierad värmesignal väljs. Påverkar inte värmestyrningen.",
           "external_heat_sources": "Exempelvis braskamin eller luftvärmepump. Tillfällig extravärme kan inte identifieras säkert; inlärningsresultat förblir ovaliderade.",
-          "thermal_heat_activity_entity": "En binär sensor där på betyder uppmätt värmetillförsel till huset och av betyder ingen. Kompressorstatus eller varmvattenläge räcker inte. Rapporttider bevisar inte fysisk mättid."
+          "thermal_heat_activity_entity": "En binär sensor där på betyder uppmätt värmetillförsel till huset och av betyder ingen. Kompressorstatus eller varmvattenläge räcker inte. Rapporttider bevisar inte fysisk mättid.",
+          "thermal_supply_temp_entity": "Välj en givare för radiatorkretsen. Temperaturen är en indikator, inte uppmätt värmeeffekt.",
+          "thermal_heating_mode_entity": "På ska betyda radiatorvärme; av eller okänt stoppar inlärning. Krävs för framledningsindikatorn.",
+          "thermal_supply_threshold": "Anpassa till värmesystemet. Fel tröskel kan ge felaktig värmeindikation."
         }
       }
     },

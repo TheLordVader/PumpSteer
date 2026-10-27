@@ -364,3 +364,153 @@ def test_reordered_or_inconsistent_context_cannot_be_used_as_fresh():
     )
     assert observer.status == "context_report_reordered"
     assert observer.manager.house.start is None
+
+
+def test_response_learning_requires_reported_command_and_complete_interval():
+    observer = PilotPassive()
+    for minute in range(16):
+        at = T + timedelta(minutes=minute)
+        observer.observe_response(
+            at,
+            state(5, at, "°C"),
+            state("on", at),
+            state(4, at, "°C"),
+            "normal",
+            output_clamp=12,
+        )
+    assert len(observer.manager.pump.history) == 1
+    row = observer.manager.pump.history[0]
+    assert row[1] == pytest.approx(13 / 24)
+    assert row[2] == 1
+    observer.observe_response(
+        T + timedelta(minutes=16),
+        state(5, at, "°C"),
+        state("on", at),
+        None,
+        "normal",
+        output_clamp=12,
+    )
+    assert observer.manager.pump_intervals.start is None
+    assert not observer.manager.pump.ready
+
+
+def test_response_learning_rejects_old_restored_and_safe_data():
+    observer = PilotPassive()
+    observer.observe_response(
+        T,
+        state(5, T, "°C"),
+        state("on", T),
+        state(4, T, "°C", restored=True),
+        "normal",
+        output_clamp=12,
+    )
+    assert observer.manager.pump_intervals.start is None
+    observer.observe_response(
+        T,
+        state(5, T, "°C"),
+        state("on", T),
+        state(4, T, "°C"),
+        "safe_mode",
+        output_clamp=12,
+    )
+    assert observer.manager.pump_intervals.start is None
+
+
+def test_supply_detector_uses_pilot_hysteresis_and_actual_reports():
+    from custom_components.pumpsteer.pilot_passive import SupplyHeatDetector
+
+    detector = SupplyHeatDetector(threshold=30)
+    assert detector.observe(T, state(31, T, "°C"), state("on", T)) is True
+    at = T + timedelta(minutes=1)
+    assert detector.observe(at, state(30, at, "°C"), state("on", at)) is True
+    at = T + timedelta(minutes=2)
+    assert detector.observe(at, state(29, at, "°C"), state("on", at)) is True
+    at = T + timedelta(minutes=3)
+    assert detector.observe(at, state(29, at, "°C"), state("on", at)) is False
+    at = T + timedelta(minutes=4)
+    assert detector.observe(at, state(35, at, "°C"), state("off", at)) is None
+    assert detector.observe(at, state(35, at, "°C"), None) is None
+
+
+def test_supply_detector_rejects_temperature_from_before_radiator_mode():
+    from custom_components.pumpsteer.pilot_passive import SupplyHeatDetector
+
+    detector = SupplyHeatDetector(30)
+    at = T + timedelta(minutes=3)
+    old_supply = state(35, T + timedelta(minutes=1), "°C")
+    heating = state("on", at, changed=T + timedelta(minutes=2))
+    assert detector.observe(at, old_supply, heating) is None
+
+
+def test_response_gap_immediately_invalidates_ready_state():
+    observer = PilotPassive()
+    observer.observe_response(
+        T,
+        state(5, T, "°C"),
+        state("on", T),
+        state(4, T, "°C"),
+        "normal",
+        output_clamp=12,
+    )
+    observer.manager.pump.ready = True
+    at = T + timedelta(minutes=6)
+    observer.observe_response(
+        at,
+        state(5, at, "°C"),
+        state("on", at),
+        state(4, at, "°C"),
+        "normal",
+        output_clamp=12,
+    )
+    assert not observer.manager.pump.ready
+    assert observer.manager.pump.reason == "observation_gap"
+
+
+def test_house_validation_is_temporally_separate_and_not_restored_as_fresh():
+    from custom_components.pumpsteer.pilot_vendor.learning_interval import (
+        LearningInterval,
+    )
+    import math
+
+    observer = PilotPassive()
+    temp = 20.0
+    for i in range(72):
+        outdoor = 5 + 4 * math.sin(i * 0.31)
+        heat = float((i // 2) % 2)
+        next_temp = temp + 0.02 * (outdoor - temp) + 0.4 * heat + 0.1
+        observer.manager.model.add_interval(
+            LearningInterval(
+                T.timestamp() + (i + 1) * 3600,
+                1,
+                temp,
+                next_temp,
+                outdoor,
+                heat,
+                None,
+                1,
+            )
+        )
+        temp = next_temp
+    observer.validation_after = T.timestamp() + 64 * 3600
+    result = observer.validated_house(T.timestamp() + 72 * 3600)
+    assert result is not None
+    assert result["samples"] == 8
+    assert result["mae"] < result["persistence_mae"]
+    observer.validation_after = T.timestamp() + 71 * 3600
+    assert observer.validated_house(T.timestamp() + 72 * 3600) is None
+
+
+def test_normal_reported_transition_breaks_interval_not_validation_history():
+    observer = PilotPassive()
+    observer.observe(T, state(20, T, "°C"), state(5, T, "°C"), state("on", T), "normal")
+    assert observer.validation_after == T.timestamp()
+    at = T + timedelta(minutes=3)
+    observer.observe(
+        at,
+        state(20, T, "°C"),
+        state(5, at, "°C"),
+        state("off", at, changed=at),
+        "normal",
+    )
+    assert observer.manager.house.start is None
+    assert observer.validation_after == T.timestamp()

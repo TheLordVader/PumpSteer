@@ -130,6 +130,9 @@ class PumpSteerSensor(RestoreEntity):
         self._thermal_model = ThermalModel()
         self._pilot = None
         self._pilot_sources = None
+        self._pilot_detector = None
+        self._pilot_detection_after = None
+        self._pilot_heat_source = "unavailable"
         self._pilot_status = "heat_signal_not_configured"
         self._pilot_price_available = False
         self._pilot_forecast_available = False
@@ -235,6 +238,8 @@ class PumpSteerSensor(RestoreEntity):
             "thermal_intelligence_external_heat",
             "thermal_intelligence_planning_status",
             "thermal_intelligence_plan_detail",
+            "thermal_intelligence_heat_source",
+            "thermal_intelligence_response",
         ):
             attrs.pop(key, None)
         if self._cfg().get("thermal_intelligence_enabled") is True:
@@ -274,6 +279,8 @@ class PumpSteerSensor(RestoreEntity):
             attrs["thermal_intelligence_plan"] = (
                 "hypothetical_only"
                 if plan["planning_status"] == "hypothetical_unvalidated"
+                else "validated_passive"
+                if plan["planning_status"] == "validated_passive"
                 else "not_available"
             )
             attrs["thermal_intelligence_planning_status"] = plan["planning_status"]
@@ -293,7 +300,19 @@ class PumpSteerSensor(RestoreEntity):
                 if not interrupted and self._pilot_price_forecast
                 else "unavailable"
             )
-            attrs["thermal_intelligence_model"] = "unvalidated"
+            attrs["thermal_intelligence_model"] = (
+                "validated_conditional"
+                if plan["planning_status"] == "validated_passive"
+                else "unvalidated"
+            )
+            attrs["thermal_intelligence_heat_source"] = (
+                self._pilot_heat_source if not interrupted else "unavailable"
+            )
+            attrs["thermal_intelligence_response"] = (
+                self._pilot.manager.pump.reason
+                if self._pilot is not None and not interrupted
+                else "unavailable"
+            )
             attrs["thermal_intelligence_physical_freshness"] = "unverified"
             attrs["thermal_intelligence_external_heat"] = (
                 "background_unverified"
@@ -927,6 +946,8 @@ class PumpSteerSensor(RestoreEntity):
         now: datetime,
     ) -> None:
         self._pilot_plan = {"planning_status": "unavailable", "reason": "safe_mode"}
+        self._pilot_detector = None
+        self._pilot_detection_after = now
         self._pilot_plan_next = None
         self._pilot_weather_raw = None
         if self._pilot is not None:
@@ -2159,7 +2180,72 @@ class PumpSteerSensor(RestoreEntity):
         if cfg.get("thermal_intelligence_enabled") is True:
             try:
                 if self._temperature_inputs_match(cfg, expected):
-                    self._observe_pilot(cfg, now, mode)
+                    sample = self._observe_pilot(cfg, now, mode)
+                    if sample is not None and self._pilot is not None:
+                        import asyncio
+                        import copy
+                        from .ohmigo import _switch_entity_id
+
+                        observed_pilot = self._pilot
+                        entities = [
+                            cfg.get(key)
+                            for key in (
+                                "indoor_temp_entity",
+                                "real_outdoor_entity",
+                                "thermal_heat_activity_entity",
+                                "thermal_supply_temp_entity",
+                                "thermal_heating_mode_entity",
+                                "ohmigo_entity",
+                                "ohmigo_relay_entity",
+                            )
+                        ]
+                        entities.append(
+                            _switch_entity_id(self.hass, self._config_entry.entry_id)
+                        )
+
+                        def snapshot():
+                            states = [
+                                self.hass.states.get(entity) if entity else None
+                                for entity in entities
+                            ]
+                            return tuple(
+                                (
+                                    getattr(state, "state", None),
+                                    getattr(state, "last_reported", None),
+                                    getattr(state, "last_changed", None),
+                                )
+                                for state in states
+                            )
+
+                        before = snapshot()
+                        fitted_pump = copy.deepcopy(observed_pilot.manager.pump)
+                        try:
+                            await asyncio.to_thread(fitted_pump.add_interval, sample)
+                        except asyncio.CancelledError:
+                            if self._pilot is observed_pilot:
+                                observed_pilot.reset_interval()
+                                self._pilot_plan = {
+                                    "planning_status": "unavailable",
+                                    "reason": "learning_cancelled",
+                                }
+                                self._pilot_plan_next = None
+                            raise
+                        if self._pilot is not observed_pilot:
+                            return
+                        if (
+                            self._temperature_unloaded
+                            or snapshot() != before
+                            or self._cfg() != cfg
+                            or not self._temperature_inputs_match(cfg, expected)
+                        ):
+                            observed_pilot.reset_interval()
+                            self._pilot_plan = {
+                                "planning_status": "unavailable",
+                                "reason": "inputs_changed_during_learning",
+                            }
+                            self._pilot_plan_next = None
+                            return
+                        observed_pilot.manager.pump = fitted_pump
                     await self._save_pilot_store()
                     try:
                         await self._plan_pilot(cfg, now, extra, fake_temp)
@@ -2213,9 +2299,16 @@ class PumpSteerSensor(RestoreEntity):
     async def _save_pilot_store(self):
         """Write only after a completed observed learning interval."""
         pilot = self._pilot
-        if self._pilot_store is None or pilot is None or not pilot.house_intervals:
+        if (
+            self._pilot_store is None
+            or pilot is None
+            or not (pilot.house_intervals or pilot.manager.pump.history)
+        ):
             return
-        key = (self._pilot_sources, pilot.house_intervals)
+        pump_last = (
+            pilot.manager.pump.history[-1][0] if pilot.manager.pump.history else None
+        )
+        key = (self._pilot_sources, pilot.house_intervals, pump_last)
         if key == self._pilot_saved:
             return
         payload = {
@@ -2233,9 +2326,20 @@ class PumpSteerSensor(RestoreEntity):
 
     def _restore_pilot_history(self, pilot, signature, now):
         saved, self._pilot_restore = self._pilot_restore, None
-        if not isinstance(saved, dict) or saved.get("sources") != list(signature):
+        if not isinstance(saved, dict):
             return
-        house, pump = saved.get("house"), saved.get("pump")
+        old_sources = saved.get("sources")
+        old_pump = saved.get("pump")
+        compatible_legacy = (
+            isinstance(old_sources, list)
+            and len(old_sources) == 4
+            and list(signature[:4]) == old_sources
+            and isinstance(old_pump, dict)
+            and not old_pump.get("history")
+        )
+        if old_sources != list(signature) and not compatible_legacy:
+            return
+        house, pump = saved.get("house"), old_pump
         if not isinstance(house, dict) or not isinstance(pump, dict):
             return
 
@@ -2295,7 +2399,12 @@ class PumpSteerSensor(RestoreEntity):
                 pilot.source_identity = (first, identity[1])
             pilot.house_intervals = len(pilot.manager.model.history)
             pilot.status = "restored_unvalidated"
-            self._pilot_saved = (signature, pilot.house_intervals)
+            pump_last = (
+                pilot.manager.pump.history[-1][0]
+                if pilot.manager.pump.history
+                else None
+            )
+            self._pilot_saved = (signature, pilot.house_intervals, pump_last)
         except (TypeError, ValueError, KeyError, OverflowError):
             _LOGGER.warning("Passive thermal history was invalid and was ignored")
 
@@ -2374,6 +2483,22 @@ class PumpSteerSensor(RestoreEntity):
 
         from functools import partial
 
+        response_context = None
+        response_scope = None
+        pilot = self._pilot
+        pilot_sources = self._pilot_sources
+        if pilot is not None and pilot.manager.pump.ready:
+            initial_response = pilot.manager.response_state(now.timestamp())
+            if initial_response is not None:
+                response_context = (pilot.manager.pump.parameters, initial_response)
+                observed = pilot.manager.pump.history[:-16]
+                if observed:
+                    response_scope = {
+                        "request_min": min(row[1] for row in observed),
+                        "request_max": max(row[1] for row in observed),
+                        "heat_min": min(row[2] for row in observed),
+                        "heat_max": max(row[2] for row in observed),
+                    }
         task = partial(
             hypothetical_plan,
             now=now,
@@ -2389,17 +2514,74 @@ class PumpSteerSensor(RestoreEntity):
             output_clamp=safe_float(cfg.get("pid_output_clamp", PID_OUTPUT_CLAMP)),
             entity_min=MIN_FAKE_TEMP,
             entity_max=MAX_FAKE_TEMP,
+            response_context=response_context,
+            response_scope=response_scope,
         )
         import asyncio
+        from .ohmigo import _switch_entity_id
 
-        result = await asyncio.to_thread(task)
+        state_ids = [
+            cfg.get(key)
+            for key in (
+                "indoor_temp_entity",
+                "real_outdoor_entity",
+                "electricity_price_entity",
+                "price_tomorrow_entity",
+                "weather_entity",
+                "thermal_heat_activity_entity",
+                "thermal_supply_temp_entity",
+                "thermal_heating_mode_entity",
+                "ohmigo_entity",
+                "ohmigo_relay_entity",
+            )
+        ]
+        state_ids.extend(
+            (
+                _switch_entity_id(self.hass, self._config_entry.entry_id),
+                self._number_entity_id("target_temperature"),
+                self._number_entity_id("aggressiveness"),
+            )
+        )
+
+        def state_snapshot():
+            values = []
+            for entity_id in state_ids:
+                state = self.hass.states.get(entity_id) if entity_id else None
+                values.append(
+                    (
+                        getattr(state, "state", None),
+                        getattr(state, "last_reported", None),
+                        getattr(state, "last_changed", None),
+                        repr(getattr(state, "attributes", None)),
+                    )
+                )
+            return tuple(values)
+
+        snapshot = state_snapshot()
+        config_snapshot = dict(cfg)
+
+        def evaluate():
+            house = (
+                pilot.validated_house(now.timestamp())
+                if response_context is not None
+                and cfg.get("external_heat_sources") is not True
+                else None
+            )
+            return task(house_context=house)
+
+        result = await asyncio.to_thread(evaluate)
         expected = {
             "indoor_temp_entity": extra.get("indoor_temperature"),
             "real_outdoor_entity": extra.get("outdoor_temperature"),
         }
-        if self._cfg().get(
-            "thermal_intelligence_enabled"
-        ) is not True or not self._temperature_inputs_match(cfg, expected):
+        if (
+            self._cfg().get("thermal_intelligence_enabled") is not True
+            or self._pilot is not pilot
+            or self._pilot_sources != pilot_sources
+            or self._cfg() != config_snapshot
+            or state_snapshot() != snapshot
+            or not self._temperature_inputs_match(cfg, expected)
+        ):
             self._pilot_plan = {
                 "planning_status": "unavailable",
                 "reason": "inputs_changed_during_planning",
@@ -2442,19 +2624,76 @@ class PumpSteerSensor(RestoreEntity):
             or self._last_outlook.day_max_temp is not None
         )
         source = cfg.get("thermal_heat_activity_entity")
+        supply = cfg.get("thermal_supply_temp_entity")
+        radiator_mode = cfg.get("thermal_heating_mode_entity")
+        threshold = safe_float(cfg.get("thermal_supply_threshold", 30))
+        use_supply = (
+            not source
+            and supply
+            and radiator_mode
+            and threshold is not None
+            and 0 <= threshold <= 60
+        )
+        if use_supply:
+            source = supply
         signature = (
             cfg.get("indoor_temp_entity"),
             cfg.get("real_outdoor_entity"),
             source,
             cfg.get("external_heat_sources") is True,
         )
+        if use_supply:
+            signature += (radiator_mode, threshold)
+        signature += (
+            cfg.get("ohmigo_entity"),
+            cfg.get("ohmigo_relay_entity"),
+            safe_float(cfg.get("pid_output_clamp", PID_OUTPUT_CLAMP)),
+        )
         if signature != self._pilot_sources:
             self._pilot = None
+            self._pilot_detector = None
             self._pilot_sources = signature
-        if not isinstance(source, str) or not source.startswith("binary_sensor."):
+        self._pilot_heat_source = (
+            "supply_temperature_indicator"
+            if use_supply
+            else "binary_heat_indicator"
+            if isinstance(source, str) and source.startswith("binary_sensor.")
+            else "unavailable"
+        )
+        if not use_supply and (
+            not isinstance(source, str) or not source.startswith("binary_sensor.")
+        ):
             self._pilot_status = "heat_signal_not_configured"
             return
         try:
+            heat_state = self.hass.states.get(source)
+            if use_supply:
+                from types import SimpleNamespace
+                from .pilot_passive import SupplyHeatDetector
+
+                if self._pilot_detector is None:
+                    self._pilot_detector = SupplyHeatDetector(threshold)
+                after = self._temperature_reported_after
+                if self._pilot_detection_after is not None and (
+                    after is None or self._pilot_detection_after > after
+                ):
+                    after = self._pilot_detection_after
+                detected = self._pilot_detector.observe(
+                    now,
+                    heat_state,
+                    self.hass.states.get(radiator_mode),
+                    reported_after=after,
+                )
+                heat_state = (
+                    None
+                    if detected is None
+                    else SimpleNamespace(
+                        state="on" if detected else "off",
+                        last_reported=self._pilot_detector.last_report,
+                        last_changed=self._pilot_detector.changed_at,
+                        attributes={},
+                    )
+                )
             if self._pilot is None:
                 from .pilot_passive import PilotPassive
 
@@ -2464,11 +2703,40 @@ class PumpSteerSensor(RestoreEntity):
                 now,
                 self.hass.states.get(signature[0]),
                 self.hass.states.get(signature[1]),
-                self.hass.states.get(source),
+                heat_state,
                 mode,
                 reported_after=self._temperature_reported_after,
             )
+            command_entity = cfg.get("ohmigo_entity")
+            from .ohmigo import _switch_entity_id
+
+            switch_id = _switch_entity_id(self.hass, self._config_entry.entry_id)
+            relay_id = cfg.get("ohmigo_relay_entity")
+            switch_state = self.hass.states.get(switch_id) if switch_id else None
+            relay_state = self.hass.states.get(relay_id) if relay_id else None
+            # HA states indicate configured Push and Active, not physical receipt.
+            command_allowed = self._pilot._report(
+                switch_state, now, reported_after=self._temperature_reported_after
+            ) == (
+                getattr(switch_state, "last_reported", None),
+                1.0,
+            ) and self._pilot._report(
+                relay_state, now, reported_after=self._temperature_reported_after
+            ) == (getattr(relay_state, "last_reported", None), 1.0)
+            sample = self._pilot.observe_response(
+                now,
+                self.hass.states.get(signature[1]),
+                heat_state,
+                self.hass.states.get(command_entity)
+                if command_entity and command_allowed
+                else None,
+                mode,
+                output_clamp=safe_float(cfg.get("pid_output_clamp", PID_OUTPUT_CLAMP)),
+                reported_after=self._temperature_reported_after,
+                defer_fit=True,
+            )
             self._pilot_status = self._pilot.status
+            return sample
         except Exception:
             _LOGGER.exception(
                 "Passive thermal intelligence failed; standard control continues"

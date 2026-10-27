@@ -42,7 +42,10 @@
           "notification_cooldown_minutes": "Repeat notification cooldown",
           "thermal_intelligence_enabled": "Thermal Intelligence (experimental diagnostics)",
           "external_heat_sources": "Do you sometimes use an additional heat source?",
-          "thermal_heat_activity_entity": "Verified heat delivery to the home (optional)"
+          "thermal_heat_activity_entity": "Verified heat delivery to the home (optional)",
+          "thermal_supply_temp_entity": "Radiator supply temperature (optional)",
+          "thermal_heating_mode_entity": "Verified radiator heating mode (optional)",
+          "thermal_supply_threshold": "Supply temperature indicator threshold"
         },
         "data_description": {
           "pid_kp": "How strongly PumpSteer reacts to current temperature error. Typical range: 2.0 to 5.0.",
@@ -62,7 +65,10 @@
           "notification_cooldown_minutes": "Minimum time between repeated alerts of the same type. Choose 0 for no limit; 60 minutes is recommended. Braking and preheating have independent timers.",
           "thermal_intelligence_enabled": "Passively collects qualified observations when a verified heat signal is selected. Does not affect heating control.",
           "external_heat_sources": "For example, a fireplace or air-to-air heat pump. Intermittent extra heat cannot be reliably identified; learned results remain unvalidated.",
-          "thermal_heat_activity_entity": "A binary sensor whose on means measured heat delivery to the home and off means none. Compressor status or hot-water mode alone is insufficient. Report times do not establish physical measurement time."
+          "thermal_heat_activity_entity": "A binary sensor whose on means measured heat delivery to the home and off means none. Compressor status or hot-water mode alone is insufficient. Report times do not establish physical measurement time.",
+          "thermal_supply_temp_entity": "Select a radiator-circuit sensor. Temperature is an indicator, not measured heat output.",
+          "thermal_heating_mode_entity": "On must mean radiator heating; off or unknown suspends learning. Required for the supply indicator.",
+          "thermal_supply_threshold": "Set for your heating system. An unsuitable threshold can misclassify heat."
         }
       }
     },

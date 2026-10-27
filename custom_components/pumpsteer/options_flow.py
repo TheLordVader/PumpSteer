@@ -98,6 +98,38 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
                         },
                     ): selector({"entity": {"domain": "binary_sensor"}}),
                     vol.Optional(
+                        "thermal_supply_temp_entity",
+                        description={
+                            "suggested_value": current_data.get(
+                                "thermal_supply_temp_entity"
+                            )
+                        },
+                    ): selector(
+                        {"entity": {"domain": "sensor", "device_class": "temperature"}}
+                    ),
+                    vol.Optional(
+                        "thermal_heating_mode_entity",
+                        description={
+                            "suggested_value": current_data.get(
+                                "thermal_heating_mode_entity"
+                            )
+                        },
+                    ): selector({"entity": {"domain": "binary_sensor"}}),
+                    vol.Optional(
+                        "thermal_supply_threshold",
+                        default=current_data.get("thermal_supply_threshold", 30),
+                    ): selector(
+                        {
+                            "number": {
+                                "min": 0,
+                                "max": 60,
+                                "step": 0.5,
+                                "unit_of_measurement": "°C",
+                                "mode": "box",
+                            }
+                        }
+                    ),
+                    vol.Optional(
                         "notify_service",
                         default=current_data.get("notify_service", ""),
                     ): selector({"text": {}}),
@@ -244,6 +276,21 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
             or not self._entity_exists(heat)
         ):
             errors["thermal_heat_activity_entity"] = "entity_not_found"
+
+        for key, domain in (
+            ("thermal_supply_temp_entity", "sensor."),
+            ("thermal_heating_mode_entity", "binary_sensor."),
+        ):
+            entity = user_input.get(key)
+            if entity and (
+                not isinstance(entity, str)
+                or not entity.startswith(domain)
+                or not self._entity_exists(entity)
+            ):
+                errors[key] = "entity_not_found"
+        supply = user_input.get("thermal_supply_temp_entity")
+        if supply and not user_input.get("thermal_heating_mode_entity"):
+            errors["thermal_heating_mode_entity"] = "entity_not_found"
 
         # ohmigo_entity is optional — validate only if set
         ohmigo = user_input.get("ohmigo_entity", "")

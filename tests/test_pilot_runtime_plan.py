@@ -310,3 +310,252 @@ def test_nonfinite_restored_model_is_rejected(bad):
     assert not restored.manager.model.history
     assert not restored.manager.pump.ready
     assert restored.status == "waiting_for_heat_signal"
+
+
+def test_passive_horizon_uses_four_real_forecast_hours():
+    price = price_state()
+    price.attributes["raw_today"] = [
+        {
+            "start": (T + timedelta(minutes=15 * i)).isoformat(),
+            "end": (T + timedelta(minutes=15 * (i + 1))).isoformat(),
+            "value": 1 + i / 20,
+        }
+        for i in range(16)
+    ]
+    weather_rows = [
+        {"datetime": (T + timedelta(hours=i)).isoformat(), "temperature": 5 - i}
+        for i in range(5)
+    ]
+    result = hypothetical_plan(
+        now=T,
+        indoor=20.8,
+        outdoor=5,
+        command=5,
+        target=21,
+        floor=20.5,
+        ceiling=21.5,
+        price_states=[price],
+        weather_rows=weather_rows,
+        weather_unit="°C",
+    )
+    assert result["horizon_minutes"] == 240
+    assert len(result["temperatures"]) == 17
+    assert result["planning_status"] == "hypothetical_unvalidated"
+
+
+def test_verified_response_used_without_calling_house_model_validated(monkeypatch):
+    from custom_components.pumpsteer.pilot_vendor.pump_response import (
+        ResponseParameters,
+    )
+    from custom_components.pumpsteer.pilot_vendor import response_optimizer
+
+    seen = []
+    original = response_optimizer.optimize
+
+    def capture(
+        controller,
+        indoor,
+        outdoor,
+        prices,
+        baseline,
+        parameters,
+        initial_state,
+        actuator,
+    ):
+        seen.append((parameters, initial_state, actuator.learned_response))
+        return original(
+            controller,
+            indoor,
+            outdoor,
+            prices,
+            baseline,
+            parameters,
+            initial_state,
+            actuator,
+        )
+
+    monkeypatch.setattr(response_optimizer, "optimize", capture)
+    params = ResponseParameters(retention=0.5, slope=0.7)
+    result = hypothetical_plan(
+        now=T,
+        indoor=20.8,
+        outdoor=5,
+        command=5,
+        target=21,
+        floor=20.5,
+        ceiling=21.5,
+        price_states=[price_state()],
+        weather_rows=weather(),
+        weather_unit="°C",
+        response_context=(params, (0.4, ())),
+    )
+    assert seen == [(params, (0.4, ()), True)]
+    assert result["planning_status"] == "hypothetical_unvalidated"
+    assert result["response_status"] == "validated_response_only"
+
+
+def test_validated_passive_plan_uses_response_and_qualified_house_parameters():
+    from custom_components.pumpsteer.pilot_vendor.pump_response import (
+        ResponseParameters,
+    )
+
+    context = {
+        "loss": 0.02,
+        "gain": 0.4,
+        "background": 0.1,
+        "mae": 0.02,
+        "persistence_mae": 0.2,
+        "samples": 8,
+        "outdoor_min": -5,
+        "outdoor_max": 10,
+        "indoor_min": 19,
+        "indoor_max": 22,
+        "heat_min": 0,
+        "heat_max": 1,
+    }
+    result = hypothetical_plan(
+        now=T,
+        indoor=20.8,
+        outdoor=5,
+        command=5,
+        target=21,
+        floor=20.5,
+        ceiling=21.5,
+        price_states=[price_state()],
+        weather_rows=weather(),
+        weather_unit="°C",
+        response_context=(ResponseParameters(), (0.4, ())),
+        house_context=context,
+        response_scope={
+            "request_min": 0,
+            "request_max": 1,
+            "heat_min": 0,
+            "heat_max": 1,
+        },
+    )
+    assert result["planning_status"] == "validated_passive"
+    assert result["validation"]["mae"] == 0.02
+    assert "assumed_model" not in result
+    context["outdoor_min"] = 4.5
+    result = hypothetical_plan(
+        now=T,
+        indoor=20.8,
+        outdoor=5,
+        command=5,
+        target=21,
+        floor=20.5,
+        ceiling=21.5,
+        price_states=[price_state()],
+        weather_rows=weather(),
+        weather_unit="°C",
+        response_context=(ResponseParameters(), (0.4, ())),
+        house_context=context,
+        response_scope={
+            "request_min": 0,
+            "request_max": 1,
+            "heat_min": 0,
+            "heat_max": 1,
+        },
+    )
+    assert result["planning_status"] == "hypothetical_unvalidated"
+
+
+def test_ha_cycle_exposes_validated_passive_with_synthetic_qualified_fixture(
+    monkeypatch,
+):
+    from custom_components.pumpsteer import forecast
+    from custom_components.pumpsteer.pilot_vendor.pump_response import (
+        ResponseParameters,
+    )
+    from test_brake_provenance import _sensor, _cycle
+
+    sensor, states = _sensor()
+    at = datetime(2026, 10, 11, 8, tzinfo=timezone.utc)
+    sensor._config_entry.options.update(
+        thermal_intelligence_enabled=True, weather_entity="weather.local"
+    )
+    price = states["sensor.price"]
+    price.last_reported = at
+    price.attributes.update(
+        unit_of_measurement="SEK/kWh",
+        raw_today=[
+            {
+                "start": (at.replace(hour=0) + timedelta(minutes=15 * i)).isoformat(),
+                "end": (
+                    at.replace(hour=0) + timedelta(minutes=15 * (i + 1))
+                ).isoformat(),
+                "value": 1 + i / 100,
+            }
+            for i in range(96)
+        ],
+    )
+    states["weather.local"] = SimpleNamespace(
+        state="cloudy", last_reported=at, attributes={"temperature_unit": "°C"}
+    )
+
+    async def forecast_stub(*args, **kwargs):
+        if kwargs.get("raw_weather_callback"):
+            kwargs["raw_weather_callback"](
+                [
+                    {
+                        "datetime": (at + timedelta(hours=i)).isoformat(),
+                        "temperature": 5 - i,
+                    }
+                    for i in range(7)
+                ]
+            )
+        return []
+
+    monkeypatch.setattr(forecast, "async_build_forecast", forecast_stub)
+    house = {
+        "loss": 0.02,
+        "gain": 0.4,
+        "background": 0.1,
+        "mae": 0.02,
+        "persistence_mae": 0.2,
+        "samples": 8,
+        "outdoor_min": -5,
+        "outdoor_max": 10,
+        "indoor_min": 19,
+        "indoor_max": 22,
+        "heat_min": 0,
+        "heat_max": 1,
+    }
+    pump = SimpleNamespace(
+        ready=True,
+        reason="ready",
+        parameters=ResponseParameters(),
+        history=[(i, i % 2, i % 2, 5) for i in range(112)],
+    )
+    sensor._pilot = SimpleNamespace(
+        house_intervals=8,
+        manager=SimpleNamespace(pump=pump, response_state=lambda ts: (0.4, ())),
+        validated_house=lambda now: house,
+    )
+    monkeypatch.setattr(sensor, "_observe_pilot", lambda *args: None)
+    attrs = _cycle(sensor, monkeypatch, 0)
+    assert attrs["thermal_intelligence_planning_status"] == "validated_passive"
+    assert attrs["thermal_intelligence_plan_detail"]["validation"]["samples"] == 8
+    assert (
+        attrs["thermal_intelligence_plan_detail"]["cost_kind"] == "proxy_not_currency"
+    )
+    sensor._config_entry.options["external_heat_sources"] = True
+    sensor._pilot_plan_next = None
+    attrs = _cycle(sensor, monkeypatch, 1)
+    assert attrs["thermal_intelligence_planning_status"] == "hypothetical_unvalidated"
+    from custom_components.pumpsteer.pilot_vendor import response_optimizer
+
+    original = response_optimizer.optimize
+
+    def change_weather(*args, **kwargs):
+        states["weather.local"].state = "unavailable"
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(response_optimizer, "optimize", change_weather)
+    sensor._pilot_plan_next = None
+    attrs = _cycle(sensor, monkeypatch, 2)
+    assert attrs["thermal_intelligence_planning_status"] == "unavailable"
+    assert (
+        attrs["thermal_intelligence_plan_detail"]["reason"]
+        == "inputs_changed_during_planning"
+    )
