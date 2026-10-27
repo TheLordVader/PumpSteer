@@ -90,6 +90,14 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
                         default=current_data.get("external_heat_sources", False),
                     ): selector({"boolean": {}}),
                     vol.Optional(
+                        "thermal_heat_activity_entity",
+                        description={
+                            "suggested_value": current_data.get(
+                                "thermal_heat_activity_entity"
+                            )
+                        },
+                    ): selector({"entity": {"domain": "binary_sensor"}}),
+                    vol.Optional(
                         "notify_service",
                         default=current_data.get("notify_service", ""),
                     ): selector({"text": {}}),
@@ -228,6 +236,14 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
         weather = user_input.get("weather_entity")
         if weather and not self._entity_exists(weather):
             errors["weather_entity"] = "entity_not_found"
+
+        heat = user_input.get("thermal_heat_activity_entity")
+        if heat and (
+            not isinstance(heat, str)
+            or not heat.startswith("binary_sensor.")
+            or not self._entity_exists(heat)
+        ):
+            errors["thermal_heat_activity_entity"] = "entity_not_found"
 
         # ohmigo_entity is optional — validate only if set
         ohmigo = user_input.get("ohmigo_entity", "")

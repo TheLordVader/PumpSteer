@@ -128,6 +128,11 @@ class PumpSteerSensor(RestoreEntity):
         self._pi = PIController()
         self._pi_precool_paused: bool = False
         self._thermal_model = ThermalModel()
+        self._pilot = None
+        self._pilot_sources = None
+        self._pilot_status = "heat_signal_not_configured"
+        self._pilot_price_available = False
+        self._pilot_forecast_available = False
         # Thermal Learning is observational and cannot change control output.
         self._thermal_learning_active: bool = False
         self._thermal_learning_reason: str = "not_evaluated"
@@ -209,13 +214,45 @@ class PumpSteerSensor(RestoreEntity):
     @property
     def extra_state_attributes(self) -> dict:
         attrs = {**self._attributes, "friendly_name": "PumpSteer"}
-        attrs.pop("thermal_intelligence_status", None)
-        attrs.pop("thermal_intelligence_reason", None)
+        for key in (
+            "thermal_intelligence_status",
+            "thermal_intelligence_reason",
+            "thermal_intelligence_learning_intervals",
+            "thermal_intelligence_plan",
+            "thermal_intelligence_forecast",
+            "thermal_intelligence_price",
+            "thermal_intelligence_model",
+            "thermal_intelligence_physical_freshness",
+        ):
+            attrs.pop(key, None)
         if self._cfg().get("thermal_intelligence_enabled") is True:
-            attrs["thermal_intelligence_status"] = (
-                "suspended_safe" if attrs.get("mode") == MODE_SAFE else "not_available"
+            interrupted = (
+                attrs.get("mode") == MODE_SAFE or attrs.get("status") == "error"
             )
-            attrs["thermal_intelligence_reason"] = "integration_incomplete"
+            attrs["thermal_intelligence_status"] = (
+                "suspended_safe"
+                if attrs.get("mode") == MODE_SAFE
+                else self._pilot_status
+            )
+            attrs["thermal_intelligence_reason"] = (
+                "validated_control_response_unavailable"
+            )
+            attrs["thermal_intelligence_learning_intervals"] = (
+                self._pilot.house_intervals if self._pilot else 0
+            )
+            attrs["thermal_intelligence_plan"] = "not_available"
+            attrs["thermal_intelligence_forecast"] = (
+                "weather_outlook_unverified"
+                if not interrupted and self._pilot_forecast_available
+                else "unavailable"
+            )
+            attrs["thermal_intelligence_price"] = (
+                "current_available"
+                if not interrupted and self._pilot_price_available
+                else "unavailable"
+            )
+            attrs["thermal_intelligence_model"] = "unvalidated"
+            attrs["thermal_intelligence_physical_freshness"] = "unverified"
         return attrs
 
     @property
@@ -362,6 +399,10 @@ class PumpSteerSensor(RestoreEntity):
     ) -> None:
         """Handle updated options."""
         self._config_entry = entry
+        self._pilot = None
+        self._pilot_sources = None
+        self._pilot_price_available = False
+        self._pilot_forecast_available = False
         if self._update_in_progress:
             self._options_update_pending = True
             return
@@ -825,6 +866,13 @@ class PumpSteerSensor(RestoreEntity):
         outdoor: Optional[float],
         now: datetime,
     ) -> None:
+        if self._pilot is not None:
+            if self._cfg().get("thermal_intelligence_enabled") is True:
+                self._pilot.reset_interval()
+                self._pilot.status = "suspended_safe"
+            else:
+                self._pilot = None
+                self._pilot_sources = None
         self._thermal_model.cancel_validation_session()
         self._thermal_learning_active = False
         self._thermal_learning_reason = "safe_mode"
@@ -1036,6 +1084,9 @@ class PumpSteerSensor(RestoreEntity):
                         return
                     await self._do_update()
                 except Exception as err:
+                    if self._pilot is not None:
+                        self._pilot.reset_interval()
+                    self._pilot_status = "update_error"
                     self._thermal_model.cancel_validation_session()
                     self._thermal_learning_active = False
                     self._thermal_learning_reason = "update_error"
@@ -2019,22 +2070,88 @@ class PumpSteerSensor(RestoreEntity):
         }
 
         cfg = self._cfg()
+        expected = {
+            key: extra.get(
+                attribute,
+                get_temperature(
+                    self.hass, cfg.get(key), self._temperature_reported_after
+                ),
+            )
+            for key, attribute in (
+                ("indoor_temp_entity", "indoor_temperature"),
+                ("real_outdoor_entity", "outdoor_temperature"),
+            )
+        }
         await self._push_validated_temperature(
             fake_temp,
             cfg,
-            {
-                key: extra.get(
-                    attribute,
-                    get_temperature(
-                        self.hass, cfg.get(key), self._temperature_reported_after
-                    ),
-                )
-                for key, attribute in (
-                    ("indoor_temp_entity", "indoor_temperature"),
-                    ("real_outdoor_entity", "outdoor_temperature"),
-                )
-            },
+            expected,
         )
+        if cfg.get("thermal_intelligence_enabled") is True:
+            if self._temperature_inputs_match(cfg, expected):
+                self._observe_pilot(cfg, now, mode)
+            elif self._pilot is not None:
+                self._pilot.reset_interval()
+                self._pilot_status = "temperature_changed_during_update"
+        elif self._pilot is not None:
+            self._pilot = None
+            self._pilot_sources = None
+
+    def _observe_pilot(self, cfg, now, mode):
+        """Passive learning from explicitly selected delivered-house-heat state."""
+        if cfg.get("thermal_intelligence_enabled") is not True:
+            self._pilot = None
+            self._pilot_sources = None
+            return
+        price_state = self.hass.states.get(cfg.get("electricity_price_entity"))
+        price_unit = (getattr(price_state, "attributes", {}) or {}).get(
+            "unit_of_measurement"
+        )
+        self._pilot_price_available = (
+            self._current_price is not None
+            and isinstance(price_unit, str)
+            and bool(price_unit.strip())
+        )
+        self._pilot_forecast_available = self._last_outlook is not None and (
+            self._last_outlook.night_min_temp is not None
+            or self._last_outlook.day_max_temp is not None
+        )
+        source = cfg.get("thermal_heat_activity_entity")
+        signature = (
+            cfg.get("indoor_temp_entity"),
+            cfg.get("real_outdoor_entity"),
+            source,
+            cfg.get("external_heat_sources") is True,
+        )
+        if signature != self._pilot_sources:
+            self._pilot = None
+            self._pilot_sources = signature
+        if cfg.get("external_heat_sources") is True:
+            self._pilot_status = "additional_heat_not_qualified"
+            return
+        if not isinstance(source, str) or not source.startswith("binary_sensor."):
+            self._pilot_status = "heat_signal_not_configured"
+            return
+        try:
+            if self._pilot is None:
+                from .pilot_passive import PilotPassive
+
+                self._pilot = PilotPassive()
+            self._pilot.observe(
+                now,
+                self.hass.states.get(signature[0]),
+                self.hass.states.get(signature[1]),
+                self.hass.states.get(source),
+                mode,
+                reported_after=self._temperature_reported_after,
+            )
+            self._pilot_status = self._pilot.status
+        except Exception:
+            _LOGGER.exception(
+                "Passive thermal intelligence failed; standard control continues"
+            )
+            self._pilot = None
+            self._pilot_status = "learning_error"
 
 
 class ThermalOutlookSensor(SensorEntity):
