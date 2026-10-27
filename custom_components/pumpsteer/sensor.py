@@ -133,6 +133,7 @@ class PumpSteerSensor(RestoreEntity):
         self._pilot_status = "heat_signal_not_configured"
         self._pilot_price_available = False
         self._pilot_forecast_available = False
+        self._pilot_price_forecast = False
         # Thermal Learning is observational and cannot change control output.
         self._thermal_learning_active: bool = False
         self._thermal_learning_reason: str = "not_evaluated"
@@ -221,8 +222,10 @@ class PumpSteerSensor(RestoreEntity):
             "thermal_intelligence_plan",
             "thermal_intelligence_forecast",
             "thermal_intelligence_price",
+            "thermal_intelligence_price_forecast",
             "thermal_intelligence_model",
             "thermal_intelligence_physical_freshness",
+            "thermal_intelligence_external_heat",
         ):
             attrs.pop(key, None)
         if self._cfg().get("thermal_intelligence_enabled") is True:
@@ -234,9 +237,23 @@ class PumpSteerSensor(RestoreEntity):
                 if attrs.get("mode") == MODE_SAFE
                 else self._pilot_status
             )
-            attrs["thermal_intelligence_reason"] = (
-                "validated_control_response_unavailable"
-            )
+            if attrs.get("mode") == MODE_SAFE:
+                reason = "safe_mode"
+            elif attrs.get("status") == "error":
+                reason = "update_error"
+            elif self._pilot_status in {
+                "heat_signal_not_configured",
+                "heat_signal_unavailable",
+                "temperature_report_unavailable",
+            }:
+                reason = self._pilot_status
+            elif not self._pilot_price_forecast:
+                reason = "timestamped_price_forecast_unavailable"
+            elif not self._pilot_forecast_available:
+                reason = "weather_forecast_unavailable"
+            else:
+                reason = "validated_model_and_weather_issue_time_unavailable"
+            attrs["thermal_intelligence_reason"] = reason
             attrs["thermal_intelligence_learning_intervals"] = (
                 self._pilot.house_intervals if self._pilot else 0
             )
@@ -251,8 +268,18 @@ class PumpSteerSensor(RestoreEntity):
                 if not interrupted and self._pilot_price_available
                 else "unavailable"
             )
+            attrs["thermal_intelligence_price_forecast"] = (
+                "coverage_complete_issue_time_unknown"
+                if not interrupted and self._pilot_price_forecast
+                else "unavailable"
+            )
             attrs["thermal_intelligence_model"] = "unvalidated"
             attrs["thermal_intelligence_physical_freshness"] = "unverified"
+            attrs["thermal_intelligence_external_heat"] = (
+                "background_unverified"
+                if self._cfg().get("external_heat_sources") is True
+                else "not_enabled"
+            )
         return attrs
 
     @property
@@ -403,6 +430,7 @@ class PumpSteerSensor(RestoreEntity):
         self._pilot_sources = None
         self._pilot_price_available = False
         self._pilot_forecast_available = False
+        self._pilot_price_forecast = False
         if self._update_in_progress:
             self._options_update_pending = True
             return
@@ -2088,11 +2116,21 @@ class PumpSteerSensor(RestoreEntity):
             expected,
         )
         if cfg.get("thermal_intelligence_enabled") is True:
-            if self._temperature_inputs_match(cfg, expected):
-                self._observe_pilot(cfg, now, mode)
-            elif self._pilot is not None:
-                self._pilot.reset_interval()
-                self._pilot_status = "temperature_changed_during_update"
+            try:
+                if self._temperature_inputs_match(cfg, expected):
+                    self._observe_pilot(cfg, now, mode)
+                elif self._pilot is not None:
+                    self._pilot.reset_interval()
+                    self._pilot_status = "temperature_changed_during_update"
+            except Exception:
+                _LOGGER.exception(
+                    "Passive thermal diagnostics failed; standard control continues"
+                )
+                self._pilot = None
+                self._pilot_status = "learning_error"
+                self._pilot_price_available = False
+                self._pilot_forecast_available = False
+                self._pilot_price_forecast = False
         elif self._pilot is not None:
             self._pilot = None
             self._pilot_sources = None
@@ -2104,11 +2142,24 @@ class PumpSteerSensor(RestoreEntity):
             self._pilot_sources = None
             return
         price_state = self.hass.states.get(cfg.get("electricity_price_entity"))
+        from .pilot_forecast import price_window, source_is_current
+
+        tomorrow = cfg.get("price_tomorrow_entity")
+        tomorrow_state = (
+            self.hass.states.get(tomorrow)
+            if tomorrow and tomorrow != cfg.get("electricity_price_entity")
+            else None
+        )
+        self._pilot_price_forecast = (
+            price_window((price_state, tomorrow_state), now, timedelta(hours=2))
+            is not None
+        )
         price_unit = (getattr(price_state, "attributes", {}) or {}).get(
             "unit_of_measurement"
         )
         self._pilot_price_available = (
             self._current_price is not None
+            and source_is_current(price_state, now)
             and isinstance(price_unit, str)
             and bool(price_unit.strip())
         )
@@ -2126,9 +2177,6 @@ class PumpSteerSensor(RestoreEntity):
         if signature != self._pilot_sources:
             self._pilot = None
             self._pilot_sources = signature
-        if cfg.get("external_heat_sources") is True:
-            self._pilot_status = "additional_heat_not_qualified"
-            return
         if not isinstance(source, str) or not source.startswith("binary_sensor."):
             self._pilot_status = "heat_signal_not_configured"
             return

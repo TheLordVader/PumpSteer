@@ -62,7 +62,7 @@
           "notification_level": "Välj alla prisnotiser, endast bromsning eller inga. Den befintliga notisbrytaren är fortfarande huvudbrytare.",
           "notification_cooldown_minutes": "Minsta tid mellan två notiser av samma typ. Välj 0 för ingen spärr; 60 minuter rekommenderas. Bromsning och förvärmning har separata spärrtider.",
           "thermal_intelligence_enabled": "Samlar passivt kvalificerade observationer om en verifierad värmesignal väljs. Påverkar inte värmestyrningen.",
-          "external_heat_sources": "Exempelvis braskamin eller luftvärmepump. Automatisk upptäckt finns inte ännu; inlärning avstår när detta val är på.",
+          "external_heat_sources": "Exempelvis braskamin eller luftvärmepump. Tillfällig extravärme kan inte identifieras säkert; inlärningsresultat förblir ovaliderade.",
           "thermal_heat_activity_entity": "En binär sensor där på betyder uppmätt värmetillförsel till huset och av betyder ingen. Kompressorstatus eller varmvattenläge räcker inte. Rapporttider bevisar inte fysisk mättid."
         }
       }

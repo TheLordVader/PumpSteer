@@ -132,7 +132,8 @@ def test_external_heat_setting_prevents_unqualified_learning(monkeypatch):
         thermal_heat_activity_entity="binary_sensor.house_heat",
     )
     attrs = _cycle(sensor, monkeypatch, 15)
-    assert attrs["thermal_intelligence_status"] == "additional_heat_not_qualified"
+    assert attrs["thermal_intelligence_status"] == "heat_signal_unavailable"
+    assert attrs["thermal_intelligence_external_heat"] == "background_unverified"
     assert attrs["thermal_intelligence_learning_intervals"] == 0
     assert attrs["thermal_intelligence_plan"] == "not_available"
 
@@ -199,3 +200,100 @@ def test_options_reload_does_not_show_previous_source_diagnostics(monkeypatch):
     attrs = sensor.extra_state_attributes
     assert attrs["thermal_intelligence_price"] == "unavailable"
     assert attrs["thermal_intelligence_forecast"] == "unavailable"
+
+
+def test_enabled_diagnoses_original_quarter_hour_price_coverage(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    sensor, states = _sensor()
+    sensor._config_entry.options["thermal_intelligence_enabled"] = True
+    at = datetime(2026, 10, 11, 8, tzinfo=timezone.utc)
+    states["sensor.price"].attributes["unit_of_measurement"] = "SEK/kWh"
+    states["sensor.price"].last_reported = at
+    states["sensor.price"].attributes["raw_today"] = [
+        {
+            "start": (at + timedelta(minutes=15 * i)).isoformat(),
+            "end": (at + timedelta(minutes=15 * (i + 1))).isoformat(),
+            "value": 1.0 + i / 10,
+        }
+        for i in range(8)
+    ]
+    sensor._observe_pilot(sensor._cfg(), at, "normal")
+    assert (
+        sensor.extra_state_attributes["thermal_intelligence_price_forecast"]
+        == "coverage_complete_issue_time_unknown"
+    )
+    assert sensor.extra_state_attributes["thermal_intelligence_plan"] == "not_available"
+
+
+def test_diagnostic_failure_never_changes_primary_control(monkeypatch):
+    from custom_components.pumpsteer import pilot_forecast
+
+    base, _ = _sensor()
+    sensor, _ = _sensor()
+    sensor._config_entry.options["thermal_intelligence_enabled"] = True
+    monkeypatch.setattr(
+        pilot_forecast,
+        "price_window",
+        lambda *args: (_ for _ in ()).throw(
+            RuntimeError("synthetic diagnostic failure")
+        ),
+    )
+    _cycle(base, monkeypatch, 15)
+    attrs = _cycle(sensor, monkeypatch, 15)
+    assert sensor.state == base.state
+    assert attrs["thermal_intelligence_status"] == "learning_error"
+    assert attrs["thermal_intelligence_plan"] == "not_available"
+
+
+def test_extra_heat_setting_allows_background_aware_unvalidated_learning(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    sensor, states = _sensor()
+    sensor._config_entry.options.update(
+        thermal_intelligence_enabled=True,
+        external_heat_sources=True,
+        thermal_heat_activity_entity="binary_sensor.house_heat",
+    )
+    states["sensor.indoor"].attributes["unit_of_measurement"] = "°C"
+    states["sensor.outdoor"].attributes["unit_of_measurement"] = "°C"
+    states["sensor.outdoor"].last_changed = datetime(
+        2026, 10, 11, 8, tzinfo=timezone.utc
+    )
+    for minute in range(0, 66, 5):
+        at = datetime(2026, 10, 11, 8, tzinfo=timezone.utc) + timedelta(minutes=minute)
+        states["binary_sensor.house_heat"] = SimpleNamespace(
+            state="on",
+            last_reported=at,
+            last_changed=datetime(2026, 10, 11, 8, tzinfo=timezone.utc),
+            attributes={},
+        )
+        attrs = _cycle(sensor, monkeypatch, minute)
+    assert attrs["thermal_intelligence_learning_intervals"] == 1
+    assert attrs["thermal_intelligence_model"] == "unvalidated"
+    assert attrs["thermal_intelligence_external_heat"] == "background_unverified"
+    assert attrs["thermal_intelligence_plan"] == "not_available"
+
+
+def test_unavailable_current_price_is_not_advertised_as_available():
+    from datetime import datetime, timezone
+
+    sensor, states = _sensor()
+    sensor._config_entry.options["thermal_intelligence_enabled"] = True
+    at = datetime(2026, 10, 11, 8, tzinfo=timezone.utc)
+    states["sensor.price"].state = "unavailable"
+    states["sensor.price"].last_reported = at
+    states["sensor.price"].attributes["unit_of_measurement"] = "SEK/kWh"
+    sensor._current_price = 2.0
+    sensor._observe_pilot(sensor._cfg(), at, "normal")
+    assert sensor.extra_state_attributes["thermal_intelligence_price"] == "unavailable"
+
+
+def test_plan_refusal_identifies_absent_heat_and_safe_mode(monkeypatch):
+    sensor, states = _sensor()
+    sensor._config_entry.options["thermal_intelligence_enabled"] = True
+    normal = _cycle(sensor, monkeypatch, 15)
+    assert normal["thermal_intelligence_reason"] == "heat_signal_not_configured"
+    states["sensor.indoor"].state = "unavailable"
+    safe = _cycle(sensor, monkeypatch, 16)
+    assert safe["thermal_intelligence_reason"] == "safe_mode"

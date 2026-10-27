@@ -61,7 +61,7 @@
           "notification_level": "Choose all price alerts, braking only, or none. The existing Notifications switch remains the master on/off control.",
           "notification_cooldown_minutes": "Minimum time between repeated alerts of the same type. Choose 0 for no limit; 60 minutes is recommended. Braking and preheating have independent timers.",
           "thermal_intelligence_enabled": "Passively collects qualified observations when a verified heat signal is selected. Does not affect heating control.",
-          "external_heat_sources": "For example, a fireplace or air-to-air heat pump. Automatic detection is not yet available; learning abstains when enabled.",
+          "external_heat_sources": "For example, a fireplace or air-to-air heat pump. Intermittent extra heat cannot be reliably identified; learned results remain unvalidated.",
           "thermal_heat_activity_entity": "A binary sensor whose on means measured heat delivery to the home and off means none. Compressor status or hot-water mode alone is insufficient. Report times do not establish physical measurement time."
         }
       }
