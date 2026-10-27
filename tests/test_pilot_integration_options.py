@@ -525,6 +525,186 @@ def test_new_paired_bad_forecast_invalidates_cached_plan(monkeypatch):
     assert attrs["thermal_intelligence_forecast_quality"]["status"] == "degraded"
 
 
+def test_degraded_model_keeps_monitoring_actual_outcomes_without_exposing_plan(
+    monkeypatch,
+):
+    from datetime import datetime, timedelta, timezone
+    import hashlib
+    from custom_components.pumpsteer import forecast
+    from custom_components.pumpsteer.pilot_forecast_audit import ForecastAudit
+    from custom_components.pumpsteer.pilot_vendor.pump_response import (
+        ResponseParameters,
+    )
+
+    sensor, states = _sensor()
+    start = datetime(2026, 10, 11, 8, tzinfo=timezone.utc)
+    sensor._config_entry.options.update(
+        thermal_intelligence_enabled=True, weather_entity="weather.local"
+    )
+    price = states["sensor.price"]
+    price.last_reported = start
+    price.attributes.update(
+        unit_of_measurement="SEK/kWh",
+        raw_today=[
+            {
+                "start": (
+                    start.replace(hour=0) + timedelta(minutes=15 * i)
+                ).isoformat(),
+                "end": (
+                    start.replace(hour=0) + timedelta(minutes=15 * (i + 1))
+                ).isoformat(),
+                "value": 1 + i / 100,
+            }
+            for i in range(96)
+        ],
+    )
+    states["weather.local"] = SimpleNamespace(
+        state="cloudy", last_reported=start, attributes={"temperature_unit": "°C"}
+    )
+
+    async def forecast_stub(*args, **kwargs):
+        callback = kwargs.get("raw_weather_callback")
+        if callback:
+            callback(
+                [
+                    {
+                        "datetime": (start + timedelta(hours=i)).isoformat(),
+                        "temperature": 5 - i,
+                    }
+                    for i in range(7)
+                ]
+            )
+        return []
+
+    monkeypatch.setattr(forecast, "async_build_forecast", forecast_stub)
+    house = {
+        "loss": 0.02,
+        "gain": 0.4,
+        "background": 0.1,
+        "mae": 0.02,
+        "persistence_mae": 0.2,
+        "samples": 8,
+        "outdoor_min": -5,
+        "outdoor_max": 10,
+        "indoor_min": 19,
+        "indoor_max": 22,
+        "heat_min": 0,
+        "heat_max": 1,
+    }
+    raw = "pilot-house-v1:" + ":".join(
+        format(house[key], ".17g") for key in ("loss", "gain", "background")
+    )
+    revision = hashlib.sha256(raw.encode()).hexdigest()[:16]
+    audit = ForecastAudit()
+    audit.records = [
+        {
+            "revision": revision,
+            "error": 0.2,
+            "persistence_error": 0,
+            "horizon_seconds": 900,
+            "observed": start.isoformat(),
+        }
+        for _ in range(5)
+    ]
+    pump = SimpleNamespace(
+        ready=True,
+        reason="ready",
+        parameters=ResponseParameters(),
+        history=[(i, i % 2, i % 2, 5) for i in range(112)],
+    )
+    sensor._pilot = SimpleNamespace(
+        house_intervals=8,
+        audit=audit,
+        last_indoor_report=start,
+        source_identity=(None, None),
+        manager=SimpleNamespace(
+            pump=pump,
+            recent=[(start.timestamp(), 0.5, 1.0)],
+            response_state=lambda ts: (0.4, ()),
+        ),
+        validated_house=lambda now: house,
+    )
+    sensor._pilot_sources = (
+        "sensor.indoor",
+        "sensor.outdoor",
+        "binary_sensor.heat",
+        False,
+    )
+    monkeypatch.setattr(sensor, "_observe_pilot", lambda *args: None)
+    attrs = _cycle(sensor, monkeypatch, 0)
+    assert attrs["thermal_intelligence_planning_status"] == "unavailable"
+    assert (
+        attrs["thermal_intelligence_plan_detail"]["reason"]
+        == "forecast_quality_degraded"
+    )
+    assert audit.pending is not None
+    assert audit.pending["revision"] == revision
+    for minute in (5, 10, 15):
+        at = start + timedelta(minutes=minute)
+        indoor = SimpleNamespace(
+            state="20.5",
+            last_reported=at if minute == 15 else start,
+            last_changed=start,
+            attributes={"unit_of_measurement": "°C"},
+        )
+        outdoor = SimpleNamespace(
+            state="5",
+            last_reported=at,
+            last_changed=start,
+            attributes={"unit_of_measurement": "°C"},
+        )
+        heat = SimpleNamespace(
+            state="on", last_reported=at, last_changed=start, attributes={}
+        )
+        audit.observe(at, indoor, outdoor, heat)
+    assert len(audit.records) == 6
+    assert audit.records[-1]["horizon_seconds"] == 900
+    assert audit.summary(revision)["status"] == "degraded"
+    # Subsequent predictions are issued at real cycle times and matched only
+    # with later reports. A few good outcomes must not immediately erase the
+    # earlier failures; the existing revision-specific rolling window decides.
+    indoor_value = 20.5
+    for index in range(1, 8):
+        issued = start + timedelta(minutes=30 * index)
+        states["sensor.indoor"].state = str(indoor_value)
+        sensor._pilot.last_indoor_report = issued
+        sensor._pilot.manager.recent = [(issued.timestamp(), 0.5, 1.0)]
+        sensor._pilot_plan_next = None
+        before = audit.summary(revision)["status"]
+        attrs = _cycle(sensor, monkeypatch, 30 * index)
+        if before == "degraded":
+            assert attrs["thermal_intelligence_planning_status"] == "unavailable"
+        assert audit.pending is not None
+        predicted = audit.pending["forecast"]
+        for minute in (5, 10, 15):
+            observed = issued + timedelta(minutes=minute)
+            indoor = SimpleNamespace(
+                state=str(predicted if minute == 15 else indoor_value),
+                last_reported=observed if minute == 15 else issued,
+                last_changed=issued,
+                attributes={"unit_of_measurement": "°C"},
+            )
+            outdoor = SimpleNamespace(
+                state="5",
+                last_reported=observed,
+                last_changed=issued,
+                attributes={"unit_of_measurement": "°C"},
+            )
+            heat = SimpleNamespace(
+                state="on", last_reported=observed, last_changed=issued, attributes={}
+            )
+            audit.observe(observed, indoor, outdoor, heat)
+        indoor_value = predicted
+    assert audit.summary(revision)["status"] == "monitoring"
+    issued = start + timedelta(minutes=240)
+    states["sensor.indoor"].state = str(indoor_value)
+    sensor._pilot.last_indoor_report = issued
+    sensor._pilot.manager.recent = [(issued.timestamp(), 0.5, 1.0)]
+    sensor._pilot_plan_next = None
+    attrs = _cycle(sensor, monkeypatch, 240)
+    assert attrs["thermal_intelligence_planning_status"] == "validated_passive"
+
+
 def test_power_telemetry_uses_bounded_event_subscription_and_no_new_entity(monkeypatch):
     import sys
     from datetime import datetime, timedelta, timezone

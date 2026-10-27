@@ -294,6 +294,10 @@ def hypothetical_plan(
             )
         if reference is not None:
             result["comparison"].update(reference)
+            result["comparison"]["pilot_heat_fraction"] = [
+                round(value, 2) for value in plan.predicted_heating
+            ]
+            result["comparison"]["heat_fraction_kind"] = "modelled_not_measured_power"
             result["comparison"]["pilot_heat_price_proxy"] = round(
                 sum(p * h * 0.25 for p, h in zip(price_values, plan.predicted_heating)),
                 4,
@@ -439,6 +443,8 @@ def _pure_pi_reference(
             if categories is None
             else "no_expensive_period_in_known_window",
             "cadence_minutes": 15,
+            "baseline_temperatures": [round(v, 2) for v in temperatures],
+            "baseline_heat_fraction": [round(v, 2) for v in heats],
             "baseline_final_temperature": round(temperatures[-1], 2),
             "baseline_target_deviation_degree_hours": round(
                 sum(abs(v - target) * 0.25 for v in temperatures[1:]), 3

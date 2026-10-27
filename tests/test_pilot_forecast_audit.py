@@ -112,3 +112,61 @@ def test_issued_forecast_is_persisted_but_never_reused_after_restart():
     resumed = ForecastAudit()
     resumed.restore(saved, T + timedelta(minutes=5))
     assert resumed.pending is None
+
+
+def _qualified_record(at):
+    audit = ForecastAudit()
+    assert audit.issue(at, 20, 5, 1, 0.02, 0.4, 0.1, "a")
+    for minute in (5, 10, 15):
+        now = at + timedelta(minutes=minute)
+        audit.observe(
+            now,
+            state(20, now, changed=at),
+            state(5, now, changed=at),
+            state("on", now, changed=at, unit=None),
+        )
+    return audit.records[0]
+
+
+def test_restore_never_counts_copied_outcomes_as_independent_evidence():
+    record = _qualified_record(T)
+    restored = ForecastAudit()
+    restored.restore(
+        {"records": [dict(record) for _ in range(5)]}, T + timedelta(hours=1)
+    )
+    assert restored.summary("a")["count"] == 1
+    assert restored.summary("a")["status"] == "insufficient_outcomes"
+
+
+def test_restore_discards_conflicting_outcome_but_keeps_other_pairs():
+    record = _qualified_record(T)
+    conflict = {**record, "actual": 20.5}
+    other = _qualified_record(T + timedelta(minutes=20))
+    restored = ForecastAudit()
+    restored.restore(
+        {"records": [record, conflict, record, other]}, T + timedelta(hours=1)
+    )
+    assert restored.summary("a")["count"] == 1
+    assert restored.records[0]["issued"] == other["issued"]
+
+
+def test_restore_discards_overlapping_forecasts_and_preserves_ordered_pairs():
+    first = _qualified_record(T)
+    overlapping = _qualified_record(T + timedelta(minutes=5))
+    later = _qualified_record(T + timedelta(minutes=30))
+    last = _qualified_record(T + timedelta(minutes=50))
+    restored = ForecastAudit()
+    restored.restore(
+        {"records": [last, first, overlapping, later]}, T + timedelta(hours=2)
+    )
+    assert [r["issued"] for r in restored.records] == [later["issued"], last["issued"]]
+
+
+def test_restore_rejects_multiple_outcomes_for_one_forecast():
+    first = _qualified_record(T)
+    different_outcome = dict(first)
+    different_outcome["observed"] = (T + timedelta(minutes=20)).isoformat()
+    different_outcome["predicted"] = first["initial"] + first["rate_per_hour"] / 3
+    restored = ForecastAudit()
+    restored.restore({"records": [first, different_outcome]}, T + timedelta(hours=1))
+    assert restored.summary("a")["count"] == 0

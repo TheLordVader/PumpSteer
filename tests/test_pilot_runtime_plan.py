@@ -722,6 +722,9 @@ def test_extended_horizon_reports_terminal_state_without_claiming_savings():
 
 def test_pure_pi_reference_uses_cloned_regulator_and_same_model():
     from custom_components.pumpsteer.control import PIController
+    from custom_components.pumpsteer.pilot_vendor.pump_response import (
+        ResponseParameters,
+    )
 
     controller = PIController()
     controller.compute(21, 20.8, 5, 1, T, kp=2.4, ki=0.035)
@@ -737,6 +740,10 @@ def test_pure_pi_reference_uses_cloned_regulator_and_same_model():
         price_states=[price_state()],
         weather_rows=weather(),
         weather_unit="°C",
+        response_context=(
+            ResponseParameters(delay_steps=1, retention=0.5),
+            (0.0, (0.0,)),
+        ),
         pi_reference={
             "controller": controller,
             "kp": 2.4,
@@ -750,6 +757,18 @@ def test_pure_pi_reference_uses_cloned_regulator_and_same_model():
     assert comparison["baseline"] == "conditional_pi_only"
     assert comparison["cadence_minutes"] == 15
     assert comparison["baseline_final_temperature"] is not None
+    assert len(comparison["baseline_temperatures"]) == len(result["temperatures"])
+    assert len(comparison["baseline_heat_fraction"]) == len(result["duties"])
+    assert len(comparison["pilot_heat_fraction"]) == len(
+        comparison["baseline_heat_fraction"]
+    )
+    assert comparison["heat_fraction_kind"] == "modelled_not_measured_power"
+    assert comparison["pilot_heat_fraction"][0] != result["duties"][0]
+    assert (
+        comparison["baseline_temperatures"][-1]
+        == comparison["baseline_final_temperature"]
+    )
+    assert all(0 <= value <= 1 for value in comparison["baseline_heat_fraction"])
     assert comparison["savings"] == "unverified"
     assert (
         controller._integral,

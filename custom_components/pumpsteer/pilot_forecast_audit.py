@@ -148,6 +148,8 @@ class ForecastAudit:
         rows = payload.get("records") if isinstance(payload, dict) else None
         if not isinstance(rows, list) or len(rows) > 24:
             return
+        candidates = {}
+        conflicting = set()
         for row in rows:
             if (
                 not isinstance(row, dict)
@@ -198,7 +200,29 @@ class ForecastAudit:
                 continue
             item["error"] = item["predicted"] - item["actual"]
             item["persistence_error"] = item["initial"] - item["actual"]
-            self.records.append(item)
+            # A live audit has only one pending forecast at a time. Repeated
+            # copies are one piece of evidence; contradictory versions of
+            # the same issuance must not be counted at all.
+            signature = (row["revision"], observed, source, *values)
+            if issued in conflicting:
+                continue
+            prior = candidates.get(issued)
+            if prior is not None and prior[0] != signature:
+                del candidates[issued]
+                conflicting.add(issued)
+            elif prior is None:
+                candidates[issued] = (signature, observed, item)
+
+        ordered = sorted(candidates.items())
+        overlapping = set()
+        for index, (issued, (_, observed, _)) in enumerate(ordered):
+            for next_issued, _ in ordered[index + 1 :]:
+                if next_issued >= observed:
+                    break
+                overlapping.update((issued, next_issued))
+        self.records = [
+            item for issued, (_, _, item) in ordered if issued not in overlapping
+        ]
 
     def summary(self, revision):
         rows = [r for r in self.records if r["revision"] == revision][-8:]

@@ -2855,14 +2855,16 @@ class PumpSteerSensor(RestoreEntity):
             revision = hashlib.sha256(raw.encode()).hexdigest()[:16]
             quality = pilot.audit.summary(revision)
             result["forecast_quality"] = quality
-            if quality["status"] == "degraded":
+            validated = result.get("planning_status") == "validated_passive"
+            degraded = quality["status"] == "degraded"
+            if degraded:
                 result = {
                     "planning_status": "unavailable",
                     "reason": "forecast_quality_degraded",
                     "forecast_quality": quality,
                 }
-            elif (
-                result.get("planning_status") == "validated_passive"
+            if (
+                validated
                 and pilot.last_indoor_report is not None
                 and timedelta(0)
                 <= issued_at - pilot.last_indoor_report
@@ -2883,19 +2885,22 @@ class PumpSteerSensor(RestoreEntity):
                         source_identity=pilot.source_identity,
                         source_reported=pilot.last_indoor_report,
                     ):
-                        result["monitoring_forecast"] = {
-                            "kind": "conditional_unchanged_heat_and_outdoor",
-                            "horizon_minutes": 15,
-                            "temperature": round(pilot.audit.pending["forecast"], 2),
-                            "initial_temperature": pilot.audit.pending["indoor"],
-                            "rate_c_per_hour": pilot.audit.pending["rate"],
-                            "valid_horizon_minutes": [10, 20],
-                            "source_reported_at": pilot.audit.pending[
-                                "source_reported"
-                            ].isoformat(),
-                            "physical_measurement_time": "unknown",
-                            "model_revision": revision,
-                        }
+                        if not degraded:
+                            result["monitoring_forecast"] = {
+                                "kind": "conditional_unchanged_heat_and_outdoor",
+                                "horizon_minutes": 15,
+                                "temperature": round(
+                                    pilot.audit.pending["forecast"], 2
+                                ),
+                                "initial_temperature": pilot.audit.pending["indoor"],
+                                "rate_c_per_hour": pilot.audit.pending["rate"],
+                                "valid_horizon_minutes": [10, 20],
+                                "source_reported_at": pilot.audit.pending[
+                                    "source_reported"
+                                ].isoformat(),
+                                "physical_measurement_time": "unknown",
+                                "model_revision": revision,
+                            }
                         await self._save_pilot_store()
         result["forecast_start"] = now.isoformat()
         result["issued_at"] = issued_at.isoformat()
