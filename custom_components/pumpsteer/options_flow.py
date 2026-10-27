@@ -82,6 +82,14 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
                         ),
                     ): selector({"entity": {"domain": "sensor"}}),
                     vol.Optional(
+                        "thermal_intelligence_enabled",
+                        default=current_data.get("thermal_intelligence_enabled", False),
+                    ): selector({"boolean": {}}),
+                    vol.Optional(
+                        "external_heat_sources",
+                        default=current_data.get("external_heat_sources", False),
+                    ): selector({"boolean": {}}),
+                    vol.Optional(
                         "notify_service",
                         default=current_data.get("notify_service", ""),
                     ): selector({"text": {}}),

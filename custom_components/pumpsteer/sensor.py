@@ -208,7 +208,15 @@ class PumpSteerSensor(RestoreEntity):
 
     @property
     def extra_state_attributes(self) -> dict:
-        return {**self._attributes, "friendly_name": "PumpSteer"}
+        attrs = {**self._attributes, "friendly_name": "PumpSteer"}
+        attrs.pop("thermal_intelligence_status", None)
+        attrs.pop("thermal_intelligence_reason", None)
+        if self._cfg().get("thermal_intelligence_enabled") is True:
+            attrs["thermal_intelligence_status"] = (
+                "suspended_safe" if attrs.get("mode") == MODE_SAFE else "not_available"
+            )
+            attrs["thermal_intelligence_reason"] = "integration_incomplete"
+        return attrs
 
     @property
     def unit_of_measurement(self) -> str:
