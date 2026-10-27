@@ -2,6 +2,7 @@
 
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+import pytest
 from custom_components.pumpsteer.pilot_runtime_plan import hypothetical_plan
 
 T = datetime(2026, 10, 25, 0, tzinfo=timezone.utc)
@@ -84,6 +85,8 @@ def test_ha_cycle_runs_optimizer_with_no_heat_sensor_and_keeps_pi_unchanged(
 
     base, base_states = _sensor()
     candidate, states = _sensor()
+    base._config_entry.options["aggressiveness"] = 0
+    candidate._config_entry.options["aggressiveness"] = 0
     now = datetime(2026, 10, 11, 8, tzinfo=timezone.utc)
     candidate._config_entry.options.update(
         thermal_intelligence_enabled=True, weather_entity="weather.local"
@@ -133,6 +136,10 @@ def test_ha_cycle_runs_optimizer_with_no_heat_sensor_and_keeps_pi_unchanged(
     assert calls
     assert attrs["thermal_intelligence_planning_status"] == "hypothetical_unvalidated"
     assert (
+        attrs["thermal_intelligence_plan_detail"]["comparison"]["baseline"]
+        == "conditional_pi_only"
+    )
+    assert (
         attrs["thermal_intelligence_plan_detail"]["cost_kind"] == "proxy_not_currency"
     )
     assert candidate.state == base.state
@@ -151,6 +158,74 @@ def test_ha_cycle_runs_optimizer_with_no_heat_sensor_and_keeps_pi_unchanged(
         unavailable["thermal_intelligence_plan_detail"]["reason"]
         == "weather_forecast_unavailable"
     )
+
+
+@pytest.mark.parametrize("mismatched_forecast", [False, True])
+def test_ha_cycle_compares_pi_in_known_normal_price_window(
+    monkeypatch, mismatched_forecast
+):
+    """The conditional PI path is connected to real price classifications."""
+    from custom_components.pumpsteer import forecast
+    from test_brake_provenance import _sensor, _cycle
+
+    base, base_states = _sensor()
+    candidate, states = _sensor()
+    now = datetime(2026, 10, 11, 8, tzinfo=timezone.utc)
+    candidate._config_entry.options.update(
+        thermal_intelligence_enabled=True, weather_entity="weather.local"
+    )
+    price = states["sensor.price"]
+    price.last_reported = now
+    price.attributes.update(
+        today=[1.0] * 96,
+        unit_of_measurement="SEK/kWh",
+        raw_today=[
+            {
+                "start": (now.replace(hour=0) + timedelta(minutes=15 * i)).isoformat(),
+                "end": (
+                    now.replace(hour=0) + timedelta(minutes=15 * (i + 1))
+                ).isoformat(),
+                "value": 1.0,
+            }
+            for i in range(96)
+        ],
+    )
+    if mismatched_forecast:
+        price.attributes["forecast"] = [
+            {**row, "value": 2.0} for row in price.attributes.pop("raw_today")
+        ]
+    base_states["sensor.price"].attributes = dict(price.attributes)
+    base_states["sensor.price"].last_reported = now
+    states["weather.local"] = SimpleNamespace(
+        state="cloudy", last_reported=now, attributes={"temperature_unit": "°C"}
+    )
+
+    async def forecast_stub(*args, **kwargs):
+        callback = kwargs.get("raw_weather_callback")
+        if callback:
+            callback(
+                [
+                    {
+                        "datetime": (now + timedelta(hours=i)).isoformat(),
+                        "temperature": 5,
+                    }
+                    for i in range(4)
+                ]
+            )
+        return []
+
+    monkeypatch.setattr(forecast, "async_build_forecast", forecast_stub)
+    before = _cycle(base, monkeypatch, 0)
+    attrs = _cycle(candidate, monkeypatch, 0)
+    assert attrs["mode"] == before["mode"] == "normal"
+    assert candidate.state == base.state
+    assert candidate._pilot_price_context is not None
+    comparison = attrs["thermal_intelligence_plan_detail"]["comparison"]
+    if mismatched_forecast:
+        assert comparison["baseline"] == "unavailable"
+    else:
+        assert comparison["baseline"] == "conditional_pi_only"
+        assert comparison["baseline_reason"] == "no_expensive_period_in_known_window"
 
 
 def test_store_roundtrip_keeps_historical_model_unvalidated():
@@ -590,6 +665,26 @@ def test_ha_cycle_exposes_validated_passive_with_synthetic_qualified_fixture(
         attrs["thermal_intelligence_plan_detail"]["reason"]
         == "inputs_changed_during_planning"
     )
+    states["weather.local"].state = "cloudy"
+    sensor._config_entry.options["thermal_hot_water_mode_entity"] = (
+        "binary_sensor.hot_water"
+    )
+    states["binary_sensor.hot_water"] = SimpleNamespace(
+        state="off", last_reported=at, last_changed=at, attributes={}
+    )
+
+    def change_hot_water(*args, **kwargs):
+        states["binary_sensor.hot_water"].state = "on"
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(response_optimizer, "optimize", change_hot_water)
+    sensor._pilot_plan_next = None
+    attrs = _cycle(sensor, monkeypatch, 3)
+    assert attrs["thermal_intelligence_planning_status"] == "unavailable"
+    assert (
+        attrs["thermal_intelligence_plan_detail"]["reason"]
+        == "inputs_changed_during_planning"
+    )
 
 
 def test_extended_horizon_reports_terminal_state_without_claiming_savings():
@@ -623,3 +718,262 @@ def test_extended_horizon_reports_terminal_state_without_claiming_savings():
     assert result["comparison"]["heat_storage"] == "unknown"
     assert result["comparison"]["savings"] == "unverified"
     assert result["comparison"]["final_temperature"] == result["temperatures"][-1]
+
+
+def test_pure_pi_reference_uses_cloned_regulator_and_same_model():
+    from custom_components.pumpsteer.control import PIController
+
+    controller = PIController()
+    controller.compute(21, 20.8, 5, 1, T, kp=2.4, ki=0.035)
+    saved = (controller._integral, controller._last_time, controller._last_error)
+    result = hypothetical_plan(
+        now=T,
+        indoor=20.8,
+        outdoor=5,
+        command=4.5,
+        target=21,
+        floor=20.5,
+        ceiling=21.5,
+        price_states=[price_state()],
+        weather_rows=weather(),
+        weather_unit="°C",
+        pi_reference={
+            "controller": controller,
+            "kp": 2.4,
+            "ki": 0.035,
+            "kd": 0,
+            "integral_clamp": 6,
+            "summer_threshold": 18,
+        },
+    )
+    comparison = result["comparison"]
+    assert comparison["baseline"] == "conditional_pi_only"
+    assert comparison["cadence_minutes"] == 15
+    assert comparison["baseline_final_temperature"] is not None
+    assert comparison["savings"] == "unverified"
+    assert (
+        controller._integral,
+        controller._last_time,
+        controller._last_error,
+    ) == saved
+
+
+def test_pi_reference_cannot_leave_validated_model_scope():
+    from custom_components.pumpsteer.control import PIController
+    from custom_components.pumpsteer.pilot_vendor.pump_response import (
+        ResponseParameters,
+    )
+
+    controller = PIController()
+    controller.compute(21, 20.8, 5, 1, T, kp=2.4, ki=0.035)
+    house = {
+        "loss": 0.02,
+        "gain": 0.4,
+        "background": 0.1,
+        "mae": 0.02,
+        "persistence_mae": 0.2,
+        "samples": 8,
+        "outdoor_min": -5,
+        "outdoor_max": 10,
+        "indoor_min": 20.75,
+        "indoor_max": 21.1,
+        "heat_min": 0,
+        "heat_max": 1,
+    }
+    result = hypothetical_plan(
+        now=T,
+        indoor=20.8,
+        outdoor=5,
+        command=4.5,
+        target=21,
+        floor=20.5,
+        ceiling=21.5,
+        price_states=[price_state()],
+        weather_rows=weather(),
+        weather_unit="°C",
+        response_context=(ResponseParameters(), (0.4, ())),
+        house_context=house,
+        response_scope={
+            "request_min": 0,
+            "request_max": 1,
+            "heat_min": 0,
+            "heat_max": 1,
+        },
+        pi_reference={
+            "controller": controller,
+            "kp": 40,
+            "ki": 0.9,
+            "kd": 0,
+            "integral_clamp": 6,
+            "summer_threshold": 18,
+        },
+    )
+    # Either the Pilot plan or the reference may fail the narrow domain; neither
+    # is permitted to appear as a validated comparison outside it.
+    if result["planning_status"] == "validated_passive":
+        assert result["comparison"]["baseline"] == "unavailable"
+
+
+def test_pi_reference_explicitly_rejects_unobserved_thermal_domain():
+    from custom_components.pumpsteer.control import PIController
+    from custom_components.pumpsteer.pilot_runtime_plan import _pure_pi_reference
+    from custom_components.pumpsteer.pilot_vendor.mpc_controller import MpcController
+    from custom_components.pumpsteer.pilot_vendor.pump_response import (
+        ResponseParameters,
+    )
+
+    pi = PIController()
+    pi.compute(21, 20.8, 5, 1, T)
+    context = {
+        "controller": pi,
+        "kp": 40,
+        "ki": 0.9,
+        "kd": 0,
+        "integral_clamp": 6,
+        "summer_threshold": 18,
+    }
+    reference = _pure_pi_reference(
+        context,
+        now=T,
+        indoor=20.8,
+        command=4.5,
+        target=21,
+        outdoor=[5] * 8,
+        prices=[1] * 8,
+        floor=20.5,
+        ceiling=21.5,
+        controller=MpcController(21, 0.5, 0.5, 2),
+        parameters=ResponseParameters(),
+        initial=(0.4, ()),
+        offset=12,
+        entity_min=-20,
+        entity_max=25,
+        house_scope={
+            "indoor_min": 20.79,
+            "indoor_max": 20.81,
+            "heat_min": 0,
+            "heat_max": 1,
+        },
+        response_scope={
+            "request_min": 0,
+            "request_max": 1,
+            "heat_min": 0,
+            "heat_max": 1,
+        },
+    )
+    assert reference is None
+
+
+def test_pi_only_zero_price_overlay_is_not_called_a_comfort_boundary():
+    from custom_components.pumpsteer.control import PIController
+
+    pi = PIController()
+    pi.compute(21, 20.8, 5, 1, T)
+    result = hypothetical_plan(
+        now=T,
+        indoor=20.8,
+        outdoor=5,
+        command=4.5,
+        target=21,
+        floor=21,
+        ceiling=21,
+        price_states=[price_state()],
+        weather_rows=weather(),
+        weather_unit="°C",
+        pi_reference={
+            "controller": pi,
+            "kp": 2.4,
+            "ki": 0.035,
+            "kd": 0,
+            "integral_clamp": 6,
+            "summer_threshold": 18,
+        },
+    )
+    assert result["comfort_status"] == "no_configured_band"
+    assert result["comparison"]["below_floor_degree_hours"] is None
+    assert result["comparison"]["baseline_below_floor_degree_hours"] is None
+    assert result["comparison"]["target_deviation_degree_hours"] is not None
+
+
+def test_pi_reference_with_price_mode_requires_full_known_nonexpensive_window():
+    from custom_components.pumpsteer.control import PIController
+
+    pi = PIController()
+    pi.compute(21, 20.8, 5, 1, T)
+    context = {
+        "controller": pi,
+        "kp": 2.4,
+        "ki": 0.035,
+        "kd": 0,
+        "integral_clamp": 6,
+        "summer_threshold": 18,
+        "categories": ["normal"] * 40,
+        "active_prices": [0.2] * 4 + [3.0] * 4 + [1.0] * 32,
+        "current_slot": 0,
+        "interval_minutes": 15,
+        "price_lookahead_minutes": 360,
+    }
+    args = dict(
+        now=T,
+        indoor=20.8,
+        outdoor=5,
+        command=4.5,
+        target=21,
+        floor=20.5,
+        ceiling=21.5,
+        price_states=[price_state()],
+        weather_rows=weather(),
+        weather_unit="°C",
+        pi_reference=context,
+    )
+    assert hypothetical_plan(**args)["comparison"]["baseline"] == "conditional_pi_only"
+    context["active_prices"][4] = 4.0
+    assert hypothetical_plan(**args)["comparison"]["baseline"] == "unavailable"
+    context["active_prices"][4] = 3.0
+    context["categories"][3] = "expensive"
+    assert hypothetical_plan(**args)["comparison"]["baseline"] == "unavailable"
+
+
+def test_pi_reference_rejects_local_midnight_before_price_thresholds_change():
+    from zoneinfo import ZoneInfo
+    from custom_components.pumpsteer.control import PIController
+    from custom_components.pumpsteer.pilot_runtime_plan import _pure_pi_reference
+    from custom_components.pumpsteer.pilot_vendor.mpc_controller import MpcController
+    from custom_components.pumpsteer.pilot_vendor.pump_response import (
+        ResponseParameters,
+    )
+
+    at = datetime(2026, 10, 25, 15, 30, tzinfo=timezone.utc)
+    pi = PIController()
+    pi.compute(21, 20.8, 5, 1, at)
+    context = {
+        "controller": pi,
+        "kp": 2.4,
+        "ki": 0.035,
+        "kd": 0,
+        "integral_clamp": 6,
+        "summer_threshold": 18,
+        "categories": ["normal"] * 100,
+        "current_slot": 0,
+        "interval_minutes": 15,
+        "price_lookahead_minutes": 360,
+        "calendar_tz": ZoneInfo("Europe/Stockholm"),
+    }
+    result = _pure_pi_reference(
+        context,
+        now=at,
+        indoor=20.8,
+        command=4.5,
+        target=21,
+        outdoor=[5] * 8,
+        prices=[1] * 8,
+        floor=20.5,
+        ceiling=21.5,
+        controller=MpcController(21, 0.5, 0.5, 2),
+        parameters=ResponseParameters(),
+        initial=(0.4, ()),
+        offset=12,
+        entity_min=-20,
+        entity_max=25,
+    )
+    assert result is None

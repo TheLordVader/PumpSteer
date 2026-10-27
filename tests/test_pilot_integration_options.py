@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import pytest
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -153,6 +154,43 @@ def test_update_error_breaks_pending_pilot_interval(monkeypatch):
     monkeypatch.setattr(sensor, "_do_update", broken)
     asyncio.run(sensor.async_update())
     assert sensor._pilot.manager.house.start is None
+
+
+def test_hot_water_transition_during_learning_discards_fit(monkeypatch):
+    from datetime import datetime, timezone
+    from custom_components.pumpsteer import sensor as sensor_module
+
+    sensor, states = _sensor()
+    sensor._config_entry.options.update(
+        thermal_intelligence_enabled=True,
+        thermal_hot_water_mode_entity="binary_sensor.hot_water",
+    )
+    at = datetime(2026, 10, 11, 8, tzinfo=timezone.utc)
+    states["binary_sensor.hot_water"] = SimpleNamespace(
+        state="off", last_reported=at, last_changed=at, attributes={}
+    )
+
+    class Pump:
+        def add_interval(self, sample):
+            states["binary_sensor.hot_water"].state = "on"
+
+    class Pilot:
+        def __init__(self):
+            self.manager = SimpleNamespace(pump=Pump())
+            self.reset = False
+
+        def reset_interval(self):
+            self.reset = True
+
+    pilot = Pilot()
+    sensor._pilot = pilot
+    monkeypatch.setattr(sensor, "_observe_pilot", lambda *args: object())
+    monkeypatch.setattr(sensor_module.dt_util, "now", lambda: at)
+    for key in ("sensor.indoor", "sensor.outdoor"):
+        states[key].last_reported = at
+    asyncio.run(sensor._do_update())
+    assert pilot.reset
+    assert sensor._pilot_plan["reason"] == "inputs_changed_during_learning"
 
 
 def test_safe_does_not_expose_previous_forecast_or_price_as_current(monkeypatch):
@@ -485,3 +523,284 @@ def test_new_paired_bad_forecast_invalidates_cached_plan(monkeypatch):
         attrs = _cycle(sensor, monkeypatch, minute)
     assert attrs["thermal_intelligence_planning_status"] != "validated_passive"
     assert attrs["thermal_intelligence_forecast_quality"]["status"] == "degraded"
+
+
+def test_power_telemetry_uses_bounded_event_subscription_and_no_new_entity(monkeypatch):
+    import sys
+    from datetime import datetime, timedelta, timezone
+    from custom_components.pumpsteer import sensor as sensor_module
+
+    sensor, states = _sensor()
+    sensor._config_entry.options.update(
+        thermal_intelligence_enabled=True,
+        thermal_power_entity="sensor.power",
+        thermal_heating_mode_entity="binary_sensor.radiator",
+    )
+    now = datetime(2026, 10, 11, 8, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        sensor_module.dt_util, "now", lambda: now - timedelta(seconds=1)
+    )
+    callbacks = []
+    unsubscribed = []
+    event_module = sys.modules["homeassistant.helpers.event"]
+
+    def track(hass, entity_ids, callback):
+        callbacks.append((entity_ids, callback))
+        return lambda: unsubscribed.append(True)
+
+    monkeypatch.setattr(event_module, "async_track_state_change_event", track)
+    sensor._setup_power_telemetry()
+    ids, callback = callbacks[0]
+    assert set(ids) == {"sensor.power", "binary_sensor.radiator", "sensor.price"}
+    states["sensor.price"].attributes.update(
+        unit_of_measurement="SEK/kWh",
+        raw_today=[
+            {
+                "start": now.isoformat(),
+                "end": (now + timedelta(hours=1)).isoformat(),
+                "value": 1,
+            }
+        ],
+    )
+    states["sensor.price"].last_reported = now
+    for minute in (0, 5):
+        at = now + timedelta(minutes=minute)
+        states["sensor.power"] = SimpleNamespace(
+            state="1000",
+            last_reported=at,
+            last_changed=now,
+            attributes={"unit_of_measurement": "W"},
+        )
+        states["binary_sensor.radiator"] = SimpleNamespace(
+            state="on", last_reported=at, last_changed=now, attributes={}
+        )
+        callback(
+            SimpleNamespace(
+                time_fired=at + timedelta(microseconds=500),
+                data={"entity_id": "sensor.power"},
+            )
+        )
+    assert sensor.extra_state_attributes["thermal_intelligence_electrical"][
+        "energy_kwh_estimate"
+    ] == pytest.approx(1 / 12, abs=0.0001)
+    sensor._stop_power_telemetry()
+    assert unsubscribed == [True]
+
+
+def test_existing_control_cycle_recovers_unchanged_ha_power_reports(monkeypatch):
+    import sys
+    from datetime import datetime, timedelta, timezone
+    from custom_components.pumpsteer import sensor as sensor_module
+
+    sensor, states = _sensor()
+    sensor._config_entry.options.update(
+        thermal_intelligence_enabled=True, thermal_power_entity="sensor.power"
+    )
+    start = datetime(2026, 10, 11, 8, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        sensor_module.dt_util, "now", lambda: start - timedelta(seconds=1)
+    )
+    monkeypatch.setattr(
+        sys.modules["homeassistant.helpers.event"],
+        "async_track_state_change_event",
+        lambda hass, ids, callback: lambda: None,
+    )
+    sensor._setup_power_telemetry()
+    states["sensor.price"].attributes.update(
+        unit_of_measurement="SEK/kWh",
+        forecast=[
+            {
+                "start": start.isoformat(),
+                "end": (start + timedelta(hours=1)).isoformat(),
+                "value": 1,
+            }
+        ],
+    )
+    states["sensor.price"].last_reported = start
+    for minute in range(0, 6):
+        at = start + timedelta(minutes=minute)
+        states["sensor.power"] = SimpleNamespace(
+            state="1000",
+            last_reported=at,
+            last_changed=start,
+            attributes={"unit_of_measurement": "W"},
+        )
+        _cycle(sensor, monkeypatch, minute)
+    assert sensor._power_ledger.summary()["energy_kwh_estimate"] == pytest.approx(
+        1 / 12, abs=0.0001
+    )
+    assert sensor._power_ledger.summary()["qualified_seconds"] == 300
+
+
+def test_other_ha_event_never_fabricates_a_power_interval(monkeypatch):
+    import sys
+    from datetime import datetime, timedelta, timezone
+    from custom_components.pumpsteer import sensor as sensor_module
+
+    sensor, states = _sensor()
+    sensor._config_entry.options.update(
+        thermal_intelligence_enabled=True,
+        thermal_power_entity="sensor.power",
+        thermal_heating_mode_entity="binary_sensor.radiator",
+    )
+    start = datetime(2026, 10, 11, 8, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        sensor_module.dt_util, "now", lambda: start - timedelta(seconds=1)
+    )
+    callbacks = []
+    monkeypatch.setattr(
+        sys.modules["homeassistant.helpers.event"],
+        "async_track_state_change_event",
+        lambda hass, ids, cb: callbacks.append(cb) or (lambda: None),
+    )
+    sensor._setup_power_telemetry()
+    callback = callbacks[0]
+    states["sensor.power"] = SimpleNamespace(
+        state="1000",
+        last_reported=start,
+        last_changed=start,
+        attributes={"unit_of_measurement": "W"},
+    )
+    states["binary_sensor.radiator"] = SimpleNamespace(
+        state="on", last_reported=start, last_changed=start, attributes={}
+    )
+    callback(SimpleNamespace(time_fired=start, data={"entity_id": "sensor.power"}))
+    change = start + timedelta(minutes=4)
+    states["binary_sensor.radiator"] = SimpleNamespace(
+        state="off", last_reported=change, last_changed=change, attributes={}
+    )
+    callback(
+        SimpleNamespace(time_fired=change, data={"entity_id": "binary_sensor.radiator"})
+    )
+    assert sensor._power_ledger.summary()["energy_kwh_estimate"] == 0
+    assert sensor._power_ledger.summary()["qualified_seconds"] == 0
+    for minute in (5, 10):
+        at = start + timedelta(minutes=minute)
+        states["sensor.power"].last_reported = at
+        callback(SimpleNamespace(time_fired=at, data={"entity_id": "sensor.power"}))
+    assert sensor._power_ledger.summary()["energy_kwh_estimate"] == pytest.approx(
+        1 / 12, abs=0.0001
+    )
+
+
+def test_power_subscription_is_not_created_when_disabled_and_survives_unrelated_options(
+    monkeypatch,
+):
+    import sys
+
+    sensor, _ = _sensor()
+    sensor._config_entry.options["thermal_power_entity"] = "sensor.power"
+    calls = []
+    monkeypatch.setattr(
+        sys.modules["homeassistant.helpers.event"],
+        "async_track_state_change_event",
+        lambda hass, ids, cb: calls.append(tuple(ids)) or (lambda: None),
+    )
+    sensor._setup_power_telemetry()
+    assert sensor._power_ledger is None and not calls
+    sensor._config_entry.options["thermal_intelligence_enabled"] = True
+    sensor._setup_power_telemetry()
+    previous = sensor._power_ledger
+    sensor._config_entry.options["target_temperature"] = 22
+    sensor._setup_power_telemetry()
+    assert sensor._power_ledger is previous
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("heat_kind", ["supply", "binary"])
+def test_hot_water_mode_blocks_ambiguous_learning_then_recovers(monkeypatch, heat_kind):
+    from datetime import datetime, timedelta, timezone
+
+    sensor, states = _sensor()
+    sensor._config_entry.options.update(
+        thermal_intelligence_enabled=True,
+        thermal_supply_temp_entity="sensor.supply",
+        thermal_heating_mode_entity="binary_sensor.radiator",
+        thermal_hot_water_mode_entity="binary_sensor.hot_water",
+        thermal_supply_threshold=30,
+    )
+    if heat_kind == "binary":
+        sensor._config_entry.options["thermal_heat_activity_entity"] = (
+            "binary_sensor.heat"
+        )
+    start = datetime(2026, 10, 11, 8, tzinfo=timezone.utc)
+    for key in ("sensor.indoor", "sensor.outdoor"):
+        states[key].attributes["unit_of_measurement"] = "°C"
+        states[key].last_changed = start
+    states["sensor.supply"] = SimpleNamespace(
+        state="32",
+        last_reported=start,
+        last_changed=start,
+        attributes={"unit_of_measurement": "°C"},
+    )
+    states["binary_sensor.radiator"] = SimpleNamespace(
+        state="on", last_reported=start, last_changed=start, attributes={}
+    )
+    states["binary_sensor.heat"] = SimpleNamespace(
+        state="on", last_reported=start, last_changed=start, attributes={}
+    )
+    states["binary_sensor.hot_water"] = SimpleNamespace(
+        state="on", last_reported=start, last_changed=start, attributes={}
+    )
+    attrs = _cycle(sensor, monkeypatch, 0)
+    assert attrs["thermal_intelligence_status"] == "hot_water_active"
+    assert attrs["thermal_intelligence_reason"] == "hot_water_active"
+    assert sensor._pilot.manager.house.start is None
+    at = start + timedelta(minutes=1)
+    states["binary_sensor.hot_water"].state = "unavailable"
+    states["binary_sensor.hot_water"].last_reported = at
+    states["binary_sensor.hot_water"].last_changed = at
+    attrs = _cycle(sensor, monkeypatch, 1)
+    assert attrs["thermal_intelligence_status"] == "hot_water_mode_unavailable"
+    assert attrs["thermal_intelligence_reason"] == "hot_water_mode_unavailable"
+    assert sensor._pilot.manager.house.start is None
+    states["binary_sensor.hot_water"].state = "off"
+    states["binary_sensor.hot_water"].last_changed = start + timedelta(minutes=2)
+    for minute in range(2, 8):
+        at = start + timedelta(minutes=minute)
+        for key in (
+            "sensor.supply",
+            "binary_sensor.heat",
+            "binary_sensor.radiator",
+            "binary_sensor.hot_water",
+        ):
+            states[key].last_reported = at
+        attrs = _cycle(sensor, monkeypatch, minute)
+    assert attrs["thermal_intelligence_status"] not in (
+        "hot_water_active",
+        "hot_water_mode_unavailable",
+        "learning_error",
+    )
+    assert sensor._pilot.manager.house.start is not None
+
+
+def test_hot_water_roundtrip_between_cycles_breaks_learning_interval(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    sensor, states = _sensor()
+    sensor._config_entry.options.update(
+        thermal_intelligence_enabled=True,
+        thermal_heat_activity_entity="binary_sensor.heat",
+        thermal_hot_water_mode_entity="binary_sensor.hot_water",
+    )
+    start = datetime(2026, 10, 11, 8, tzinfo=timezone.utc)
+    for key in ("sensor.indoor", "sensor.outdoor"):
+        states[key].attributes["unit_of_measurement"] = "°C"
+        states[key].last_changed = start
+    states["binary_sensor.heat"] = SimpleNamespace(
+        state="on", last_reported=start, last_changed=start, attributes={}
+    )
+    states["binary_sensor.hot_water"] = SimpleNamespace(
+        state="off", last_reported=start, last_changed=start, attributes={}
+    )
+    _cycle(sensor, monkeypatch, 0)
+    pilot = sensor._pilot
+    assert pilot.manager.house.start is not None
+    pilot.validation_after = start.timestamp() - 100
+    changed = start + timedelta(seconds=45)
+    states["binary_sensor.hot_water"].last_changed = changed
+    states["binary_sensor.hot_water"].last_reported = changed
+    states["binary_sensor.heat"].last_reported = start + timedelta(minutes=1)
+    _cycle(sensor, monkeypatch, 1)
+    assert pilot.validation_after == (start + timedelta(minutes=1)).timestamp()
+    assert pilot.manager.house.start == (start + timedelta(minutes=1)).timestamp()

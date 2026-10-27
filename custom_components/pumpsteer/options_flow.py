@@ -98,6 +98,22 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
                         },
                     ): selector({"entity": {"domain": "binary_sensor"}}),
                     vol.Optional(
+                        "thermal_power_entity",
+                        description={
+                            "suggested_value": current_data.get("thermal_power_entity")
+                        },
+                    ): selector(
+                        {"entity": {"domain": "sensor", "device_class": "power"}}
+                    ),
+                    vol.Optional(
+                        "thermal_hot_water_mode_entity",
+                        description={
+                            "suggested_value": current_data.get(
+                                "thermal_hot_water_mode_entity"
+                            )
+                        },
+                    ): selector({"entity": {"domain": "binary_sensor"}}),
+                    vol.Optional(
                         "thermal_supply_temp_entity",
                         description={
                             "suggested_value": current_data.get(
@@ -278,6 +294,8 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
             errors["thermal_heat_activity_entity"] = "entity_not_found"
 
         for key, domain in (
+            ("thermal_power_entity", "sensor."),
+            ("thermal_hot_water_mode_entity", "binary_sensor."),
             ("thermal_supply_temp_entity", "sensor."),
             ("thermal_heating_mode_entity", "binary_sensor."),
         ):

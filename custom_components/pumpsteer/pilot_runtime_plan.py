@@ -84,6 +84,7 @@ def hypothetical_plan(
     response_context=None,
     house_context=None,
     response_scope=None,
+    pi_reference=None,
 ):
     """No outputs or service calls; all parameters and costs are hypothetical."""
     unavailable = {"planning_status": "unavailable"}
@@ -108,7 +109,7 @@ def hypothetical_plan(
             or not math.isfinite(v)
             for v in values
         )
-        or not floor < target < ceiling
+        or not floor <= target <= ceiling
         or not 0 < output_clamp <= 50
         or not entity_min < entity_max
     ):
@@ -266,6 +267,51 @@ def hypothetical_plan(
             "resource_cap_reached": horizon * 4 == max_steps,
         },
     }
+    if pi_reference is not None:
+        reference = _pure_pi_reference(
+            pi_reference,
+            now=now,
+            indoor=indoor,
+            command=command,
+            target=target,
+            outdoor=outdoor_values,
+            prices=price_values,
+            price_segments=prices,
+            floor=floor,
+            ceiling=ceiling,
+            controller=controller,
+            parameters=parameters,
+            initial=initial,
+            offset=output_clamp,
+            entity_min=entity_min,
+            entity_max=entity_max,
+            house_scope=house_context if validated else None,
+            response_scope=response_scope if validated else None,
+        )
+        if reference is None:
+            result["comparison"]["baseline_reason"] = (
+                "pi_reference_outside_domain_or_unsupported"
+            )
+        if reference is not None:
+            result["comparison"].update(reference)
+            result["comparison"]["pilot_heat_price_proxy"] = round(
+                sum(p * h * 0.25 for p, h in zip(price_values, plan.predicted_heating)),
+                4,
+            )
+            result["comparison"]["pilot_heat_fraction_hours"] = round(
+                sum(plan.predicted_heating) * 0.25, 3
+            )
+    if floor == ceiling:
+        result["comfort_status"] = "no_configured_band"
+        result["comparison"]["below_floor_degree_hours"] = None
+        result["comparison"]["above_ceiling_degree_hours"] = None
+        result["comparison"]["target_deviation_degree_hours"] = round(
+            sum(abs(temp - target) * 0.25 for temp in plan.predicted_temperatures[1:]),
+            3,
+        )
+        if result["comparison"].get("baseline") == "conditional_pi_only":
+            result["comparison"]["baseline_below_floor_degree_hours"] = None
+            result["comparison"]["baseline_above_ceiling_degree_hours"] = None
     if validated:
         result["validation"] = {
             key: house_context[key]
@@ -291,3 +337,156 @@ def hypothetical_plan(
             "initial_heat": 0.0 if response_context is None else "observed",
         }
     return result
+
+
+def _pure_pi_reference(
+    context,
+    *,
+    now,
+    indoor,
+    command,
+    target,
+    outdoor,
+    prices,
+    floor,
+    ceiling,
+    controller,
+    parameters,
+    initial,
+    offset,
+    entity_min,
+    entity_max,
+    house_scope=None,
+    response_scope=None,
+    price_segments=None,
+):
+    """Counterfactual PI-only path, sampled every 15 minutes; not full overlays."""
+    import copy
+
+    try:
+        if any(value >= context["summer_threshold"] for value in outdoor):
+            return None
+        categories = context.get("categories")
+        if categories is not None:
+            interval = context["interval_minutes"]
+            start = context["current_slot"]
+            lookahead = context["price_lookahead_minutes"]
+            if interval <= 0 or start < 0 or lookahead < 0:
+                return None
+            required = math.ceil((len(outdoor) * 15 + lookahead) / interval) + 1
+            if (
+                start + required > len(categories)
+                or "expensive" in categories[start : start + required]
+            ):
+                return None
+            timezone = context.get("calendar_tz", now.tzinfo)
+            local_start = now.astimezone(timezone)
+            local_end = (
+                now + timedelta(minutes=len(outdoor) * 15 + lookahead)
+            ).astimezone(timezone)
+            if (
+                local_end.date() != local_start.date()
+                or local_end.utcoffset() != local_start.utcoffset()
+                or not _matching_pi_prices(context, now, local_start, price_segments)
+            ):
+                return None
+        pi = copy.deepcopy(context["controller"])
+        heat, queue = initial
+        value = indoor
+        temperatures = [value]
+        heats = []
+        for index, ambient in enumerate(outdoor):
+            if index == 0:
+                fake = command
+            else:
+                output = pi.compute(
+                    target,
+                    value,
+                    ambient,
+                    1.0,
+                    now + timedelta(minutes=15 * index),
+                    kp=context["kp"],
+                    ki=context["ki"],
+                    kd=context["kd"],
+                    integral_clamp=context["integral_clamp"],
+                    output_clamp=offset,
+                    min_fake_temp=entity_min,
+                    max_fake_temp=entity_max,
+                )
+                fake = max(entity_min, min(entity_max, ambient + output.offset))
+            request = virtual_request(ambient, fake, offset)
+            if request is None:
+                return None
+            heat, queue = parameters.advance(request, heat, queue, ambient)
+            value = controller._predict_temp(value, ambient, heat)
+            if house_scope is not None and not (
+                house_scope["indoor_min"] <= value <= house_scope["indoor_max"]
+                and house_scope["heat_min"] <= heat <= house_scope["heat_max"]
+            ):
+                return None
+            if response_scope is not None and not (
+                response_scope["request_min"]
+                <= request
+                <= response_scope["request_max"]
+                and response_scope["heat_min"] <= heat <= response_scope["heat_max"]
+            ):
+                return None
+            temperatures.append(value)
+            heats.append(heat)
+        return {
+            "baseline": "conditional_pi_only",
+            "baseline_reason": "price_overlays_disabled"
+            if categories is None
+            else "no_expensive_period_in_known_window",
+            "cadence_minutes": 15,
+            "baseline_final_temperature": round(temperatures[-1], 2),
+            "baseline_target_deviation_degree_hours": round(
+                sum(abs(v - target) * 0.25 for v in temperatures[1:]), 3
+            ),
+            "baseline_min_temperature": round(min(temperatures), 2),
+            "baseline_max_temperature": round(max(temperatures), 2),
+            "baseline_below_floor_degree_hours": round(
+                sum(max(0, floor - v) * 0.25 for v in temperatures[1:]), 3
+            ),
+            "baseline_above_ceiling_degree_hours": round(
+                sum(max(0, v - ceiling) * 0.25 for v in temperatures[1:]), 3
+            ),
+            "baseline_heat_price_proxy": round(
+                sum(p * h * 0.25 for p, h in zip(prices, heats)), 4
+            ),
+            "baseline_heat_fraction_hours": round(sum(heats) * 0.25, 3),
+            "proxy_definition": "price_times_model_heat_fraction_not_currency",
+            "reference_assumptions": "15_minute_PI_no_future_holiday_or_precool_unverified_heat_delivery",
+        }
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return None
+
+
+def _matching_pi_prices(context, now, local_start, segments):
+    """Require the PI price slots and timestamped plan prices to agree."""
+    if not segments:
+        return False
+    interval = context["interval_minutes"] * 60
+    slot = context["current_slot"]
+    active = context["active_prices"]
+    seconds_into_slot = (
+        local_start.hour * 3600 + local_start.minute * 60 + local_start.second
+    ) % interval + local_start.microsecond / 1_000_000
+    for start, end, value in segments:
+        cursor = start
+        while cursor < end:
+            elapsed = (cursor - now).total_seconds()
+            index = slot + math.floor((seconds_into_slot + elapsed) / interval)
+            if (
+                index < 0
+                or index >= len(active)
+                or not math.isclose(value, active[index], rel_tol=1e-9, abs_tol=1e-9)
+            ):
+                return False
+            boundary = now + timedelta(
+                seconds=(index - slot + 1) * interval - seconds_into_slot
+            )
+            if boundary <= cursor:
+                return False
+            cursor = min(end, boundary)
+    return True

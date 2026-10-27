@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import homeassistant.util.dt as dt_util
 from homeassistant.components.sensor import SensorEntity
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.restore_state import RestoreEntity
@@ -137,6 +137,7 @@ class PumpSteerSensor(RestoreEntity):
         self._pilot_price_available = False
         self._pilot_forecast_available = False
         self._pilot_price_forecast = False
+        self._pilot_price_context = None
         self._pilot_plan = {"planning_status": "unavailable", "reason": "not_evaluated"}
         self._pilot_plan_next = None
         self._pilot_plan_signature = None
@@ -144,6 +145,11 @@ class PumpSteerSensor(RestoreEntity):
         self._pilot_house_candidate_at = None
         self._pilot_house_candidate_owner = None
         self._pilot_weather_raw = None
+        self._pilot_hot_water_checked_at = None
+        self._power_ledger = None
+        self._power_unsubscribe = None
+        self._power_signature = None
+        self._power_last_report = None
         self._pilot_store = None
         self._pilot_saved = None
         self._pilot_restore = None
@@ -242,6 +248,7 @@ class PumpSteerSensor(RestoreEntity):
             "thermal_intelligence_planning_status",
             "thermal_intelligence_plan_detail",
             "thermal_intelligence_forecast_quality",
+            "thermal_intelligence_electrical",
             "thermal_intelligence_heat_source",
             "thermal_intelligence_response",
         ):
@@ -263,6 +270,8 @@ class PumpSteerSensor(RestoreEntity):
                 "heat_signal_not_configured",
                 "heat_signal_unavailable",
                 "temperature_report_unavailable",
+                "hot_water_active",
+                "hot_water_mode_unavailable",
             }:
                 reason = self._pilot_status
             elif not self._pilot_price_forecast:
@@ -289,6 +298,8 @@ class PumpSteerSensor(RestoreEntity):
             )
             attrs["thermal_intelligence_planning_status"] = plan["planning_status"]
             attrs["thermal_intelligence_plan_detail"] = plan
+            if self._power_ledger is not None:
+                attrs["thermal_intelligence_electrical"] = self._power_ledger.summary()
             if (
                 self._pilot is not None
                 and self._pilot.audit.records
@@ -394,6 +405,7 @@ class PumpSteerSensor(RestoreEntity):
         self._temperature_reported_after = dt_util.now()
         self._temperature_unloaded = False
         await super().async_added_to_hass()
+        self._setup_power_telemetry()
         if self._cfg().get("thermal_intelligence_enabled") is True:
             await self._load_pilot_store()
 
@@ -468,6 +480,7 @@ class PumpSteerSensor(RestoreEntity):
     async def async_will_remove_from_hass(self) -> None:
         """Cancel options update listener on unload."""
         self._temperature_unloaded = True
+        self._stop_power_telemetry()
         if self._remove_start_listener is not None:
             self._remove_start_listener()
             self._remove_start_listener = None
@@ -481,6 +494,7 @@ class PumpSteerSensor(RestoreEntity):
     ) -> None:
         """Handle updated options."""
         self._config_entry = entry
+        self._setup_power_telemetry()
         self._pilot = None
         self._pilot_sources = None
         self._pilot_price_available = False
@@ -1204,6 +1218,7 @@ class PumpSteerSensor(RestoreEntity):
     async def _do_update(self) -> None:
         """Run the main control state machine."""
         now = dt_util.now()
+        self._consume_power_report(now)
         # Advance the clock on every control cycle, including branches that
         # pause the preheat ramp. Never count a backwards clock interval twice.
         preheat_dt_seconds = 60.0
@@ -1262,6 +1277,11 @@ class PumpSteerSensor(RestoreEntity):
         prices, categories, interval_minutes, current_slot = await self._get_prices(
             cfg,
             now,
+        )
+        self._pilot_price_context = (
+            (tuple(categories), tuple(prices), interval_minutes, current_slot)
+            if cfg.get("thermal_intelligence_enabled") is True and categories
+            else None
         )
 
         expected = {"indoor_temp_entity": indoor, "real_outdoor_entity": outdoor}
@@ -2209,6 +2229,7 @@ class PumpSteerSensor(RestoreEntity):
                                 "thermal_heat_activity_entity",
                                 "thermal_supply_temp_entity",
                                 "thermal_heating_mode_entity",
+                                "thermal_hot_water_mode_entity",
                                 "ohmigo_entity",
                                 "ohmigo_relay_entity",
                             )
@@ -2291,6 +2312,145 @@ class PumpSteerSensor(RestoreEntity):
         elif self._pilot is not None:
             self._pilot = None
             self._pilot_sources = None
+
+    def _stop_power_telemetry(self):
+        if self._power_unsubscribe is not None:
+            self._power_unsubscribe()
+            self._power_unsubscribe = None
+        if self._power_ledger is not None:
+            self._power_ledger.reset_anchor()
+        self._power_signature = None
+        self._power_last_report = None
+
+    def _record_power_snapshot(self, when):
+        """Read existing HA in-memory states; preserve their actual report times."""
+        cfg = self._cfg()
+        today, tomorrow = (
+            cfg.get("electricity_price_entity"),
+            cfg.get("price_tomorrow_entity"),
+        )
+        power = self.hass.states.get(cfg.get("thermal_power_entity"))
+        try:
+            self._power_ledger.observe(
+                when,
+                power,
+                self.hass.states.get(cfg.get("thermal_heating_mode_entity"))
+                if cfg.get("thermal_heating_mode_entity")
+                else None,
+                self.hass.states.get(cfg.get("thermal_hot_water_mode_entity"))
+                if cfg.get("thermal_hot_water_mode_entity")
+                else None,
+                (
+                    self.hass.states.get(today) if today else None,
+                    self.hass.states.get(tomorrow)
+                    if tomorrow and tomorrow != today
+                    else None,
+                ),
+                heating_configured=bool(cfg.get("thermal_heating_mode_entity")),
+                hot_water_configured=bool(cfg.get("thermal_hot_water_mode_entity")),
+            )
+            from .pilot_forecast import _timestamp
+
+            reported = _timestamp(getattr(power, "last_reported", None))
+            instant = _timestamp(when)
+            if (
+                reported is not None
+                and instant is not None
+                and reported <= instant
+                and (
+                    self._power_last_report is None
+                    or reported > self._power_last_report
+                )
+            ):
+                self._power_last_report = reported
+        except Exception:
+            self._power_ledger.reset_anchor()
+            _LOGGER.exception(
+                "Passive power telemetry failed; standard control continues"
+            )
+
+    def _consume_power_report(self, now):
+        """Catch new HA reports during the existing control cycle, without polling APIs."""
+        if (
+            self._power_ledger is None
+            or self._temperature_unloaded
+            or self._cfg().get("thermal_intelligence_enabled") is not True
+        ):
+            return
+        from .pilot_forecast import _timestamp
+
+        state = self.hass.states.get(self._cfg().get("thermal_power_entity"))
+        report = _timestamp(getattr(state, "last_reported", None))
+        clock = _timestamp(now)
+        if (
+            report is None
+            or clock is None
+            or report > clock
+            or (
+                self._power_last_report is not None
+                and report <= self._power_last_report
+            )
+        ):
+            return
+        anchor = self._power_ledger.anchor
+        if anchor is None or report > anchor["time"]:
+            self._record_power_snapshot(report)
+
+    def _setup_power_telemetry(self):
+        """Subscribe only to selected states; the normal cycle catches unchanged reports."""
+        cfg = self._cfg()
+        power_id = cfg.get("thermal_power_entity")
+        keys = (
+            "thermal_power_entity",
+            "thermal_heating_mode_entity",
+            "thermal_hot_water_mode_entity",
+            "electricity_price_entity",
+            "price_tomorrow_entity",
+        )
+        signature = tuple(cfg.get(key) for key in keys)
+        if (
+            cfg.get("thermal_intelligence_enabled") is True
+            and self._power_signature == signature
+            and self._power_unsubscribe is not None
+        ):
+            return
+        self._stop_power_telemetry()
+        self._power_ledger = None
+        if (
+            cfg.get("thermal_intelligence_enabled") is not True
+            or not isinstance(power_id, str)
+            or not power_id.startswith("sensor.")
+        ):
+            return
+        from homeassistant.helpers.event import async_track_state_change_event
+        from .pilot_power_ledger import PowerLedger
+
+        self._power_signature = signature
+        self._power_ledger = PowerLedger(started_after=dt_util.now())
+        entity_ids = list(dict.fromkeys(value for value in signature if value))
+
+        @callback
+        def changed(event):
+            if (
+                self._temperature_unloaded
+                or self._power_ledger is None
+                or self._cfg().get("thermal_intelligence_enabled") is not True
+            ):
+                return
+            entity_id = event.data.get("entity_id")
+            if entity_id == power_id:
+                previous_report = self._power_last_report
+                self._consume_power_report(event.time_fired)
+                if self._power_last_report == previous_report:
+                    self._power_ledger.reset_anchor(gap=True)
+            elif entity_id in entity_ids:
+                # Do not infer the power or its mode at a non-power event. A
+                # later fresh power report starts a new qualified interval.
+                self._power_ledger.reset_anchor(gap=True)
+
+        self._power_unsubscribe = async_track_state_change_event(
+            self.hass, entity_ids, changed
+        )
 
     async def _load_pilot_store(self):
         """Restore only historical model evidence, never a fresh measurement."""
@@ -2537,6 +2697,40 @@ class PumpSteerSensor(RestoreEntity):
                         "heat_min": min(row[2] for row in observed),
                         "heat_max": max(row[2] for row in observed),
                     }
+        pi_reference = None
+        if (
+            self._attributes.get("mode") == MODE_PI
+            and self._last_pi_result is not None
+            and self._brake_ramp == 0
+            and self._preheat_ramp == 0
+            and (aggression == 0 or self._pilot_price_context is not None)
+        ):
+            import copy
+
+            pi_reference = {
+                "controller": copy.deepcopy(self._pi),
+                "kp": safe_float(cfg.get("pid_kp", PID_KP)),
+                "ki": safe_float(cfg.get("pid_ki", PID_KI)),
+                "kd": safe_float(cfg.get("pid_kd", PID_KD)),
+                "integral_clamp": safe_float(
+                    cfg.get("pid_integral_clamp", PID_INTEGRAL_CLAMP)
+                ),
+                "summer_threshold": self._helper_value_with_fallback(
+                    helper_key="summer_threshold",
+                    cfg=cfg,
+                    default=float(DEFAULT_SUMMER_THRESHOLD),
+                ),
+                "calendar_tz": now.tzinfo,
+            }
+            if aggression != 0:
+                categories, active_prices, interval, slot = self._pilot_price_context
+                pi_reference.update(
+                    categories=categories,
+                    active_prices=active_prices,
+                    interval_minutes=interval,
+                    current_slot=slot,
+                    price_lookahead_minutes=PRICE_LOOKAHEAD_HOURS * 60,
+                )
         task = partial(
             hypothetical_plan,
             now=now,
@@ -2554,6 +2748,7 @@ class PumpSteerSensor(RestoreEntity):
             entity_max=MAX_FAKE_TEMP,
             response_context=response_context,
             response_scope=response_scope,
+            pi_reference=pi_reference,
         )
         import asyncio
         from .ohmigo import _switch_entity_id
@@ -2569,6 +2764,7 @@ class PumpSteerSensor(RestoreEntity):
                 "thermal_heat_activity_entity",
                 "thermal_supply_temp_entity",
                 "thermal_heating_mode_entity",
+                "thermal_hot_water_mode_entity",
                 "ohmigo_entity",
                 "ohmigo_relay_entity",
             )
@@ -2578,6 +2774,7 @@ class PumpSteerSensor(RestoreEntity):
                 _switch_entity_id(self.hass, self._config_entry.entry_id),
                 self._number_entity_id("target_temperature"),
                 self._number_entity_id("aggressiveness"),
+                self._number_entity_id("summer_threshold"),
             )
         )
 
@@ -2739,6 +2936,7 @@ class PumpSteerSensor(RestoreEntity):
         source = cfg.get("thermal_heat_activity_entity")
         supply = cfg.get("thermal_supply_temp_entity")
         radiator_mode = cfg.get("thermal_heating_mode_entity")
+        hot_water_mode = cfg.get("thermal_hot_water_mode_entity")
         threshold = safe_float(cfg.get("thermal_supply_threshold", 30))
         use_supply = (
             not source
@@ -2757,6 +2955,8 @@ class PumpSteerSensor(RestoreEntity):
         )
         if use_supply:
             signature += (radiator_mode, threshold)
+        if hot_water_mode:
+            signature += ("hot_water_mode", hot_water_mode)
         signature += (
             cfg.get("ohmigo_entity"),
             cfg.get("ohmigo_relay_entity"),
@@ -2766,6 +2966,7 @@ class PumpSteerSensor(RestoreEntity):
             self._pilot = None
             self._pilot_detector = None
             self._pilot_sources = signature
+            self._pilot_hot_water_checked_at = None
         self._pilot_heat_source = (
             "supply_temperature_indicator"
             if use_supply
@@ -2780,7 +2981,51 @@ class PumpSteerSensor(RestoreEntity):
             return
         try:
             heat_state = self.hass.states.get(source)
-            if use_supply:
+            hot_water_status = None
+            if hot_water_mode:
+                from .pilot_forecast import _timestamp
+                from .pilot_passive import PilotPassive
+
+                state = self.hass.states.get(hot_water_mode)
+                report = PilotPassive._report(
+                    state, now, reported_after=self._temperature_reported_after
+                )
+                changed = _timestamp(getattr(state, "last_changed", None))
+                if report is None or changed is None or changed > _timestamp(report[0]):
+                    hot_water_status = "hot_water_mode_unavailable"
+                    self._pilot_hot_water_checked_at = None
+                elif report[1] != 0.0:
+                    hot_water_status = "hot_water_active"
+                if hot_water_status is None:
+                    previous = self._pilot_hot_water_checked_at
+                    if previous is not None and (
+                        changed > previous or _timestamp(now) < previous
+                    ):
+                        if self._pilot is not None:
+                            self._pilot.reset_interval()
+                        self._pilot_detector = None
+                        if (
+                            self._pilot_plan.get("planning_status")
+                            == "validated_passive"
+                        ):
+                            self._pilot_plan = {
+                                "planning_status": "unavailable",
+                                "reason": "hot_water_mode_changed",
+                            }
+                    self._pilot_hot_water_checked_at = _timestamp(now)
+                else:
+                    self._pilot_hot_water_checked_at = None
+            if hot_water_status is not None:
+                # A conflicting or unknown water mode cannot establish
+                # radiator heat; reset the supply detector as well.
+                self._pilot_detector = None
+                heat_state = None
+                if self._pilot_plan.get("planning_status") == "validated_passive":
+                    self._pilot_plan = {
+                        "planning_status": "unavailable",
+                        "reason": hot_water_status,
+                    }
+            elif use_supply:
                 from types import SimpleNamespace
                 from .pilot_passive import SupplyHeatDetector
 
@@ -2867,7 +3112,7 @@ class PumpSteerSensor(RestoreEntity):
                 reported_after=self._temperature_reported_after,
                 defer_fit=True,
             )
-            self._pilot_status = self._pilot.status
+            self._pilot_status = hot_water_status or self._pilot.status
             return sample
         except Exception:
             _LOGGER.exception(

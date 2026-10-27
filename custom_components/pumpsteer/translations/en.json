@@ -45,7 +45,9 @@
           "thermal_heat_activity_entity": "Verified heat delivery to the home (optional)",
           "thermal_supply_temp_entity": "Radiator supply temperature (optional)",
           "thermal_heating_mode_entity": "Verified radiator heating mode (optional)",
-          "thermal_supply_threshold": "Supply temperature indicator threshold"
+          "thermal_supply_threshold": "Supply temperature indicator threshold",
+          "thermal_power_entity": "Heat-pump electrical power (optional)",
+          "thermal_hot_water_mode_entity": "Verified hot-water mode (optional)"
         },
         "data_description": {
           "pid_kp": "How strongly PumpSteer reacts to current temperature error. Typical range: 2.0 to 5.0.",
@@ -68,7 +70,9 @@
           "thermal_heat_activity_entity": "A binary sensor whose on means measured heat delivery to the home and off means none. Compressor status or hot-water mode alone is insufficient. Report times do not establish physical measurement time.",
           "thermal_supply_temp_entity": "Select a radiator-circuit sensor. Temperature is an indicator, not measured heat output.",
           "thermal_heating_mode_entity": "On must mean radiator heating; off or unknown suspends learning. Required for the supply indicator.",
-          "thermal_supply_threshold": "Set for your heating system. An unsuitable threshold can misclassify heat."
+          "thermal_supply_threshold": "Set for your heating system. An unsuitable threshold can misclassify heat.",
+          "thermal_power_entity": "Measured electrical input for the equipment being analysed. Energy is estimated from HA reports; it is not delivered heat.",
+          "thermal_hot_water_mode_entity": "On means verified hot-water operation. Heat learning pauses when on or unknown; unknown periods are not classified."
         }
       }
     },
