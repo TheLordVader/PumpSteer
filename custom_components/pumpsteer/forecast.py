@@ -132,6 +132,7 @@ async def _async_extract_weather_points(
     hass: HomeAssistant,
     weather_entity_id: str,
     horizon_hours: int,
+    raw_callback=None,
 ) -> dict[datetime, ForecastPoint]:
     """Read hourly weather forecast via weather.get_forecasts service call."""
 
@@ -165,6 +166,12 @@ async def _async_extract_weather_points(
             weather_entity_id,
         )
         return {}
+
+    if raw_callback is not None:
+        try:
+            raw_callback(forecast[:100])
+        except Exception:
+            _LOGGER.exception("Passive weather forecast capture failed")
 
     now_utc = dt_util.utcnow()
     current_hour = now_utc.replace(minute=0, second=0, microsecond=0)
@@ -276,6 +283,7 @@ async def async_build_forecast(
     price_entity_id: str,
     weather_entity_id: str,
     horizon_hours: int = 24,
+    raw_weather_callback=None,
 ) -> list[ForecastPoint]:
     """
     Build a normalized hourly forecast for PumpSteer utility and diagnostics.
@@ -289,7 +297,7 @@ async def async_build_forecast(
     - diagnostic forecast observability
     """
     weather_points = await _async_extract_weather_points(
-        hass, weather_entity_id, horizon_hours
+        hass, weather_entity_id, horizon_hours, raw_weather_callback
     )
     price_points = _extract_price_points(hass, price_entity_id, horizon_hours)
 
