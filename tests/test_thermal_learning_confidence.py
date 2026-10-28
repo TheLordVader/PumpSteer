@@ -182,6 +182,36 @@ def test_one_real_brake_session_is_counted_and_validated():
     assert model.prediction_mae == pytest.approx(0.0, abs=1e-6)
 
 
+def test_validation_does_not_use_future_outdoor_observations():
+    model = ThermalModel()
+    model.restore_k(0.05)
+    model.start_validation_session(_START, 21.0, 5.0)
+    for minute in range(1, 61):
+        assert model.update_validation_session(
+            _START + timedelta(minutes=minute), 21.0 - 0.01 * minute, -5.0
+        )
+    assert model.end_validation_session(_START + timedelta(minutes=60), 20.4)
+    # The forecast at the start cannot know the later outdoor observations.
+    assert model.last_session_predicted_drop == pytest.approx(0.8)
+    assert model.prediction_mae == pytest.approx(0.2)
+
+
+def test_old_noncausal_validation_is_not_restored_as_current_accuracy():
+    model = ThermalModel()
+    model.restore_k(0.05)
+    model.restore_diagnostics(
+        sample_count=50,
+        learning_sessions=4,
+        validated_sessions=3,
+        prediction_mae=0.1,
+        validation_basis=None,
+    )
+    assert model.sample_count == 50
+    assert model.learning_sessions == 4
+    assert model.validated_sessions == 0
+    assert model.prediction_mae is None
+
+
 def test_short_session_does_not_count_toward_confidence():
     model = ThermalModel()
     model.restore_k(0.05)

@@ -17,7 +17,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers.typing import StateType
 
-from .thermal_model import ThermalModel
+from .thermal_model import VALIDATION_BASIS, ThermalModel
 
 from .control import PIController
 from .control_ramps import (
@@ -520,6 +520,7 @@ class PumpSteerSensor(RestoreEntity):
                     "thermal_validated_sessions", 0
                 ),
                 prediction_mae=self._attributes.get("thermal_prediction_mae_c"),
+                validation_basis=self._attributes.get("thermal_validation_basis"),
             )
 
         # Wait until Home Assistant is fully started before the first real update.
@@ -991,6 +992,7 @@ class PumpSteerSensor(RestoreEntity):
             "thermal_learning_reason": self._thermal_learning_reason,
             "thermal_learning_sessions": self._thermal_model.learning_sessions,
             "thermal_validated_sessions": self._thermal_model.validated_sessions,
+            "thermal_validation_basis": VALIDATION_BASIS,
             "thermal_prediction_mae_c": (
                 round(self._thermal_model.prediction_mae, 3)
                 if self._thermal_model.prediction_mae is not None

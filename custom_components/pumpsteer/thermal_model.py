@@ -52,6 +52,7 @@ _MAX_RATE_C_PER_HOUR = 1.0
 
 # Validation sessions shorter than this are too sensitive to sensor noise.
 _MIN_VALIDATION_SESSION_MINUTES = 10.0
+VALIDATION_BASIS = "start_outdoor_v1"
 
 
 @dataclass
@@ -71,8 +72,7 @@ class _ValidationSession:
     start_indoor: float
     prediction_k: float
     prediction_valid: bool
-    outdoor_sum: float
-    outdoor_samples: int
+    start_outdoor: float
     last_time: datetime
     last_indoor: float
 
@@ -223,13 +223,19 @@ class ThermalModel:
         learning_sessions: int = 0,
         validated_sessions: int = 0,
         prediction_mae: Optional[float] = None,
+        validation_basis: Optional[str] = VALIDATION_BASIS,
     ) -> None:
         """Restore compact model-quality summaries without restoring raw samples."""
         self._sample_count = max(0, int(sample_count))
         self._fit_rmse = self._finite_or_none(fit_rmse)
         self._learning_sessions = max(0, int(learning_sessions))
-        self._validated_sessions = max(0, int(validated_sessions))
-        self._prediction_mae = self._finite_or_none(prediction_mae)
+        # Older summaries used future outdoor observations and are not forecasts.
+        if validation_basis == VALIDATION_BASIS:
+            self._validated_sessions = max(0, int(validated_sessions))
+            self._prediction_mae = self._finite_or_none(prediction_mae)
+        else:
+            self._validated_sessions = 0
+            self._prediction_mae = None
 
     @staticmethod
     def _finite_or_none(value: Optional[float]) -> Optional[float]:
@@ -407,8 +413,7 @@ class ThermalModel:
             start_indoor=indoor_temp,
             prediction_k=self._k,
             prediction_valid=self._valid,
-            outdoor_sum=outdoor_temp,
-            outdoor_samples=1,
+            start_outdoor=outdoor_temp,
             last_time=now,
             last_indoor=indoor_temp,
         )
@@ -430,8 +435,6 @@ class ThermalModel:
             return False
         session.last_time = now
         session.last_indoor = indoor_temp
-        session.outdoor_sum += outdoor_temp
-        session.outdoor_samples += 1
         return True
 
     def end_validation_session(self, now: datetime, indoor_temp: float) -> bool:
@@ -454,11 +457,13 @@ class ThermalModel:
             return False
 
         actual_drop = max(0.0, session.start_indoor - session.last_indoor)
-        avg_outdoor = session.outdoor_sum / max(session.outdoor_samples, 1)
+        # Use only the outdoor temperature known at session start. The horizon is
+        # selected afterwards, so this is conditional retrospective validation,
+        # not an issued operational forecast or a verified weather forecast.
         predicted_drop = self._predict_drop_with_k(
             session.prediction_k,
             session.start_indoor,
-            avg_outdoor,
+            session.start_outdoor,
             duration_minutes,
         )
 

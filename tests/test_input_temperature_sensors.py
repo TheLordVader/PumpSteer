@@ -66,6 +66,40 @@ def test_loss_is_per_input_and_recovers(temperatures, index, key, value):
     assert entities[index].native_value == 0.0
 
 
+@pytest.mark.parametrize("basis,expected", [(None, 0), ("start_outdoor_v1", 3)])
+def test_restore_only_causal_thermal_validation(
+    temperatures, monkeypatch, basis, expected
+):
+    controller, _, _, _, _ = temperatures
+    controller.hass.is_running = False
+    controller.hass.bus = SimpleNamespace(async_listen_once=lambda *args: lambda: None)
+    controller._config_entry.add_update_listener = lambda callback: lambda: None
+
+    async def last_state():
+        return SimpleNamespace(
+            state="-12",
+            attributes={
+                "thermal_k": 0.05,
+                "thermal_k_samples": 40,
+                "thermal_validated_sessions": 3,
+                "thermal_prediction_mae_c": 0.1,
+                "thermal_validation_basis": basis,
+            },
+        )
+
+    async def no_extra():
+        return None
+
+    monkeypatch.setattr(controller, "async_get_last_state", last_state)
+    monkeypatch.setattr(
+        controller, "async_get_last_extra_data", no_extra, raising=False
+    )
+    asyncio.run(controller.async_added_to_hass())
+    assert controller._thermal_model.sample_count == 40
+    assert controller._thermal_model.validated_sessions == expected
+    assert controller._thermal_model.prediction_mae == (0.1 if expected else None)
+
+
 def test_start_restore_reload_and_fresh_report(temperatures, monkeypatch):
     controller, states, clock, entities, _ = temperatures
     controller.hass.is_running = False
