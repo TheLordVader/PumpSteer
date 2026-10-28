@@ -15,6 +15,12 @@ from homeassistant.helpers.typing import StateType
 from .thermal_model import ThermalModel
 
 from .control import PIController
+from .control_ramps import (
+    BRAKE_RAMP_MAX_DT_SECONDS as _BRAKE_RAMP_MAX_DT_SECONDS,
+    PREHEAT_RAMP_MAX_DT_SECONDS as _PREHEAT_RAMP_MAX_DT_SECONDS,
+    brake_ramp_step,
+    preheat_ramp_step,
+)
 from .electricity_price import (
     PRICE_EXPENSIVE,
     PRICE_NORMAL,
@@ -85,17 +91,6 @@ _RESTORE_BRAKE_LAST_T = "brake_last_t"
 _RESTORE_BRAKE_LAST_EXPENSIVE_T = "brake_last_expensive_t"
 _RESTORE_WAS_BRAKING = "was_braking_last_cycle"
 
-# Maximum dt_seconds allowed in _update_brake_ramp.
-# Caps the step size so a long gap between mode transitions (e.g. normal →
-# braking at a slot boundary, or braking → normal when price is reclassified)
-# does not cause a large jump in brake_ramp in a single cycle.
-# 60 s = one polling cycle → max ±5% per step at ramp_in/out = 20 min.
-_BRAKE_RAMP_MAX_DT_SECONDS: float = 60.0
-
-# Allow ordinary scheduling gaps and 30–120 s polling, while preventing a
-# long outage from being counted as continuous preheating in one update.
-_PREHEAT_RAMP_MAX_DT_SECONDS: float = 300.0
-
 
 class PumpSteerSensor(RestoreEntity):
     """
@@ -141,10 +136,12 @@ class PumpSteerSensor(RestoreEntity):
         self._pilot_plan = {"planning_status": "unavailable", "reason": "not_evaluated"}
         self._pilot_plan_next = None
         self._pilot_plan_signature = None
+        self._pilot_replay_state_signature = None
         self._pilot_house_candidate = None
         self._pilot_house_candidate_at = None
         self._pilot_house_candidate_owner = None
         self._pilot_weather_raw = None
+        self._pilot_holiday_current = None
         self._pilot_hot_water_checked_at = None
         self._power_ledger = None
         self._power_unsubscribe = None
@@ -1093,29 +1090,19 @@ class PumpSteerSensor(RestoreEntity):
         HA restart — never causes a large jump in brake_ramp in a single step.
         This applies equally to ramp-in and ramp-out.
         """
-        if self._brake_last_t is None:
-            dt_seconds = _BRAKE_RAMP_MAX_DT_SECONDS
-        else:
-            dt_seconds = max((now - self._brake_last_t).total_seconds(), 1.0)
-            dt_seconds = min(dt_seconds, _BRAKE_RAMP_MAX_DT_SECONDS)
-
-        self._brake_last_t = now
-
-        if brake_requested:
-            self._brake_last_expensive_t = now
-            rate = 1.0 / (ramp_in * 60.0)
-            self._brake_ramp += dt_seconds * rate
-        else:
-            hold_active = (
-                self._brake_last_expensive_t is not None
-                and (now - self._brake_last_expensive_t).total_seconds()
-                < hold_minutes * 60.0
+        self._brake_ramp, self._brake_last_t, self._brake_last_expensive_t = (
+            brake_ramp_step(
+                self._brake_ramp,
+                self._brake_last_t,
+                self._brake_last_expensive_t,
+                brake_requested,
+                now,
+                ramp_in,
+                ramp_out,
+                hold_minutes,
+                max_dt_seconds=_BRAKE_RAMP_MAX_DT_SECONDS,
             )
-            if not hold_active:
-                rate = 1.0 / (ramp_out * 60.0)
-                self._brake_ramp -= dt_seconds * rate
-
-        self._brake_ramp = max(0.0, min(1.0, self._brake_ramp))
+        )
         return self._brake_ramp
 
     def _update_preheat_ramp(
@@ -1126,16 +1113,14 @@ class PumpSteerSensor(RestoreEntity):
         dt_seconds: float = 60.0,
     ) -> float:
         """Update preheat ramp factor for smooth preheat entry and exit."""
-        elapsed_minutes = max(0.0, min(dt_seconds, _PREHEAT_RAMP_MAX_DT_SECONDS)) / 60.0
-        step_up = elapsed_minutes / max(ramp_in, 1.0)
-        step_down = elapsed_minutes / max(ramp_out, 1.0)
-
-        if preheat_requested:
-            self._preheat_ramp += step_up
-        else:
-            self._preheat_ramp -= step_down
-
-        self._preheat_ramp = max(0.0, min(1.0, self._preheat_ramp))
+        self._preheat_ramp = preheat_ramp_step(
+            self._preheat_ramp,
+            preheat_requested,
+            ramp_in,
+            ramp_out,
+            dt_seconds,
+            max_dt_seconds=_PREHEAT_RAMP_MAX_DT_SECONDS,
+        )
         return self._preheat_ramp
 
     def _pi_output(
@@ -1271,6 +1256,9 @@ class PumpSteerSensor(RestoreEntity):
         holiday = await async_update_holiday(
             self.hass, self._config_entry.entry_id, self._config_entry
         )
+        self._pilot_holiday_current = (
+            bool(holiday) if cfg.get("thermal_intelligence_enabled") is True else None
+        )
         if holiday:
             target = HOLIDAY_TEMP
 
@@ -1349,6 +1337,55 @@ class PumpSteerSensor(RestoreEntity):
             await self._temperature_interrupted(cfg)
             return
 
+        await self._run_control_logic(
+            now=now,
+            cfg=cfg,
+            indoor=indoor,
+            outdoor=outdoor,
+            target=target,
+            summer_threshold=summer_threshold,
+            aggressiveness=aggressiveness,
+            holiday=holiday,
+            categories=categories,
+            current_slot=current_slot,
+            current_cat=current_cat,
+            upcoming=upcoming,
+            ramp_in=ramp_in,
+            ramp_out=ramp_out,
+            comfort_floor=comfort_floor,
+            comfort_floor_reached=comfort_floor_reached,
+            forecast_temps=forecast_temps,
+            interval_minutes=interval_minutes,
+            preheat_dt_seconds=preheat_dt_seconds,
+        )
+
+    def _control_event(self, event, **details):
+        log_event(event, **details)
+
+    async def _run_control_logic(
+        self,
+        *,
+        now,
+        cfg,
+        indoor,
+        outdoor,
+        target,
+        summer_threshold,
+        aggressiveness,
+        holiday,
+        categories,
+        current_slot,
+        current_cat,
+        upcoming,
+        ramp_in,
+        ramp_out,
+        comfort_floor,
+        comfort_floor_reached,
+        forecast_temps,
+        interval_minutes,
+        preheat_dt_seconds,
+    ):
+        """Run the existing mode decisions on the supplied control state."""
         # 1. Summer mode.
         if outdoor >= summer_threshold:
             self._update_thermal_learning(
@@ -1437,10 +1474,11 @@ class PumpSteerSensor(RestoreEntity):
                 outdoor=outdoor,
             )
             if self._prev_aggressiveness != 0:
-                _LOGGER.debug(
-                    "Aggressiveness changed to 0 (was %s): resetting PI integral once",
-                    self._prev_aggressiveness,
-                )
+                if not getattr(self, "_control_passive", False):
+                    _LOGGER.debug(
+                        "Aggressiveness changed to 0 (was %s): resetting PI integral once",
+                        self._prev_aggressiveness,
+                    )
                 self._pi.reset(now)
                 self._pi_precool_paused = False
                 self._last_pi_result = None
@@ -1475,12 +1513,13 @@ class PumpSteerSensor(RestoreEntity):
             brake_hold = float(cfg.get("brake_hold_minutes", BRAKE_HOLD_MINUTES))
 
             if comfort_floor_reached:
-                _LOGGER.info(
-                    "Comfort floor reached (%.1f < %.1f), releasing brake",
-                    indoor,
-                    comfort_floor,
-                )
-                log_event(
+                if not getattr(self, "_control_passive", False):
+                    _LOGGER.info(
+                        "Comfort floor reached (%.1f < %.1f), releasing brake",
+                        indoor,
+                        comfort_floor,
+                    )
+                self._control_event(
                     "COMFORT_FLOOR_RELEASE",
                     indoor=round(indoor, 1),
                     floor=round(comfort_floor, 1),
@@ -1765,14 +1804,14 @@ class PumpSteerSensor(RestoreEntity):
                 return
 
         if bridge_short_dip and not self._bridge_short_dip_active:
-            log_event(
+            self._control_event(
                 "BRIDGE_SHORT_DIP_START",
                 brake_factor=round(self._brake_ramp, 3),
                 minutes_until_expensive=round(minutes_until_expensive, 1),
                 bridge_limit_minutes=round(brake_hold, 1),
             )
         elif not bridge_short_dip and self._bridge_short_dip_active:
-            log_event(
+            self._control_event(
                 "BRIDGE_SHORT_DIP_END",
                 brake_factor=round(self._brake_ramp, 3),
             )
@@ -2146,6 +2185,17 @@ class PumpSteerSensor(RestoreEntity):
 
         return None
 
+    def _close_short_dip(self, mode):
+        # Close an active bridge when another control branch takes over before
+        # the normal-control bridge block is reached.
+        if self._bridge_short_dip_active and mode != MODE_BRAKE_HOLD:
+            self._control_event(
+                "BRIDGE_SHORT_DIP_END",
+                brake_factor=round(self._brake_ramp, 3),
+                new_mode=mode,
+            )
+            self._bridge_short_dip_active = False
+
     async def _set_state(
         self,
         fake_temp: float,
@@ -2153,15 +2203,7 @@ class PumpSteerSensor(RestoreEntity):
         extra: Dict[str, Any],
         now: datetime,
     ) -> None:
-        # Close an active bridge when another control branch takes over before
-        # the normal-control bridge block is reached.
-        if self._bridge_short_dip_active and mode != MODE_BRAKE_HOLD:
-            log_event(
-                "BRIDGE_SHORT_DIP_END",
-                brake_factor=round(self._brake_ramp, 3),
-                new_mode=mode,
-            )
-            self._bridge_short_dip_active = False
+        self._close_short_dip(mode)
 
         if self._safe_mode_warned and mode != MODE_SAFE:
             _LOGGER.info(
@@ -2610,6 +2652,108 @@ class PumpSteerSensor(RestoreEntity):
         """Capture only the forecast already fetched for the normal outlook."""
         self._pilot_weather_raw = rows
 
+    def _capture_replay_context(self, cfg, now, aggression):
+        """Freeze existing HA inputs for an isolated passive control replay."""
+        import copy
+        from homeassistant.helpers import entity_registry as er
+        from .control_replay import ControlReplayState
+        from .holiday import _get_entity_ids, _get_datetime
+        from .pilot_passive import PilotPassive
+
+        price_context = self._pilot_price_context
+        if not price_context:
+            return None, ()
+        categories, active_prices, interval, slot = price_context
+        known = True
+        holiday_ids = ()
+        preheat_id = None
+        start = end = None
+        boolean_on = False
+        try:
+            holiday_ids = _get_entity_ids(self.hass, self._config_entry.entry_id)
+            boolean_id, start_id, end_id = holiday_ids
+            for entity_id in holiday_ids:
+                if entity_id:
+                    state = self.hass.states.get(entity_id)
+                    if (
+                        state is None
+                        or getattr(state, "state", None)
+                        in (None, "unknown", "unavailable", "")
+                        or (getattr(state, "attributes", {}) or {}).get("restored")
+                    ):
+                        known = False
+            if boolean_id:
+                boolean = self.hass.states.get(boolean_id)
+                boolean_on = getattr(boolean, "state", None) == "on"
+                if getattr(boolean, "state", None) not in ("on", "off"):
+                    known = False
+            start = _get_datetime(self.hass, start_id)
+            end = _get_datetime(self.hass, end_id)
+            dates_valid = start is not None and end is not None and end > start
+            expected_holiday = start <= now < end if dates_valid else boolean_on
+            known = known and expected_holiday == self._pilot_holiday_current
+            registry = er.async_get(self.hass)
+            preheat_id = registry.async_get_entity_id(
+                "switch", DOMAIN, f"{self._config_entry.entry_id}_preheat_enabled"
+            )
+            if preheat_id:
+                state = self.hass.states.get(preheat_id)
+                if getattr(state, "state", None) not in ("on", "off") or (
+                    getattr(state, "attributes", {}) or {}
+                ).get("restored"):
+                    known = False
+        except (AttributeError, TypeError, ValueError, KeyError):
+            known = False
+
+        qualified = True
+        for key in ("indoor_temp_entity", "real_outdoor_entity"):
+            source = self.hass.states.get(cfg.get(key))
+            report = PilotPassive._report(
+                source,
+                now,
+                temperature=True,
+                reported_after=self._temperature_reported_after,
+            )
+            changed = getattr(source, "last_changed", None)
+            try:
+                if (
+                    report is None
+                    or changed is None
+                    or changed.tzinfo is None
+                    or changed > report[0]
+                ):
+                    qualified = False
+            except (TypeError, AttributeError):
+                qualified = False
+
+        return {
+            "state": ControlReplayState.from_sensor(self),
+            "cfg": copy.deepcopy(cfg),
+            "categories": categories,
+            "active_prices": active_prices,
+            "interval_minutes": interval,
+            "current_slot": slot,
+            "summer_threshold": self._helper_value_with_fallback(
+                helper_key="summer_threshold",
+                cfg=cfg,
+                default=float(DEFAULT_SUMMER_THRESHOLD),
+            ),
+            "configured_target": self._helper_value_with_fallback(
+                helper_key="target_temperature",
+                cfg=cfg,
+                default=float(DEFAULT_TARGET_TEMP),
+            ),
+            "aggressiveness": aggression,
+            "house_inertia": self._house_inertia(cfg),
+            "preheat_enabled": self._preheat_enabled(cfg),
+            "calendar_tz": now.tzinfo,
+            "holiday_context_known": known,
+            "holiday_start": start,
+            "holiday_end": end,
+            "holiday_boolean_on": boolean_on,
+            "inputs_qualified": qualified,
+        }, tuple(holiday_ids or ()) + (preheat_id,)
+
     async def _plan_pilot(self, cfg, now, extra, command):
         """Run a bounded diagnostic only; it never changes the control output."""
         price_id = cfg.get("electricity_price_entity")
@@ -2647,6 +2791,78 @@ class PumpSteerSensor(RestoreEntity):
             return
         target = extra.get("target_temperature")
         aggression = extra.get("aggressiveness")
+        replay_context, replay_entities = self._capture_replay_context(
+            cfg, now, aggression
+        )
+
+        def replay_signature():
+            if replay_context is None:
+                return None
+            inside = self.hass.states.get(cfg.get("indoor_temp_entity"))
+            outside = self.hass.states.get(cfg.get("real_outdoor_entity"))
+            inside_attrs = getattr(inside, "attributes", {}) or {}
+            outside_attrs = getattr(outside, "attributes", {}) or {}
+            components = inside_attrs.get("source_temperatures_used")
+            components = (
+                tuple(sorted(components))
+                if isinstance(components, dict)
+                and all(isinstance(key, str) for key in components)
+                else None
+            )
+            entities = []
+            for entity_id in replay_entities:
+                entity = self.hass.states.get(entity_id) if entity_id else None
+                entities.append(
+                    (
+                        getattr(entity, "state", None),
+                        getattr(entity, "last_changed", None),
+                        (getattr(entity, "attributes", {}) or {}).get("restored"),
+                    )
+                )
+            return (
+                replay_context["summer_threshold"],
+                replay_context["configured_target"],
+                replay_context["house_inertia"],
+                replay_context["preheat_enabled"],
+                replay_context["holiday_context_known"],
+                replay_context["holiday_start"],
+                replay_context["holiday_end"],
+                replay_context["holiday_boolean_on"],
+                self._pilot_holiday_current,
+                replay_context["inputs_qualified"],
+                components,
+                outside_attrs.get("selected_source"),
+                tuple(entities),
+            )
+
+        def pi_result_signature(result):
+            return (
+                (result.offset, result.p_term, result.i_term, result.error)
+                if result is not None
+                else None
+            )
+
+        replay_state = replay_context["state"] if replay_context is not None else None
+        replay_state_signature = (
+            (
+                replay_state.pi._integral,
+                replay_state.pi._last_time,
+                replay_state.pi._last_error,
+                replay_state.pi_precool_paused,
+                pi_result_signature(replay_state.last_pi_result),
+                replay_state.brake_ramp,
+                replay_state.preheat_ramp,
+                replay_state.brake_last_t,
+                replay_state.brake_last_expensive_t,
+                replay_state.preheat_last_t,
+                replay_state.was_braking_last_cycle,
+                replay_state.prev_aggressiveness,
+                replay_state.bridge_short_dip_active,
+                replay_state.thermal_pending_samples,
+            )
+            if replay_state is not None
+            else None
+        )
         signature = (
             repr(getattr(price_state, "attributes", None)),
             repr(getattr(tomorrow_state, "attributes", None)),
@@ -2658,6 +2874,7 @@ class PumpSteerSensor(RestoreEntity):
             target,
             aggression,
             cfg.get("pid_output_clamp", PID_OUTPUT_CLAMP),
+            replay_signature(),
         )
         if self._pilot_plan_next is not None and now < self._pilot_plan_next:
             if signature != self._pilot_plan_signature:
@@ -2665,9 +2882,43 @@ class PumpSteerSensor(RestoreEntity):
                     "planning_status": "unavailable",
                     "reason": "context_changed_waiting_for_replan",
                 }
+            elif (
+                replay_state_signature != self._pilot_replay_state_signature
+                and self._pilot_plan.get("comparison", {}).get("baseline")
+                in {"shared_control_passive", "conditional_pi_only"}
+            ):
+                # A cached reference was issued for another PI/ramp state. Do
+                # not rerun the optimizer on every control cycle or expose the
+                # stale modeled path as a current comparison.
+                prior_reference = self._pilot_plan["comparison"]
+                historical = (
+                    {
+                        **prior_reference,
+                        "status": "historical",
+                        "forecast_start": self._pilot_plan["forecast_start"],
+                        "issued_at": self._pilot_plan.get("issued_at"),
+                    }
+                    if self._pilot_plan.get("forecast_start")
+                    else None
+                )
+                comparison = {
+                    "baseline": "unavailable",
+                    "baseline_reason": "control_state_changed_waiting_for_replan",
+                    "shared_control_status": "unavailable",
+                    "savings": "unverified",
+                    "recovery": "unknown",
+                    "heat_storage": "unknown",
+                }
+                if historical is not None:
+                    comparison["historical_reference"] = historical
+                self._pilot_plan = {
+                    **self._pilot_plan,
+                    "comparison": comparison,
+                }
             return
         self._pilot_plan_next = now + timedelta(minutes=30)
         self._pilot_plan_signature = signature
+        self._pilot_replay_state_signature = replay_state_signature
         if (
             not isinstance(target, (int, float))
             or aggression not in COMFORT_FLOOR_BY_AGGRESSIVENESS
@@ -2749,6 +3000,7 @@ class PumpSteerSensor(RestoreEntity):
             response_context=response_context,
             response_scope=response_scope,
             pi_reference=pi_reference,
+            replay_context=replay_context,
         )
         import asyncio
         from .ohmigo import _switch_entity_id
@@ -2775,8 +3027,10 @@ class PumpSteerSensor(RestoreEntity):
                 self._number_entity_id("target_temperature"),
                 self._number_entity_id("aggressiveness"),
                 self._number_entity_id("summer_threshold"),
+                self._number_entity_id("house_inertia"),
             )
         )
+        state_ids.extend(replay_entities)
 
         def state_snapshot():
             values = []
@@ -2792,7 +3046,26 @@ class PumpSteerSensor(RestoreEntity):
                 )
             return tuple(values)
 
+        def control_snapshot():
+            return (
+                self._pi._integral,
+                self._pi._last_time,
+                self._pi._last_error,
+                self._pi_precool_paused,
+                pi_result_signature(self._last_pi_result),
+                self._brake_ramp,
+                self._preheat_ramp,
+                self._brake_last_t,
+                self._brake_last_expensive_t,
+                self._preheat_last_t,
+                self._was_braking_last_cycle,
+                self._prev_aggressiveness,
+                self._bridge_short_dip_active,
+                self._thermal_model.pending_samples,
+            )
+
         snapshot = state_snapshot()
+        control_before = control_snapshot()
         config_snapshot = dict(cfg)
 
         cached_house = (
@@ -2826,6 +3099,7 @@ class PumpSteerSensor(RestoreEntity):
             or self._pilot_sources != pilot_sources
             or self._cfg() != config_snapshot
             or state_snapshot() != snapshot
+            or control_snapshot() != control_before
             or not self._temperature_inputs_match(cfg, expected)
         ):
             self._pilot_plan = {

@@ -6,6 +6,7 @@ from .pilot_forecast import _timestamp, price_window
 from .pilot_vendor.mpc_controller import MpcController
 from .pilot_vendor.pump_response import ResponseParameters, virtual_request
 from .pilot_vendor.response_optimizer import VirtualActuator
+from .settings import PRECOOL_LOOKAHEAD, PRICE_LOOKAHEAD_HOURS
 
 
 def _weather_intervals(rows, now, horizon_hours=2):
@@ -66,6 +67,70 @@ def _quarters(segments, now, horizon_hours=2):
     return result
 
 
+def _shared_window_is_eligible(context, now, hours, price_states, weather_rows, target):
+    """Cheap qualification before choosing a shorter shared planning horizon."""
+    from .settings import HOLIDAY_TEMP
+
+    try:
+        if not context.get("inputs_qualified") or not context.get(
+            "holiday_context_known"
+        ):
+            return False
+        end = now + timedelta(hours=hours)
+        price_end = end + timedelta(hours=PRICE_LOOKAHEAD_HOURS)
+        zone = context["calendar_tz"]
+        local_start, local_end = now.astimezone(zone), price_end.astimezone(zone)
+        if (
+            local_start.date() != local_end.date()
+            or local_start.utcoffset() != local_end.utcoffset()
+        ):
+            return False
+        segments = price_window(
+            price_states, now, timedelta(hours=hours + PRICE_LOOKAHEAD_HOURS)
+        )
+        if segments is None or not _matching_pi_prices(
+            context, now, local_start, segments
+        ):
+            return False
+        interval = context["interval_minutes"]
+        if not isinstance(interval, int) or interval <= 0:
+            return False
+        into = (
+            (local_start.hour * 60 + local_start.minute) % interval
+        ) * 60 + local_start.second
+        last_slot = context["current_slot"] + math.floor(
+            (into + (price_end - now).total_seconds()) / (interval * 60)
+        )
+        if context["current_slot"] < 0 or last_slot >= len(context["categories"]):
+            return False
+        start, stop = (
+            _timestamp(context.get("holiday_start")),
+            _timestamp(context.get("holiday_end")),
+        )
+        valid = start is not None and stop is not None and stop > start
+        if valid and any(now < change <= end for change in (start, stop)):
+            return False
+        holiday = start <= now < stop if valid else bool(context["holiday_boolean_on"])
+        if not math.isclose(
+            target,
+            HOLIDAY_TEMP if holiday else context["configured_target"],
+            abs_tol=1e-9,
+        ):
+            return False
+        return (
+            _weather_intervals(weather_rows, now, hours + PRECOOL_LOOKAHEAD) is not None
+        )
+    except (
+        KeyError,
+        TypeError,
+        ValueError,
+        OverflowError,
+        AttributeError,
+        ZeroDivisionError,
+    ):
+        return False
+
+
 def hypothetical_plan(
     *,
     now,
@@ -85,6 +150,7 @@ def hypothetical_plan(
     house_context=None,
     response_scope=None,
     pi_reference=None,
+    replay_context=None,
 ):
     """No outputs or service calls; all parameters and costs are hypothetical."""
     unavailable = {"planning_status": "unavailable"}
@@ -118,9 +184,44 @@ def hypothetical_plan(
         return {**unavailable, "reason": "price_forecast_unavailable"}
     if weather_unit != "°C" or _weather_intervals(weather_rows, now) is None:
         return {**unavailable, "reason": "weather_forecast_unavailable"}
+    current_domain_invalid = (
+        house_context is not None
+        and not house_context["outdoor_min"] <= outdoor <= house_context["outdoor_max"]
+    ) or (
+        response_context is not None
+        and response_context[0].outdoor_gain
+        and not response_context[0].outdoor_min
+        <= outdoor
+        <= response_context[0].outdoor_max
+    )
+    if current_domain_invalid:
+        # A forecast inside the learned range cannot make an already observed
+        # out-of-range starting condition into a validated model state.
+        response_context = None
     # Bounded beam search: at most 48 quarter-hour steps per planning run.
     max_steps = 48
-    for horizon in range(max_steps // 4, 1, -1):
+    horizons = list(range(max_steps // 4, 1, -1))
+    if (
+        replay_context is not None
+        and not current_domain_invalid
+        and replay_context.get("inputs_qualified")
+        and replay_context.get("holiday_context_known")
+    ):
+        # Prefer the longest horizon for which both alternatives can be
+        # evaluated using the additional forecasts the real controller uses.
+        shared_horizon = next(
+            (
+                hours
+                for hours in horizons
+                if _shared_window_is_eligible(
+                    replay_context, now, hours, price_states, weather_rows, target
+                )
+            ),
+            None,
+        )
+        if shared_horizon is not None:
+            horizons = [shared_horizon]
+    for horizon in horizons:
         prices = price_window(price_states, now, timedelta(hours=horizon))
         weather = _weather_intervals(weather_rows, now, horizon)
         if prices is not None and weather is not None:
@@ -267,7 +368,114 @@ def hypothetical_plan(
             "resource_cap_reached": horizon * 4 == max_steps,
         },
     }
-    if pi_reference is not None:
+    reference = None
+    if replay_context is not None and not current_domain_invalid:
+        reference = _shared_control_reference(
+            context=replay_context,
+            now=now,
+            indoor=indoor,
+            actual_outdoor=outdoor,
+            command=command,
+            target=target,
+            floor=floor,
+            ceiling=ceiling,
+            outdoor_segments=weather,
+            price_segments=prices,
+            control_price_segments=price_window(
+                price_states, now, timedelta(hours=horizon + PRICE_LOOKAHEAD_HOURS)
+            ),
+            prices=price_values,
+            weather_rows=weather_rows,
+            pilot_virtuals=plan.planned_virtual_outdoor,
+            controller=controller,
+            parameters=parameters,
+            initial=initial,
+            offset=output_clamp,
+            house_scope=house_context if validated else None,
+            response_scope=response_scope if validated else None,
+        )
+        if reference is None:
+            longer_horizon = next(
+                (
+                    hours
+                    for hours in range(max_steps // 4, horizon, -1)
+                    if price_window(price_states, now, timedelta(hours=hours))
+                    is not None
+                    and _weather_intervals(weather_rows, now, hours) is not None
+                ),
+                None,
+            )
+            if longer_horizon is not None:
+                # Restore the original longer Pilot plan, at most once. The
+                # normal replay path has a single optimizer run; this bounded
+                # retry is used only when the shared simulation itself failed.
+                fallback_reference = pi_reference
+                if fallback_reference is not None and _known_fallback_conflict(
+                    replay_context,
+                    now,
+                    longer_horizon,
+                    weather_rows,
+                    fallback_reference.get("summer_threshold"),
+                ):
+                    fallback_reference = None
+                fallback = hypothetical_plan(
+                    now=now,
+                    indoor=indoor,
+                    outdoor=outdoor,
+                    command=command,
+                    target=target,
+                    floor=floor,
+                    ceiling=ceiling,
+                    price_states=price_states,
+                    weather_rows=weather_rows,
+                    weather_unit=weather_unit,
+                    output_clamp=output_clamp,
+                    entity_min=entity_min,
+                    entity_max=entity_max,
+                    response_context=response_context,
+                    house_context=house_context,
+                    response_scope=response_scope,
+                    pi_reference=fallback_reference,
+                )
+                if fallback.get("planning_status") != "unavailable":
+                    if "comparison" in fallback:
+                        fallback["comparison"]["shared_control_status"] = "unavailable"
+                        fallback["comparison"]["shared_control_reason"] = (
+                            "context_or_model_domain_unavailable"
+                        )
+                    return fallback
+                # Longer forecasts can leave the model's qualified domain.
+                # Preserve the already valid shorter plan in that case.
+            result["comparison"]["baseline_reason"] = (
+                "shared_control_context_or_coverage_unavailable"
+            )
+            result["comparison"]["shared_control_status"] = "unavailable"
+            result["comparison"]["shared_control_reason"] = (
+                "context_or_forecast_coverage_unavailable"
+            )
+        else:
+            result["comparison"].update(reference)
+            result["comparison"]["shared_control_status"] = "available"
+    elif replay_context is not None:
+        result["comparison"]["baseline_reason"] = (
+            "current_outdoor_outside_validated_domain"
+        )
+        result["comparison"]["shared_control_status"] = "unavailable"
+        result["comparison"]["shared_control_reason"] = (
+            "current_outdoor_outside_validated_domain"
+        )
+    if (
+        reference is None
+        and pi_reference is not None
+        and not current_domain_invalid
+        and not _known_fallback_conflict(
+            replay_context,
+            now,
+            horizon,
+            weather_rows,
+            pi_reference.get("summer_threshold"),
+        )
+    ):
         reference = _pure_pi_reference(
             pi_reference,
             now=now,
@@ -313,9 +521,15 @@ def hypothetical_plan(
             sum(abs(temp - target) * 0.25 for temp in plan.predicted_temperatures[1:]),
             3,
         )
-        if result["comparison"].get("baseline") == "conditional_pi_only":
+        if result["comparison"].get("baseline") in {
+            "conditional_pi_only",
+            "shared_control_passive",
+        }:
             result["comparison"]["baseline_below_floor_degree_hours"] = None
             result["comparison"]["baseline_above_ceiling_degree_hours"] = None
+        if result["comparison"].get("baseline") == "shared_control_passive":
+            result["comparison"]["pilot_below_floor_degree_hours"] = None
+            result["comparison"]["pilot_above_ceiling_degree_hours"] = None
     if validated:
         result["validation"] = {
             key: house_context[key]
@@ -395,6 +609,7 @@ def _pure_pi_reference(
             ):
                 return None
         pi = copy.deepcopy(context["controller"])
+        pi.emit_log = False
         heat, queue = initial
         value = indoor
         temperatures = [value]
@@ -496,3 +711,383 @@ def _matching_pi_prices(context, now, local_start, segments):
                 return False
             cursor = min(end, boundary)
     return True
+
+
+def _known_fallback_conflict(context, now, horizon, weather_rows, summer_threshold):
+    """Never use PI-only fallback when known future controls contradict it."""
+    from .settings import PRECOOL_LOOKAHEAD, PRECOOL_MARGIN
+
+    if (
+        isinstance(summer_threshold, bool)
+        or not isinstance(summer_threshold, (int, float))
+        or not math.isfinite(summer_threshold)
+    ):
+        return True
+    end = now + timedelta(hours=horizon)
+    if context is not None and context.get("holiday_context_known"):
+        start = _timestamp(context.get("holiday_start"))
+        stop = _timestamp(context.get("holiday_end"))
+        if start is not None and stop is not None and stop > start:
+            if any(now < change <= end for change in (start, stop)):
+                return True
+    for row in weather_rows or ():
+        if not isinstance(row, dict):
+            continue
+        at = _timestamp(row.get("datetime"))
+        try:
+            temp = float(row.get("temperature"))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if (
+            at is not None
+            and now.replace(minute=0, second=0, microsecond=0)
+            <= at
+            <= end + timedelta(hours=PRECOOL_LOOKAHEAD)
+            and math.isfinite(temp)
+            and temp >= summer_threshold + PRECOOL_MARGIN
+        ):
+            return True
+    return False
+
+
+def _shared_control_reference(
+    *,
+    context,
+    now,
+    indoor,
+    actual_outdoor,
+    command,
+    target,
+    floor,
+    ceiling,
+    outdoor_segments,
+    price_segments,
+    control_price_segments,
+    prices,
+    weather_rows,
+    pilot_virtuals,
+    controller,
+    parameters,
+    initial,
+    offset,
+    house_scope=None,
+    response_scope=None,
+):
+    """Replay the shared controller each minute and the Pilot model each quarter.
+
+    The room temperature is held between model steps; no measured or inferred
+    physical heat output is asserted. Both paths keep the already-issued
+    command for the first minute.
+    """
+    from .control_replay import ControlReplayInput, replay_control_step
+    from .forecast import ForecastPoint, analyze_thermal_outlook
+    from .settings import HOLIDAY_TEMP, PRECOOL_LOOKAHEAD, PRICE_LOOKAHEAD_HOURS
+
+    try:
+        if (
+            not context.get("holiday_context_known")
+            or not context.get("inputs_qualified")
+            or not prices
+            or len(prices) > 48
+        ):
+            return None
+        if len(pilot_virtuals) != len(prices):
+            return None
+        zone = context["calendar_tz"]
+        local_start = now.astimezone(zone)
+        end = now + timedelta(minutes=15 * len(prices))
+        price_end = end + timedelta(hours=PRICE_LOOKAHEAD_HOURS)
+        holiday_start, holiday_end = (
+            _timestamp(context.get("holiday_start")),
+            _timestamp(context.get("holiday_end")),
+        )
+        valid_holiday_dates = (
+            holiday_start is not None
+            and holiday_end is not None
+            and holiday_end > holiday_start
+        )
+        if valid_holiday_dates and any(
+            now < change <= end for change in (holiday_start, holiday_end)
+        ):
+            # The Pilot optimizer has one target, so a changing holiday target
+            # cannot be compared against the same comfort assumptions.
+            return None
+        current_holiday = (
+            holiday_start <= now < holiday_end
+            if valid_holiday_dates
+            else bool(context["holiday_boolean_on"])
+        )
+        expected_target = (
+            HOLIDAY_TEMP if current_holiday else context["configured_target"]
+        )
+        if not math.isclose(target, expected_target, abs_tol=1e-9):
+            return None
+        if (
+            local_start.date() != price_end.astimezone(zone).date()
+            or local_start.utcoffset() != price_end.astimezone(zone).utcoffset()
+            or not control_price_segments
+            or control_price_segments[0][0] != now
+            or control_price_segments[-1][1] != price_end
+            or any(
+                a[1] != b[0]
+                for a, b in zip(control_price_segments, control_price_segments[1:])
+            )
+            or not _matching_pi_prices(
+                context, now, local_start, control_price_segments
+            )
+        ):
+            return None
+        interval = context["interval_minutes"]
+        if not isinstance(interval, int) or interval <= 0:
+            return None
+        slot = context["current_slot"]
+        seconds_into = (
+            local_start.hour * 3600 + local_start.minute * 60 + local_start.second
+        ) % (interval * 60) + local_start.microsecond / 1_000_000
+        last_slot = slot + math.floor(
+            (seconds_into + (price_end - now).total_seconds()) / (interval * 60)
+        )
+        categories = context["categories"]
+        if slot < 0 or last_slot >= len(categories):
+            return None
+        # The live outlook and precooling examine up to 24 future hours.
+        weather = _weather_intervals(
+            weather_rows, now, len(prices) / 4 + PRECOOL_LOOKAHEAD
+        )
+        if weather is None:
+            return None
+        raw_points = {}
+        for row in weather_rows:
+            at = _timestamp(row.get("datetime"))
+            if at is None:
+                return None
+            hour = at.replace(minute=0, second=0, microsecond=0)
+
+            def number(key):
+                try:
+                    value = float(row.get(key))
+                    return value if math.isfinite(value) else None
+                except (TypeError, ValueError, OverflowError):
+                    return None
+
+            raw_points[hour] = ForecastPoint(
+                timestamp=hour,
+                price=None,
+                outdoor_temp=number("temperature"),
+                wind_speed=number("wind_speed"),
+                wind_gust_speed=number("wind_gust_speed"),
+                cloud_coverage=number("cloud_coverage"),
+                precipitation=number("precipitation"),
+                humidity=number("humidity"),
+            )
+        ordered = sorted(raw_points.items())
+        forecast_cache = {}
+
+        def forecast_at(tick):
+            hour = tick.replace(minute=0, second=0, microsecond=0)
+            if hour not in forecast_cache:
+                points = [
+                    point
+                    for at, point in ordered
+                    if hour <= at <= hour + timedelta(hours=PRECOOL_LOOKAHEAD)
+                ]
+                # Missing hourly observations alter both live precool and outlook.
+                if len(points) != PRECOOL_LOOKAHEAD + 1:
+                    return None
+                outlook = analyze_thermal_outlook(points, context["summer_threshold"])
+                forecast_cache[hour] = ([p.outdoor_temp for p in points], outlook)
+            return forecast_cache[hour]
+
+        def value_at(segments, at):
+            for start, stop, value in segments:
+                if start <= at < stop:
+                    return value
+            return None
+
+        def holiday_at(tick):
+            if not valid_holiday_dates:
+                return bool(context["holiday_boolean_on"])
+            return holiday_start <= tick < holiday_end
+
+        def simulate(pilot):
+            state = context["state"]
+            value = indoor
+            heat, queue = initial
+            temperatures = [value]
+            heats = []
+            requests = []
+            virtuals = []
+            modes = []
+            brake_active = []
+            for quarter, price in enumerate(prices):
+                requested = 0.0
+                average_outdoor = 0.0
+                for minute in range(15):
+                    elapsed = quarter * 15 + minute
+                    tick = now + timedelta(minutes=elapsed)
+                    ambient = (
+                        actual_outdoor
+                        if elapsed == 0
+                        else value_at(outdoor_segments, tick)
+                    )
+                    if ambient is None:
+                        return None
+                    average_outdoor += ambient / 15
+                    if elapsed == 0:
+                        fake = command
+                        mode = "initial_command"
+                    elif pilot:
+                        fake = pilot_virtuals[quarter]
+                        mode = "pilot_plan"
+                    else:
+                        forecast = forecast_at(tick)
+                        if forecast is None:
+                            return None
+                        current_slot = slot + math.floor(
+                            (seconds_into + elapsed * 60) / (interval * 60)
+                        )
+                        inputs = ControlReplayInput(
+                            now=tick.astimezone(zone),
+                            cfg=context["cfg"],
+                            indoor=value,
+                            outdoor=ambient,
+                            target=context["configured_target"],
+                            summer_threshold=context["summer_threshold"],
+                            aggressiveness=context["aggressiveness"],
+                            holiday=holiday_at(tick),
+                            categories=categories,
+                            current_slot=current_slot,
+                            interval_minutes=interval,
+                            house_inertia=context["house_inertia"],
+                            forecast_temps=forecast[0],
+                            outlook=forecast[1],
+                            preheat_enabled=context["preheat_enabled"],
+                        )
+                        state, decision = replay_control_step(state, inputs)
+                        if decision.fake_temp is None or decision.mode in {
+                            "safe_mode",
+                            "unavailable",
+                        }:
+                            return None
+                        fake, mode = decision.fake_temp, decision.mode
+                    request = virtual_request(ambient, fake, offset)
+                    if request is None or (
+                        response_scope is not None
+                        and not response_scope["request_min"]
+                        <= request
+                        <= response_scope["request_max"]
+                    ):
+                        return None
+                    requested += request / 15
+                    virtuals.append(fake)
+                    modes.append(mode)
+                    brake_active.append(
+                        not pilot
+                        and (
+                            state.brake_ramp > 0
+                            or mode in {"braking", "pre_braking", "brake_hold"}
+                        )
+                    )
+                if house_scope is not None and not (
+                    house_scope["outdoor_min"]
+                    <= average_outdoor
+                    <= house_scope["outdoor_max"]
+                ):
+                    return None
+                if getattr(parameters, "outdoor_gain", 0) and not (
+                    parameters.outdoor_min <= average_outdoor <= parameters.outdoor_max
+                ):
+                    return None
+                heat, queue = parameters.advance(
+                    requested, heat, queue, average_outdoor
+                )
+                value = controller._predict_temp(value, average_outdoor, heat)
+                if house_scope is not None and not (
+                    house_scope["indoor_min"] <= value <= house_scope["indoor_max"]
+                    and house_scope["heat_min"] <= heat <= house_scope["heat_max"]
+                ):
+                    return None
+                if (
+                    response_scope is not None
+                    and not response_scope["heat_min"]
+                    <= heat
+                    <= response_scope["heat_max"]
+                ):
+                    return None
+                temperatures.append(value)
+                heats.append(heat)
+                requests.append(requested)
+            return temperatures, heats, requests, virtuals, modes, brake_active
+
+        baseline, pilot = simulate(False), simulate(True)
+        if baseline is None or pilot is None:
+            return None
+        base_t, base_h, base_r, _, modes, braking = baseline
+        pilot_t, pilot_h, pilot_r, _, _, _ = pilot
+        transitions = [
+            (minute, mode)
+            for minute, mode in enumerate(modes)
+            if minute == 0 or mode != modes[minute - 1]
+        ]
+        if len(transitions) > 96:
+            return None  # Bound the existing sensor attribute rather than truncate evidence.
+        last_brake = max(
+            (i for i, active in enumerate(braking) if active), default=None
+        )
+        release = (
+            last_brake + 1
+            if last_brake is not None and last_brake < len(braking) - 1
+            else None
+        )
+        recovery = next(
+            (
+                i * 15 - release
+                for i, temp in enumerate(base_t)
+                if release is not None and i * 15 >= release and temp >= indoor
+            ),
+            None,
+        )
+        return {
+            "baseline": "shared_control_passive",
+            "control_step_seconds": 60,
+            "thermal_step_seconds": 900,
+            "heat_fraction_kind": "modelled_not_measured_power",
+            "baseline_temperatures": [round(v, 2) for v in base_t],
+            "baseline_heat_fraction": [round(v, 2) for v in base_h],
+            "pilot_temperatures": [round(v, 2) for v in pilot_t],
+            "pilot_heat_fraction": [round(v, 2) for v in pilot_h],
+            "baseline_request_fraction": [round(v, 2) for v in base_r],
+            "pilot_request_fraction": [round(v, 2) for v in pilot_r],
+            "request_kind": "virtual_command_derived_not_measured_heat",
+            "baseline_mode_changes": transitions,
+            "baseline_brake_release_minutes": release,
+            "baseline_recovery_to_initial_minutes": recovery,
+            "baseline_final_temperature": round(base_t[-1], 2),
+            "pilot_final_temperature": round(pilot_t[-1], 2),
+            "baseline_below_floor_degree_hours": round(
+                sum(max(0, floor - v) * 0.25 for v in base_t[1:]), 3
+            ),
+            "pilot_below_floor_degree_hours": round(
+                sum(max(0, floor - v) * 0.25 for v in pilot_t[1:]), 3
+            ),
+            "baseline_above_ceiling_degree_hours": round(
+                sum(max(0, v - ceiling) * 0.25 for v in base_t[1:]), 3
+            ),
+            "pilot_above_ceiling_degree_hours": round(
+                sum(max(0, v - ceiling) * 0.25 for v in pilot_t[1:]), 3
+            ),
+            "baseline_heat_price_proxy": round(
+                sum(p * h * 0.25 for p, h in zip(prices, base_h)), 4
+            ),
+            "pilot_heat_price_proxy": round(
+                sum(p * h * 0.25 for p, h in zip(prices, pilot_h)), 4
+            ),
+            "proxy_definition": "price_times_model_heat_fraction_not_currency",
+            "recovery": "unknown",
+            "heat_storage": "unknown",
+            "savings": "unverified",
+            "period_complete": "unverified",
+            "reference_assumptions": "quarter_hour_room_hold_frozen_forecasts_first_minute_current_command_no_physical_heat_confirmation",
+        }
+    except (KeyError, TypeError, ValueError, OverflowError, AttributeError):
+        return None

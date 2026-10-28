@@ -40,7 +40,8 @@ class PIController:
     brake_behavior='decay' slowly reduces it.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, emit_log: bool = True) -> None:
+        self.emit_log = emit_log
         self._integral: float = 0.0
         self._last_time: Optional[datetime] = None
         self._last_error: float = 0.0
@@ -50,7 +51,8 @@ class PIController:
         self._integral = 0.0
         self._last_time = now
         self._last_error = 0.0
-        _LOGGER.debug("PIController reset")
+        if self.emit_log:
+            _LOGGER.debug("PIController reset")
 
     def compute(
         self,
@@ -97,13 +99,14 @@ class PIController:
         raw_output = -(p_term + i_term + d_term + feedforward_bias)
         clamped = max(-output_clamp, min(output_clamp, raw_output))
 
-        _LOGGER.debug(
-            "PI: error=%.2f P=%.2f I=%.2f → offset=%.2f (dt=%.1f min, braking=%s)",
-            error,
-            p_term,
-            i_term,
-            clamped,
-            dt_minutes,
-            braking_active,
-        )
+        if self.emit_log:
+            _LOGGER.debug(
+                "PI: error=%.2f P=%.2f I=%.2f → offset=%.2f (dt=%.1f min, braking=%s)",
+                error,
+                p_term,
+                i_term,
+                clamped,
+                dt_minutes,
+                braking_active,
+            )
         return PIResult(offset=clamped, p_term=p_term, i_term=i_term, error=error)
