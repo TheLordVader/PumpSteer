@@ -158,6 +158,9 @@ class PumpSteerSensor(RestoreEntity):
         self._pilot_status = "heat_signal_not_configured"
         self._pilot_operating_mode = "unknown"
         self._pilot_operating_quality = "insufficient_evidence"
+        self._heat_operation = None
+        self._heat_operation_signature = None
+        self._heat_operation_detail = {}
         self._pilot_price_available = False
         self._pilot_forecast_available = False
         self._pilot_price_forecast = False
@@ -277,6 +280,7 @@ class PumpSteerSensor(RestoreEntity):
             "thermal_intelligence_response",
             "thermal_intelligence_operating_mode",
             "thermal_intelligence_operating_quality",
+            "thermal_intelligence_operation_detail",
         ):
             attrs.pop(key, None)
         if self._cfg().get("thermal_intelligence_enabled") is True:
@@ -290,6 +294,9 @@ class PumpSteerSensor(RestoreEntity):
                 "insufficient_evidence"
                 if interrupted
                 else self._pilot_operating_quality
+            )
+            attrs["thermal_intelligence_operation_detail"] = (
+                {} if interrupted else self._heat_operation_detail
             )
             attrs["thermal_intelligence_status"] = (
                 "suspended_safe"
@@ -550,6 +557,15 @@ class PumpSteerSensor(RestoreEntity):
     ) -> None:
         """Handle updated options."""
         self._config_entry = entry
+        if (
+            self._heat_operation is not None
+            and self._cfg().get("thermal_intelligence_enabled") is True
+        ):
+            try:
+                await self._save_pilot_store()
+                await self._flush_pilot_store()
+            except Exception:
+                _LOGGER.exception("Passive heat history cleanup failed")
         if self._cfg().get("thermal_intelligence_enabled") is not True:
             try:
                 self._plan_audit.cancel_plans("disabled")
@@ -559,6 +575,10 @@ class PumpSteerSensor(RestoreEntity):
             except Exception:
                 _LOGGER.exception("Passive plan audit cleanup failed")
         self._setup_power_telemetry()
+        self._heat_operation = None
+        self._heat_operation_signature = None
+        self._heat_operation_detail = {}
+        self._pilot_saved = None
         self._pilot = None
         self._pilot_sources = None
         self._pilot_price_available = False
@@ -2372,6 +2392,9 @@ class PumpSteerSensor(RestoreEntity):
                                 "thermal_supply_temp_entity",
                                 "thermal_heating_mode_entity",
                                 "thermal_hot_water_mode_entity",
+                                "thermal_compressor_entity",
+                                "thermal_return_temp_entity",
+                                "thermal_power_entity",
                                 "ohmigo_entity",
                                 "ohmigo_relay_entity",
                             )
@@ -2481,6 +2504,7 @@ class PumpSteerSensor(RestoreEntity):
             state="off" if state.state == "on" else "on",
             last_reported=getattr(state, "last_reported", None),
             last_changed=getattr(state, "last_changed", None),
+            last_updated=getattr(state, "last_updated", None),
             attributes=getattr(state, "attributes", {}),
         )
 
@@ -2673,6 +2697,16 @@ class PumpSteerSensor(RestoreEntity):
             and self._pilot_store is not None
             and self._pilot_persisted is not None
         ):
+            if (
+                self._heat_operation is not None
+                and self._heat_operation_signature is not None
+            ):
+                payload = dict(self._pilot_persisted)
+                payload["heat_operation"] = {
+                    "sources": list(self._heat_operation_signature),
+                    "samples": self._heat_operation.export(),
+                }
+                self._pilot_persisted = payload
             await self._pilot_store.async_save(self._pilot_persisted)
 
     async def _save_pilot_store(self):
@@ -2683,11 +2717,20 @@ class PumpSteerSensor(RestoreEntity):
         model_available = pilot is not None and (
             pilot.house_intervals or pilot.manager.pump.history
         )
+        operation = self._heat_operation
+        operation_samples = operation.export() if operation is not None else None
+        operation_available = bool(
+            operation_samples and any(operation_samples.values())
+        )
         plan_data = self._plan_audit.export_plan()
-        if not model_available and not (
-            plan_data["records"]
-            or plan_data["pending_count"]
-            or plan_data["unverifiable"]
+        if (
+            not model_available
+            and not operation_available
+            and not (
+                plan_data["records"]
+                or plan_data["pending_count"]
+                or plan_data["unverifiable"]
+            )
         ):
             return
         pump_last = (
@@ -2717,11 +2760,18 @@ class PumpSteerSensor(RestoreEntity):
             plan_last,
             plan_data["pending_count"],
             plan_data["unverifiable"],
+            self._heat_operation_signature if operation_available else None,
+            operation.sample_count // 18 if operation_available else None,
         )
         if key == self._pilot_saved:
             return
         payload = dict(self._pilot_persisted or {})
         payload.update(version=1, plan_audit=plan_data)
+        if operation_available:
+            payload["heat_operation"] = {
+                "sources": list(self._heat_operation_signature),
+                "samples": operation_samples,
+            }
         if model_available:
             payload.update(
                 sources=list(self._pilot_sources),
@@ -3296,6 +3346,9 @@ class PumpSteerSensor(RestoreEntity):
                 "thermal_supply_temp_entity",
                 "thermal_heating_mode_entity",
                 "thermal_hot_water_mode_entity",
+                "thermal_compressor_entity",
+                "thermal_return_temp_entity",
+                "thermal_power_entity",
                 "ohmigo_entity",
                 "ohmigo_relay_entity",
             )
@@ -3514,9 +3567,12 @@ class PumpSteerSensor(RestoreEntity):
         """Passive learning from explicitly selected delivered-house-heat state."""
         self._pilot_operating_mode = "unknown"
         self._pilot_operating_quality = "insufficient_evidence"
+        self._heat_operation_detail = {}
         if cfg.get("thermal_intelligence_enabled") is not True:
             self._pilot = None
             self._pilot_sources = None
+            self._heat_operation = None
+            self._heat_operation_signature = None
             return
         if self._pilot_store_read_failed:
             self._pilot_status = "history_unavailable"
@@ -3547,13 +3603,28 @@ class PumpSteerSensor(RestoreEntity):
             self._last_outlook.night_min_temp is not None
             or self._last_outlook.day_max_temp is not None
         )
-        source = cfg.get("thermal_heat_activity_entity")
+        method = cfg.get("thermal_detection_method")
+        heat_id = cfg.get("thermal_heat_activity_entity")
+        aliased_heat = bool(
+            method in {"automatic", "verified"}
+            and heat_id
+            and heat_id
+            in {
+                cfg.get("thermal_compressor_entity"),
+                cfg.get("thermal_heating_mode_entity"),
+                cfg.get("thermal_hot_water_mode_entity"),
+            }
+        )
+        source = None if aliased_heat else heat_id
+        if method == "manual":
+            source = None
         supply = cfg.get("thermal_supply_temp_entity")
         radiator_mode = cfg.get("thermal_heating_mode_entity")
         hot_water_mode = cfg.get("thermal_hot_water_mode_entity")
         threshold = safe_float(cfg.get("thermal_supply_threshold", 30))
         use_supply = (
             not source
+            and method not in {"automatic", "verified"}
             and supply
             and radiator_mode
             and threshold is not None
@@ -3575,6 +3646,19 @@ class PumpSteerSensor(RestoreEntity):
             )
         if hot_water_mode:
             signature += ("hot_water_mode", hot_water_mode)
+        if method == "automatic":
+            signature += ("detection_method", method)
+            signature += tuple(
+                cfg.get(k)
+                for k in (
+                    "thermal_compressor_entity",
+                    "thermal_return_temp_entity",
+                    "thermal_power_entity",
+                    "thermal_heating_mode_entity",
+                    "thermal_heating_mode_inverted",
+                    "thermal_supply_temp_entity",
+                )
+            )
         signature += (
             cfg.get("ohmigo_entity"),
             cfg.get("ohmigo_relay_entity"),
@@ -3592,6 +3676,66 @@ class PumpSteerSensor(RestoreEntity):
             if isinstance(source, str) and source.startswith("binary_sensor.")
             else "unavailable"
         )
+        operation = None
+        if method == "automatic":
+            from .heat_operation import HeatOperation
+
+            operation_signature = tuple(
+                cfg.get(k)
+                for k in (
+                    "thermal_heat_activity_entity",
+                    "thermal_compressor_entity",
+                    "thermal_heating_mode_entity",
+                    "thermal_heating_mode_inverted",
+                    "thermal_hot_water_mode_entity",
+                    "thermal_power_entity",
+                    "thermal_supply_temp_entity",
+                    "thermal_return_temp_entity",
+                )
+            )
+            if (
+                self._heat_operation is None
+                or operation_signature != self._heat_operation_signature
+            ):
+                self._heat_operation = HeatOperation()
+                self._heat_operation_signature = operation_signature
+                saved = (self._pilot_persisted or {}).get("heat_operation")
+                if isinstance(saved, dict) and saved.get("sources") == list(
+                    operation_signature
+                ):
+                    self._heat_operation.restore(saved.get("samples"))
+
+            def source_state(key):
+                from types import SimpleNamespace
+
+                entity = cfg.get(key)
+                if not entity:
+                    return None
+                return self.hass.states.get(entity) or SimpleNamespace(
+                    state="unavailable", attributes={}
+                )
+
+            radiator = self._heating_mode_state(cfg)
+            if radiator is None and cfg.get("thermal_heating_mode_entity"):
+                radiator = source_state("thermal_heating_mode_entity")
+            operation = self._heat_operation.observe(
+                now,
+                heat=None
+                if aliased_heat
+                else source_state("thermal_heat_activity_entity"),
+                compressor=source_state("thermal_compressor_entity"),
+                radiator=radiator,
+                water=source_state("thermal_hot_water_mode_entity"),
+                power=source_state("thermal_power_entity"),
+                supply=source_state("thermal_supply_temp_entity"),
+                return_temp=source_state("thermal_return_temp_entity"),
+                reported_after=self._temperature_reported_after,
+            )
+            if aliased_heat:
+                operation["reason"] = "heat_signal_aliases_operating_mode"
+            self._heat_operation_detail = operation
+            self._pilot_operating_mode = operation["mode"]
+            self._pilot_operating_quality = operation["quality"]
         if not use_supply and (
             not isinstance(source, str) or not source.startswith("binary_sensor.")
         ):
@@ -3689,7 +3833,11 @@ class PumpSteerSensor(RestoreEntity):
                         attributes={},
                     )
                 )
-            if hot_water_status == "hot_water_active":
+            if operation is not None and not operation["learning_qualified"]:
+                heat_state = None
+            if operation is not None:
+                pass
+            elif hot_water_status == "hot_water_active":
                 self._pilot_operating_mode = "hot_water"
                 self._pilot_operating_quality = (
                     "reported_mode_not_physical_confirmation"
@@ -3908,6 +4056,7 @@ class PumpSteerThermalStatusSensor(SensorEntity):
             "operating_quality": attrs.get(
                 "thermal_intelligence_operating_quality", "insufficient_evidence"
             ),
+            "operation_detail": attrs.get("thermal_intelligence_operation_detail", {}),
             "heat_entity": cfg.get("thermal_heat_activity_entity")
             or cfg.get("thermal_supply_temp_entity"),
             "radiator_mode_entity": cfg.get("thermal_heating_mode_entity"),

@@ -73,7 +73,10 @@
           "thermal_heating_mode_inverted": "Radiatorläge motsvarar av",
           "thermal_supply_threshold": "Framledningens indikationströskel",
           "thermal_power_entity": "Värmepumpens eleffekt (valfri)",
-          "thermal_hot_water_mode_entity": "Verifierat varmvattenläge (valfritt)"
+          "thermal_hot_water_mode_entity": "Verifierat varmvattenläge (valfritt)",
+          "thermal_detection_method": "Metod för värmedetektering",
+          "thermal_compressor_entity": "Kompressorstatus (valfri)",
+          "thermal_return_temp_entity": "Returtemperatur (valfri)"
         },
         "data_description": {
           "thermal_heat_activity_entity": "En binär sensor där på betyder uppmätt värmetillförsel till huset och av betyder ingen. Kompressorstatus eller varmvattenläge räcker inte. Rapporttider bevisar inte fysisk mättid.",
@@ -82,7 +85,10 @@
           "thermal_heating_mode_inverted": "Aktivera endast om av betyder radiatorläge. Okänd eller gammal status stoppar inlärning.",
           "thermal_supply_threshold": "Anpassa till värmesystemet. Fel tröskel kan ge felaktig värmeindikation.",
           "thermal_power_entity": "Uppmätt eleffekt för den utrustning som ska analyseras. Energi skattas från HA-rapporter; det är inte levererad värme.",
-          "thermal_hot_water_mode_entity": "På betyder verifierad varmvattenproduktion. Värmeinlärning pausas vid på eller okänt läge; okända perioder klassas inte."
+          "thermal_hot_water_mode_entity": "På betyder verifierad varmvattenproduktion. Värmeinlärning pausas vid på eller okänt läge; okända perioder klassas inte.",
+          "thermal_detection_method": "Automatisk använder kvalificerade signaler och visar osäkerhet. Manuell behåller tröskeln.",
+          "thermal_compressor_entity": "Kompressorstatus ensam bevisar inte radiatorvärme.",
+          "thermal_return_temp_entity": "Används endast tillsammans med andra kvalificerade signaler."
         }
       },
       "notifications": {
@@ -122,7 +128,9 @@
       "required": "Det här fältet är obligatoriskt",
       "entity_not_found": "Entiteten hittades inte",
       "entity_unavailable": "Entiteten är otillgänglig",
-      "invalid_notification_setting": "Ogiltig notisinställning"
+      "invalid_notification_setting": "Ogiltig notisinställning",
+      "invalid_detection_method": "Ogiltig metod för värmedetektering.",
+      "heat_signal_alias": "Värmesignalen måste vara en separat indikator för radiatorvärme."
     }
   },
   "entity": {
@@ -146,6 +154,15 @@
           "hypothetical_plan": "Passiv – hypotetisk plan",
           "validated_plan": "Passiv – validerad modellplan"
         }
+      }
+    }
+  },
+  "selector": {
+    "thermal_detection_method": {
+      "options": {
+        "automatic": "Automatisk (rekommenderas)",
+        "manual": "Manuell framledningströskel",
+        "verified": "Verifierad värmedriftssignal"
       }
     }
   }

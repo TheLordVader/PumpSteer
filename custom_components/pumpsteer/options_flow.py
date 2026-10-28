@@ -19,6 +19,9 @@ DOMAIN = "pumpsteer"
 _GROUPS = {
     "thermal": {"thermal_intelligence_enabled", "external_heat_sources"},
     "telemetry": {
+        "thermal_detection_method",
+        "thermal_compressor_entity",
+        "thermal_return_temp_entity",
         "thermal_heat_activity_entity",
         "thermal_supply_temp_entity",
         "thermal_heating_mode_entity",
@@ -57,6 +60,8 @@ _CLEARABLE = {
     "thermal_heating_mode_entity",
     "thermal_power_entity",
     "thermal_hot_water_mode_entity",
+    "thermal_compressor_entity",
+    "thermal_return_temp_entity",
 }
 
 
@@ -155,6 +160,38 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
                 "external_heat_sources",
                 default=current_data.get("external_heat_sources", False),
             ): selector({"boolean": {}}),
+            vol.Optional(
+                "thermal_detection_method",
+                default=current_data.get("thermal_detection_method")
+                or (
+                    "verified"
+                    if current_data.get("thermal_heat_activity_entity")
+                    else "manual"
+                    if current_data.get("thermal_supply_temp_entity")
+                    else "automatic"
+                ),
+            ): selector(
+                {
+                    "select": {
+                        "options": ["automatic", "manual", "verified"],
+                        "translation_key": "thermal_detection_method",
+                    }
+                }
+            ),
+            vol.Optional(
+                "thermal_compressor_entity",
+                description={
+                    "suggested_value": current_data.get("thermal_compressor_entity")
+                },
+            ): selector({"entity": {"domain": "binary_sensor"}}),
+            vol.Optional(
+                "thermal_return_temp_entity",
+                description={
+                    "suggested_value": current_data.get("thermal_return_temp_entity")
+                },
+            ): selector(
+                {"entity": {"domain": "sensor", "device_class": "temperature"}}
+            ),
             vol.Optional(
                 "thermal_heat_activity_entity",
                 description={
@@ -350,6 +387,24 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
             errors["weather_entity"] = "entity_not_found"
 
         heat = user_input.get("thermal_heat_activity_entity")
+        method = user_input.get("thermal_detection_method")
+        if method and method not in {"automatic", "manual", "verified"}:
+            errors["thermal_detection_method"] = "invalid_detection_method"
+        if method == "verified" and not heat:
+            errors["thermal_heat_activity_entity"] = "required"
+        if (
+            method in {"automatic", "verified"}
+            and heat
+            and heat
+            in {
+                user_input.get("thermal_compressor_entity"),
+                user_input.get("thermal_heating_mode_entity"),
+                user_input.get("thermal_hot_water_mode_entity"),
+            }
+        ):
+            errors["thermal_heat_activity_entity"] = "heat_signal_alias"
+        if method == "manual" and not user_input.get("thermal_supply_temp_entity"):
+            errors["thermal_supply_temp_entity"] = "required"
         if heat and (
             not isinstance(heat, str)
             or not heat.startswith("binary_sensor.")
@@ -362,6 +417,8 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
             ("thermal_hot_water_mode_entity", "binary_sensor."),
             ("thermal_supply_temp_entity", "sensor."),
             ("thermal_heating_mode_entity", "binary_sensor."),
+            ("thermal_compressor_entity", "binary_sensor."),
+            ("thermal_return_temp_entity", "sensor."),
         ):
             entity = user_input.get(key)
             if entity and (

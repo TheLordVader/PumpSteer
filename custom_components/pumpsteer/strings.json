@@ -84,7 +84,10 @@
           "thermal_heating_mode_inverted": "Radiator mode is off",
           "thermal_supply_threshold": "Supply temperature indicator threshold",
           "thermal_power_entity": "Heat-pump electrical power (optional)",
-          "thermal_hot_water_mode_entity": "Verified hot-water mode (optional)"
+          "thermal_hot_water_mode_entity": "Verified hot-water mode (optional)",
+          "thermal_detection_method": "Heating detection method",
+          "thermal_compressor_entity": "Compressor status (optional)",
+          "thermal_return_temp_entity": "Return temperature (optional)"
         },
         "data_description": {
           "thermal_heat_activity_entity": "A binary sensor whose on means measured heat delivery to the home and off means none. Compressor status or hot-water mode alone is insufficient. Report times do not establish physical measurement time.",
@@ -93,7 +96,10 @@
           "thermal_heating_mode_inverted": "Enable only when off means radiator mode. Unknown or stale status suspends learning.",
           "thermal_supply_threshold": "Set for your heating system. An unsuitable threshold can misclassify heat.",
           "thermal_power_entity": "Measured electrical input for the equipment being analysed. Energy is estimated from HA reports; it is not delivered heat.",
-          "thermal_hot_water_mode_entity": "On means verified hot-water operation. Heat learning pauses when on or unknown; unknown periods are not classified."
+          "thermal_hot_water_mode_entity": "On means verified hot-water operation. Heat learning pauses when on or unknown; unknown periods are not classified.",
+          "thermal_detection_method": "Automatic uses qualified signals and reports uncertainty. Manual retains the supply threshold.",
+          "thermal_compressor_entity": "Compressor status alone does not prove radiator heating.",
+          "thermal_return_temp_entity": "Used only together with other qualified signals."
         }
       },
       "notifications": {
@@ -129,7 +135,9 @@
       "entity_unavailable": "Entity unavailable",
       "invalid_range": "Min brake strength cannot be higher than max brake strength",
       "unknown": "An unknown error occurred",
-      "invalid_notification_setting": "Invalid notification setting"
+      "invalid_notification_setting": "Invalid notification setting",
+      "invalid_detection_method": "Invalid heating detection method.",
+      "heat_signal_alias": "The heat signal must be a separate radiator heat indicator."
     }
   },
   "entity": {
@@ -153,6 +161,15 @@
           "hypothetical_plan": "Passive – hypothetical plan",
           "validated_plan": "Passive – validated model plan"
         }
+      }
+    }
+  },
+  "selector": {
+    "thermal_detection_method": {
+      "options": {
+        "automatic": "Automatic (recommended)",
+        "manual": "Manual supply threshold",
+        "verified": "Verified heating entity"
       }
     }
   }

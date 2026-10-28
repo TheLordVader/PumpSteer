@@ -492,6 +492,7 @@ async def test_active_price_and_fake_ohmigo(
             "aggressiveness": 3,
             "house_inertia": 2,
             "thermal_intelligence_enabled": enable,
+            "thermal_detection_method": "automatic",
         }
 
     hass.states.async_set("switch.relay_off", "on")
@@ -1075,6 +1076,30 @@ async def test_unknown_store_version_is_not_overwritten(
     assert not sensor._pilot_store_read_failed
 
 
+async def test_native_operation_store_restores_unvalidated_samples(hass):
+    from custom_components.pumpsteer.heat_operation import HeatOperation
+    from custom_components.pumpsteer.sensor import PumpSteerSensor
+
+    await hass.async_start()
+    entry = MockConfigEntry(domain="pumpsteer", title="test", data={}, options={})
+    sensor = PumpSteerSensor(hass, entry)
+    await sensor._load_pilot_store()
+    sensor._heat_operation = HeatOperation()
+    sensor._heat_operation_signature = ("sensor.test",)
+    sensor._heat_operation.samples = {"idle": [0.1] * 3, "heating": [1.2] * 3}
+    sensor._heat_operation.sample_count = 6
+    await sensor._save_pilot_store()
+    await sensor._flush_pilot_store()
+    restored_sensor = PumpSteerSensor(hass, entry)
+    await restored_sensor._load_pilot_store()
+    saved = restored_sensor._pilot_persisted["heat_operation"]
+    assert saved["sources"] == ["sensor.test"]
+    restored = HeatOperation()
+    assert restored.restore(saved["samples"])
+    assert restored.samples["heating"] == [1.2] * 3
+    assert restored.fresh_labels == set()
+
+
 async def test_native_options_menu_preserves_other_pages(
     recorder_mock, hass, enable_custom_integrations, monkeypatch, tmp_path
 ):
@@ -1128,6 +1153,49 @@ async def test_native_options_menu_preserves_other_pages(
     assert entry.options["notification_cooldown_minutes"] == "60"
     assert entry.options["indoor_temp_entity"] == "sensor.room"
     assert entry.options["thermal_intelligence_enabled"] is True
+    for entity, value, attrs in [
+        (
+            "sensor.test_power",
+            "0.5",
+            {"unit_of_measurement": "kW", "device_class": "power"},
+        ),
+        (
+            "sensor.supply",
+            "35",
+            {"unit_of_measurement": "°C", "device_class": "temperature"},
+        ),
+        (
+            "sensor.return",
+            "30",
+            {"unit_of_measurement": "°C", "device_class": "temperature"},
+        ),
+        ("binary_sensor.heat", "on", {}),
+        ("binary_sensor.compressor", "on", {}),
+        ("binary_sensor.radiator", "on", {}),
+    ]:
+        hass.states.async_set(entity, value, attrs)
+    for method in ("automatic", "manual", "verified"):
+        result = await hass.config_entries.options.async_init(entry.entry_id)
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"], {"next_step_id": "telemetry"}
+        )
+        result = await hass.config_entries.options.async_configure(
+            result["flow_id"],
+            {
+                "thermal_detection_method": method,
+                "thermal_heat_activity_entity": "binary_sensor.heat",
+                "thermal_compressor_entity": "binary_sensor.compressor",
+                "thermal_supply_temp_entity": "sensor.supply",
+                "thermal_return_temp_entity": "sensor.return",
+                "thermal_heating_mode_entity": "binary_sensor.radiator",
+                "thermal_heating_mode_inverted": False,
+                "thermal_supply_threshold": 30,
+                "thermal_power_entity": "sensor.test_power",
+            },
+        )
+        assert result["type"] == "create_entry", result
+        assert entry.options["thermal_detection_method"] == method
+        assert entry.options["notification_level"] == "braking_only"
     hass.states.async_set("sensor.room", "unavailable")
     result = await hass.config_entries.options.async_init(entry.entry_id)
     result = await hass.config_entries.options.async_configure(
@@ -1143,7 +1211,9 @@ async def test_native_options_menu_preserves_other_pages(
     result = await hass.config_entries.options.async_configure(
         result["flow_id"], {"next_step_id": "telemetry"}
     )
-    result = await hass.config_entries.options.async_configure(result["flow_id"], {})
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"thermal_detection_method": "automatic"}
+    )
     assert result["type"] == "create_entry"
     assert entry.options["thermal_power_entity"] == ""
     assert entry.options["notification_cooldown_minutes"] == "60"

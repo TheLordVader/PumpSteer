@@ -172,23 +172,31 @@ def test_update_error_breaks_pending_pilot_interval(monkeypatch):
     assert sensor._pilot.manager.house.start is None
 
 
-def test_hot_water_transition_during_learning_discards_fit(monkeypatch):
+@pytest.mark.parametrize(
+    "role",
+    [
+        "thermal_hot_water_mode_entity",
+        "thermal_compressor_entity",
+        "thermal_return_temp_entity",
+        "thermal_power_entity",
+    ],
+)
+def test_signal_transition_during_learning_discards_fit(monkeypatch, role):
     from datetime import datetime, timezone
     from custom_components.pumpsteer import sensor as sensor_module
 
     sensor, states = _sensor()
     sensor._config_entry.options.update(
-        thermal_intelligence_enabled=True,
-        thermal_hot_water_mode_entity="binary_sensor.hot_water",
+        thermal_intelligence_enabled=True, **{role: "sensor.observed"}
     )
     at = datetime(2026, 10, 11, 8, tzinfo=timezone.utc)
-    states["binary_sensor.hot_water"] = SimpleNamespace(
+    states["sensor.observed"] = SimpleNamespace(
         state="off", last_reported=at, last_changed=at, attributes={}
     )
 
     class Pump:
         def add_interval(self, sample):
-            states["binary_sensor.hot_water"].state = "on"
+            states["sensor.observed"].state = "on"
 
     class Pilot:
         def __init__(self):
@@ -571,6 +579,123 @@ def test_hot_water_can_be_reported_without_a_heat_indicator(monkeypatch):
     assert attrs["thermal_intelligence_status"] == "heat_signal_not_configured"
 
 
+def test_automatic_mode_uses_verified_heat_and_rejects_contradictory_compressor(
+    monkeypatch,
+):
+    from datetime import datetime, timedelta, timezone
+
+    sensor, states = _sensor()
+    sensor._config_entry.options.update(
+        thermal_intelligence_enabled=True,
+        thermal_detection_method="automatic",
+        thermal_heat_activity_entity="binary_sensor.heat",
+        thermal_compressor_entity="binary_sensor.compressor",
+        thermal_hot_water_mode_entity="binary_sensor.water",
+    )
+    start = datetime(2026, 10, 11, 8, tzinfo=timezone.utc)
+    for key in ("sensor.indoor", "sensor.outdoor"):
+        states[key].attributes["unit_of_measurement"] = "°C"
+        states[key].last_changed = start
+    for key, value in (
+        ("binary_sensor.heat", "on"),
+        ("binary_sensor.compressor", "on"),
+        ("binary_sensor.water", "off"),
+    ):
+        states[key] = SimpleNamespace(
+            state=value, last_reported=start, last_changed=start, attributes={}
+        )
+    attrs = _cycle(sensor, monkeypatch, 0)
+    assert attrs["thermal_intelligence_operating_mode"] == "space_heating"
+    assert attrs["thermal_intelligence_operating_quality"] == "verified"
+    at = start + timedelta(minutes=1)
+    states["binary_sensor.compressor"].state = "off"
+    states["binary_sensor.compressor"].last_reported = at
+    states["binary_sensor.compressor"].last_changed = at
+    attrs = _cycle(sensor, monkeypatch, 1)
+    assert attrs["thermal_intelligence_operating_mode"] == "unknown"
+    assert sensor._pilot.manager.house.start is None
+
+
+def test_operation_store_batches_and_flushes_latest_samples():
+    from custom_components.pumpsteer.heat_operation import HeatOperation
+
+    sensor, _ = _sensor()
+    saved = []
+
+    class Store:
+        def async_delay_save(self, callback, delay):
+            saved.append(callback())
+
+        async def async_save(self, data):
+            saved.append(data)
+
+    sensor._pilot_store = Store()
+    sensor._heat_operation = HeatOperation()
+    sensor._heat_operation_signature = ("sensor.example",)
+    sensor._heat_operation.samples["idle"] = [0.1]
+    sensor._heat_operation.sample_count = 1
+    asyncio.run(sensor._save_pilot_store())
+    assert len(saved) == 1
+    sensor._heat_operation.samples["idle"].append(0.2)
+    sensor._heat_operation.sample_count = 2
+    asyncio.run(sensor._save_pilot_store())
+    assert len(saved) == 1
+    asyncio.run(sensor._flush_pilot_store())
+    restored = HeatOperation()
+    assert restored.restore(saved[-1]["heat_operation"]["samples"])
+    assert restored.samples["idle"] == [0.1, 0.2]
+    assert restored.fresh_labels == set()
+    sensor._heat_operation.samples["idle"] = [0.3] * 24
+    sensor._heat_operation.sample_count = 36
+    asyncio.run(sensor._save_pilot_store())
+    assert saved[-1]["heat_operation"]["samples"]["idle"] == [0.3] * 24
+
+
+def test_automatic_mode_rejects_heat_signal_aliasing_compressor(monkeypatch):
+    from datetime import datetime, timezone
+
+    sensor, states = _sensor()
+    sensor._config_entry.options.update(
+        thermal_intelligence_enabled=True,
+        thermal_detection_method="automatic",
+        thermal_heat_activity_entity="binary_sensor.compressor",
+        thermal_compressor_entity="binary_sensor.compressor",
+    )
+    start = datetime(2026, 10, 11, 8, tzinfo=timezone.utc)
+    for key in ("sensor.indoor", "sensor.outdoor"):
+        states[key].attributes["unit_of_measurement"] = "°C"
+        states[key].last_changed = start
+    states["binary_sensor.compressor"] = SimpleNamespace(
+        state="on", last_reported=start, last_changed=start, attributes={}
+    )
+    attrs = _cycle(sensor, monkeypatch, 0)
+    assert attrs["thermal_intelligence_operating_mode"] == "unknown"
+    assert not attrs["thermal_intelligence_operation_detail"]["learning_qualified"]
+    assert sensor._pilot is None
+
+
+def test_automatic_mode_requires_a_configured_missing_radiator_sensor(monkeypatch):
+    from datetime import datetime, timezone
+
+    sensor, states = _sensor()
+    sensor._config_entry.options.update(
+        thermal_intelligence_enabled=True,
+        thermal_detection_method="automatic",
+        thermal_heat_activity_entity="binary_sensor.heat",
+        thermal_heating_mode_entity="binary_sensor.missing",
+    )
+    start = datetime(2026, 10, 11, 8, tzinfo=timezone.utc)
+    for key in ("sensor.indoor", "sensor.outdoor"):
+        states[key].attributes["unit_of_measurement"] = "°C"
+        states[key].last_changed = start
+    states["binary_sensor.heat"] = SimpleNamespace(
+        state="on", last_reported=start, last_changed=start, attributes={}
+    )
+    attrs = _cycle(sensor, monkeypatch, 0)
+    assert attrs["thermal_intelligence_operating_mode"] == "unknown"
+    assert sensor._pilot.manager.house.start is None
+
+
 def test_options_offer_supply_mode_and_threshold(monkeypatch):
     flow = options_flow.PumpSteerOptionsFlowHandler()
     flow.config_entry = SimpleNamespace(data={}, options={})
@@ -598,6 +723,19 @@ def test_options_offer_supply_mode_and_threshold(monkeypatch):
         if isinstance(key, tuple)
     )
     assert ("thermal_supply_threshold", 30) in schema
+    assert any(
+        key[0] == "thermal_detection_method" for key in schema if isinstance(key, tuple)
+    )
+    assert any(
+        key[0] == "thermal_compressor_entity"
+        for key in schema
+        if isinstance(key, tuple)
+    )
+    assert any(
+        key[0] == "thermal_return_temp_entity"
+        for key in schema
+        if isinstance(key, tuple)
+    )
 
 
 def test_new_paired_bad_forecast_invalidates_cached_plan(monkeypatch):
