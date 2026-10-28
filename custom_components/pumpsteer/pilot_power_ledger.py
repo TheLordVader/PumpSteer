@@ -222,7 +222,22 @@ class PowerLedger:
         }
 
     def summary(self):
+        # Do not treat a partial-price cost as the price of all observed energy.
+        priced = (
+            self.currency is not None and not self.mixed_currency and self.energy > 0
+        )
+        complete = priced and abs(self.priced_energy - self.energy) <= 1e-9
         return {
+            "price_coverage": "complete"
+            if complete
+            else "partial"
+            if priced and self.priced_energy > 0
+            else "unavailable",
+            "effective_price_per_kwh": round(self.cost / self.energy, 4)
+            if complete
+            else None,
+            "price_basis": "configured_price_entity_not_verified_full_tariff",
+            "price_coverage_scope": "observed_intervals_only",
             "method": "reported_power_held_between_reports",
             "measurement_time": "HA_report_not_physical",
             "energy_kwh_estimate": round(self.energy, 4),

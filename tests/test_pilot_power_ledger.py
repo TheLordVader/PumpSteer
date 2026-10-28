@@ -247,3 +247,20 @@ def test_invalid_unit_clears_anchor_instead_of_bridging_data():
     at = T + timedelta(minutes=4)
     ledger.observe(at, state(0.5, at, "kW"), None, None, [prices()])
     assert ledger.summary()["energy_kwh_estimate"] == 0
+
+
+def test_economic_evidence_exposes_partial_vs_complete_without_fabricating_rate():
+    ledger = PowerLedger()
+    ledger.energy = 2.0
+    ledger.priced_energy = 1.0
+    ledger.cost = 2.0
+    ledger.currency = "SEK"
+    result = ledger.summary()
+    assert result["price_coverage"] == "partial"
+    assert result["effective_price_per_kwh"] is None
+    ledger.priced_energy = 2.0
+    assert ledger.summary()["price_coverage"] == "complete"
+    assert ledger.summary()["effective_price_per_kwh"] == 1.0
+    ledger.mixed_currency = True
+    assert ledger.summary()["price_coverage"] == "unavailable"
+    assert ledger.summary()["effective_price_per_kwh"] is None

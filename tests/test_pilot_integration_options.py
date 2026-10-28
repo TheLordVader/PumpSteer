@@ -1151,6 +1151,11 @@ def test_power_telemetry_uses_bounded_event_subscription_and_no_new_entity(monke
     assert sensor.extra_state_attributes["thermal_intelligence_electrical"][
         "energy_kwh_estimate"
     ] == pytest.approx(1 / 12, abs=0.0001)
+    economic = sensor.extra_state_attributes["thermal_intelligence_electrical"]
+    assert economic["price_coverage"] == "complete"
+    assert economic["effective_price_per_kwh"] == pytest.approx(1.0)
+    assert economic["price_basis"] == "configured_price_entity_not_verified_full_tariff"
+    assert economic["price_coverage_scope"] == "observed_intervals_only"
     prior_ledger = sensor._power_ledger
     sensor._config_entry.options["thermal_heating_mode_inverted"] = True
     sensor._setup_power_telemetry()
