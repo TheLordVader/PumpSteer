@@ -27,6 +27,8 @@ from .electricity_price import (
     async_get_price_thresholds,
     classify_price_list,
     filter_short_peaks,
+    price_cache_refresh_due,
+    price_cache_transition,
 )
 from .holiday import async_update_holiday
 from .ohmigo import async_push_ohmigo
@@ -284,7 +286,7 @@ class PumpSteerSensor(RestoreEntity):
             plan = (
                 self._pilot_plan
                 if not interrupted
-                else {"planning_status": "unavailable", "reason": "control_interrupted"}
+                else self._unavailable_pilot_plan("control_interrupted")
             )
             attrs["thermal_intelligence_plan"] = (
                 "hypothetical_only"
@@ -497,10 +499,7 @@ class PumpSteerSensor(RestoreEntity):
         self._pilot_price_available = False
         self._pilot_forecast_available = False
         self._pilot_price_forecast = False
-        self._pilot_plan = {
-            "planning_status": "unavailable",
-            "reason": "options_changed",
-        }
+        self._pilot_plan = self._unavailable_pilot_plan("options_changed")
         self._pilot_plan_next = None
         self._pilot_weather_raw = None
         self._pilot_restore = None
@@ -970,7 +969,7 @@ class PumpSteerSensor(RestoreEntity):
         outdoor: Optional[float],
         now: datetime,
     ) -> None:
-        self._pilot_plan = {"planning_status": "unavailable", "reason": "safe_mode"}
+        self._pilot_plan = self._unavailable_pilot_plan("safe_mode")
         self._pilot_detector = None
         self._pilot_detection_after = now
         self._pilot_plan_next = None
@@ -2039,16 +2038,30 @@ class PumpSteerSensor(RestoreEntity):
             or self._price_thresholds_cached_date != today_date
         )
 
+        due = price_cache_refresh_due(
+            now=now,
+            entity_id=today_entity_id,
+            today_prices=today_prices,
+            cached_date=self._price_thresholds_cached_date,
+            cached_entity_id=self._price_thresholds_entity_id,
+        )
+        thresholds = await async_get_price_thresholds(today_prices) if due else None
+        transition = price_cache_transition(
+            now=now,
+            entity_id=today_entity_id,
+            today_prices=today_prices,
+            cached_date=self._price_thresholds_cached_date,
+            cached_entity_id=self._price_thresholds_entity_id,
+            cached_p30=self._cached_p30,
+            cached_p80=self._cached_p80,
+            thresholds=thresholds,
+        )
+        self._cached_p30, self._cached_p80 = transition.p30, transition.p80
+        self._price_thresholds_cached_date = transition.date
+        self._price_thresholds_entity_id = transition.entity_id
         if recalc_thresholds:
             midnight_grace = now.hour == 0 and now.minute < 15
-
-            if today_prices and not midnight_grace:
-                self._cached_p30, self._cached_p80 = await async_get_price_thresholds(
-                    today_prices,
-                )
-                self._price_thresholds_cached_date = today_date
-                self._price_thresholds_entity_id = today_entity_id
-
+            if transition.refreshed:
                 _LOGGER.debug(
                     "Recomputed price thresholds: p30=%.3f p80=%.3f for entity %s (date=%s)",
                     self._cached_p30,
@@ -2731,6 +2744,11 @@ class PumpSteerSensor(RestoreEntity):
             "cfg": copy.deepcopy(cfg),
             "categories": categories,
             "active_prices": active_prices,
+            "price_entity_id": cfg.get("electricity_price_entity"),
+            "cached_price_date": self._price_thresholds_cached_date,
+            "cached_price_entity_id": self._price_thresholds_entity_id,
+            "cached_p30": self._cached_p30,
+            "cached_p80": self._cached_p80,
             "interval_minutes": interval,
             "current_slot": slot,
             "summer_threshold": self._helper_value_with_fallback(
@@ -2753,6 +2771,59 @@ class PumpSteerSensor(RestoreEntity):
             "holiday_boolean_on": boolean_on,
             "inputs_qualified": qualified,
         }, tuple(holiday_ids or ()) + (preheat_id,)
+
+    def _unavailable_pilot_plan(self, reason):
+        """Keep the last issued comparison as history, never as a current plan."""
+        previous = self._pilot_plan
+        comparison = previous.get("comparison", {})
+        historical = comparison.get("historical_reference")
+        if (
+            historical is None
+            and previous.get("planning_status")
+            in {"validated_passive", "hypothetical_unvalidated"}
+            and previous.get("forecast_start")
+        ):
+            historical = {
+                **comparison,
+                "status": "historical",
+                "forecast_start": previous["forecast_start"],
+                "issued_at": previous.get("issued_at"),
+                "pilot_plan": {
+                    **{
+                        key: previous[key]
+                        for key in (
+                            "planning_status",
+                            "reason",
+                            "horizon_minutes",
+                            "forecast_coverage",
+                            "cost_kind",
+                            "response_status",
+                            "duties",
+                            "temperatures",
+                            "comfort_status",
+                            "validation",
+                            "assumed_model",
+                            "forecast_quality",
+                            "monitoring_forecast",
+                            "initial_context",
+                        )
+                        if key in previous
+                    },
+                    "outcome_evaluation": "not_evaluated",
+                },
+            }
+        result = {"planning_status": "unavailable", "reason": reason}
+        if historical is not None:
+            result["comparison"] = {
+                "baseline": "unavailable",
+                "baseline_reason": reason,
+                "shared_control_status": "unavailable",
+                "savings": "unverified",
+                "recovery": "unknown",
+                "heat_storage": "unknown",
+                "historical_reference": historical,
+            }
+        return result
 
     async def _plan_pilot(self, cfg, now, extra, command):
         """Run a bounded diagnostic only; it never changes the control output."""
@@ -2780,12 +2851,11 @@ class PumpSteerSensor(RestoreEntity):
             _weather_intervals(self._pilot_weather_raw, now) if unit == "°C" else None
         )
         if prices is None or weather is None:
-            self._pilot_plan = {
-                "planning_status": "unavailable",
-                "reason": "price_forecast_unavailable"
+            self._pilot_plan = self._unavailable_pilot_plan(
+                "price_forecast_unavailable"
                 if prices is None
-                else "weather_forecast_unavailable",
-            }
+                else "weather_forecast_unavailable"
+            )
             self._pilot_plan_next = None
             self._pilot_plan_signature = None
             return
@@ -2830,6 +2900,10 @@ class PumpSteerSensor(RestoreEntity):
                 replay_context["holiday_boolean_on"],
                 self._pilot_holiday_current,
                 replay_context["inputs_qualified"],
+                replay_context["cached_price_date"],
+                replay_context["cached_price_entity_id"],
+                replay_context["cached_p30"],
+                replay_context["cached_p80"],
                 components,
                 outside_attrs.get("selected_source"),
                 tuple(entities),
@@ -2878,43 +2952,20 @@ class PumpSteerSensor(RestoreEntity):
         )
         if self._pilot_plan_next is not None and now < self._pilot_plan_next:
             if signature != self._pilot_plan_signature:
-                self._pilot_plan = {
-                    "planning_status": "unavailable",
-                    "reason": "context_changed_waiting_for_replan",
-                }
+                self._pilot_plan = self._unavailable_pilot_plan(
+                    "context_changed_waiting_for_replan"
+                )
             elif (
                 replay_state_signature != self._pilot_replay_state_signature
-                and self._pilot_plan.get("comparison", {}).get("baseline")
-                in {"shared_control_passive", "conditional_pi_only"}
+                and self._pilot_plan.get("planning_status")
+                in {"validated_passive", "hypothetical_unvalidated"}
             ):
                 # A cached reference was issued for another PI/ramp state. Do
                 # not rerun the optimizer on every control cycle or expose the
                 # stale modeled path as a current comparison.
-                prior_reference = self._pilot_plan["comparison"]
-                historical = (
-                    {
-                        **prior_reference,
-                        "status": "historical",
-                        "forecast_start": self._pilot_plan["forecast_start"],
-                        "issued_at": self._pilot_plan.get("issued_at"),
-                    }
-                    if self._pilot_plan.get("forecast_start")
-                    else None
+                self._pilot_plan = self._unavailable_pilot_plan(
+                    "control_state_changed_waiting_for_replan"
                 )
-                comparison = {
-                    "baseline": "unavailable",
-                    "baseline_reason": "control_state_changed_waiting_for_replan",
-                    "shared_control_status": "unavailable",
-                    "savings": "unverified",
-                    "recovery": "unknown",
-                    "heat_storage": "unknown",
-                }
-                if historical is not None:
-                    comparison["historical_reference"] = historical
-                self._pilot_plan = {
-                    **self._pilot_plan,
-                    "comparison": comparison,
-                }
             return
         self._pilot_plan_next = now + timedelta(minutes=30)
         self._pilot_plan_signature = signature

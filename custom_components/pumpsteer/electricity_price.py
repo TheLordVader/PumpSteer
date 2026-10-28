@@ -1,5 +1,5 @@
 import logging
-from typing import List
+from typing import List, NamedTuple
 
 from .settings import (
     ABSOLUTE_CHEAP_LIMIT,
@@ -65,6 +65,60 @@ def compute_price_thresholds(
     return p30, p80
 
 
+class PriceCacheTransition(NamedTuple):
+    """A new cache snapshot, without changing the input snapshot."""
+
+    p30: float
+    p80: float
+    date: str | None
+    entity_id: str | None
+    refreshed: bool
+
+
+def price_cache_refresh_due(
+    *, now, entity_id, today_prices, cached_date, cached_entity_id
+) -> bool:
+    """Follow the same daily and midnight-grace rule as the live controller."""
+    date = now.strftime("%Y-%m-%d")
+    changed = (
+        cached_date is None or cached_entity_id != entity_id or cached_date != date
+    )
+    return bool(today_prices) and changed and not (now.hour == 0 and now.minute < 15)
+
+
+def price_cache_transition(
+    *,
+    now,
+    entity_id,
+    today_prices,
+    cached_date,
+    cached_entity_id,
+    cached_p30,
+    cached_p80,
+    thresholds=None,
+):
+    """Return daily thresholds without I/O; inputs must already be qualified.
+
+    ``thresholds`` lets live pass the result of the existing asynchronous
+    threshold entrypoint. Replay omits it and uses the same percentile core.
+    """
+    due = price_cache_refresh_due(
+        now=now,
+        entity_id=entity_id,
+        today_prices=today_prices,
+        cached_date=cached_date,
+        cached_entity_id=cached_entity_id,
+    )
+    if not due:
+        return PriceCacheTransition(
+            cached_p30, cached_p80, cached_date, cached_entity_id, False
+        )
+    p30, p80 = (
+        compute_price_thresholds([], today_prices) if thresholds is None else thresholds
+    )
+    return PriceCacheTransition(p30, p80, now.strftime("%Y-%m-%d"), entity_id, True)
+
+
 async def async_get_price_thresholds(
     current_prices: List[float],
 ) -> tuple[float, float]:
@@ -76,8 +130,7 @@ async def async_get_price_thresholds(
     """
     if not current_prices:
         return 0.0, 0.0
-    p30 = _percentile(current_prices, PRICE_PERCENTILE_CHEAP)
-    p80 = _percentile(current_prices, PRICE_PERCENTILE_EXPENSIVE)
+    p30, p80 = compute_price_thresholds([], current_prices)
     _LOGGER.debug(
         "Price thresholds: P30=%.3f P80=%.3f (from %d today prices)",
         p30,

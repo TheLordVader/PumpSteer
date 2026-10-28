@@ -1,12 +1,231 @@
 """Strictly passive, explicitly hypothetical use of Heat Pump Pilot's optimizer."""
 
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass
 import math
 from .pilot_forecast import _timestamp, price_window
 from .pilot_vendor.mpc_controller import MpcController
 from .pilot_vendor.pump_response import ResponseParameters, virtual_request
 from .pilot_vendor.response_optimizer import VirtualActuator
 from .settings import PRECOOL_LOOKAHEAD, PRICE_LOOKAHEAD_HOURS
+
+
+@dataclass(frozen=True)
+class _ReplayPriceSnapshot:
+    prices: tuple
+    categories: tuple
+    slot: int
+    p30: float
+    p80: float
+
+
+class _ReplayPriceCalendar:
+    """Frozen, already-published local price days and the actual live cache."""
+
+    def __init__(self, context, days):
+        self.context = context
+        self.days = days
+        self.cache = {}
+
+    def at(self, instant):
+        from .electricity_price import (
+            classify_price_list,
+            filter_short_peaks,
+            price_cache_transition,
+        )
+        from .settings import PEAK_FILTER_MIN_DURATION_MINUTES
+        from .utils import compute_price_slot_index
+
+        local = instant.astimezone(self.context["calendar_tz"])
+        day = local.date()
+        today = self.days.get(day)
+        if today is None:
+            return None
+        key = (day, local.hour == 0 and local.minute < 15)
+        if key not in self.cache:
+            c = self.context
+            transition = price_cache_transition(
+                now=local,
+                entity_id=c["price_entity_id"],
+                today_prices=today,
+                cached_date=c["cached_price_date"],
+                cached_entity_id=c["cached_price_entity_id"],
+                cached_p30=c["cached_p30"],
+                cached_p80=c["cached_p80"],
+            )
+            tomorrow = self.days.get(day + timedelta(days=1), ())
+            prices = tuple(today) + tuple(tomorrow)
+            categories = filter_short_peaks(
+                classify_price_list(prices, transition.p30, transition.p80),
+                c["interval_minutes"],
+                PEAK_FILTER_MIN_DURATION_MINUTES,
+            )
+            self.cache[key] = (
+                prices,
+                tuple(categories),
+                transition.p30,
+                transition.p80,
+            )
+        prices, categories, p30, p80 = self.cache[key]
+        return _ReplayPriceSnapshot(
+            prices,
+            categories,
+            compute_price_slot_index(
+                local, self.context["interval_minutes"], len(prices)
+            ),
+            p30,
+            p80,
+        )
+
+
+def _build_replay_price_calendar(price_states, context, now):
+    """Qualify full original timestamped days, never invent future prices."""
+    from .pilot_forecast import source_is_current
+    from .sensor import PumpSteerSensor
+
+    try:
+        now = _timestamp(now)
+        zone = context["calendar_tz"]
+        local = now.astimezone(zone)
+        interval = context["interval_minutes"]
+        if (
+            interval not in (15, 30, 60)
+            or not isinstance(context["price_entity_id"], str)
+            or not context["price_entity_id"]
+        ):
+            return None
+        if any(
+            isinstance(context[key], bool)
+            or not isinstance(context[key], (int, float))
+            or not math.isfinite(context[key])
+            for key in ("cached_p30", "cached_p80")
+        ):
+            return None
+        grouped = {}
+        unit = None
+        for state in price_states:
+            if state is None or not source_is_current(state, now):
+                continue
+            attrs = getattr(state, "attributes", {}) or {}
+            current_unit = attrs.get("unit_of_measurement")
+            if current_unit not in ("SEK/kWh", "EUR/kWh") or (
+                unit and unit != current_unit
+            ):
+                return None
+            unit = current_unit
+            for name in ("raw_today", "raw_tomorrow", "prices", "forecast"):
+                entries = attrs.get(name, [])
+                if not isinstance(entries, list) or len(entries) > 192:
+                    return None
+                if entries and all(not isinstance(entry, dict) for entry in entries):
+                    continue
+                for row in entries:
+                    if not isinstance(row, dict):
+                        return None
+                    start, end = (
+                        _timestamp(row.get("start")),
+                        _timestamp(row.get("end")),
+                    )
+                    value = row.get("value", row.get("price"))
+                    if start is None or end is None or isinstance(value, bool):
+                        return None
+                    try:
+                        value = float(value)
+                    except (TypeError, ValueError, OverflowError):
+                        return None
+                    if not math.isfinite(value) or end - start != timedelta(
+                        minutes=interval
+                    ):
+                        return None
+                    day = start.astimezone(zone).date()
+                    if day not in (local.date(), local.date() + timedelta(days=1)):
+                        continue
+                    entries_for_day = grouped.setdefault(day, {})
+                    prior = entries_for_day.get(start)
+                    if prior is not None and prior != (end, value):
+                        return None
+                    entries_for_day[start] = (end, value)
+        days = {}
+        for day in (local.date(), local.date() + timedelta(days=1)):
+            raw = grouped.get(day, {})
+            if not raw and day != local.date():
+                continue
+            rows = [
+                {"start": start, "end": end, "value": value}
+                for start, (end, value) in sorted(raw.items())
+            ]
+            anchor = datetime(day.year, day.month, day.day, tzinfo=zone)
+            if not PumpSteerSensor._price_day_matches_slots(rows, anchor, interval):
+                return None
+            days[day] = tuple(row["value"] for row in rows)
+        expected = days[local.date()] + days.get(local.date() + timedelta(days=1), ())
+        active = tuple(context["active_prices"])
+        if len(active) != len(expected) or any(
+            not math.isclose(a, b, rel_tol=1e-9, abs_tol=1e-9)
+            for a, b in zip(active, expected)
+        ):
+            return None
+        calendar = _ReplayPriceCalendar(context, days)
+        snapshot = calendar.at(now)
+        if (
+            snapshot is None
+            or snapshot.slot != context["current_slot"]
+            or snapshot.categories != tuple(context["categories"])
+        ):
+            return None
+        return calendar
+    except (
+        KeyError,
+        TypeError,
+        ValueError,
+        AttributeError,
+        OverflowError,
+        ZeroDivisionError,
+    ):
+        return None
+
+
+def _needs_price_calendar(local_start, local_end):
+    return (
+        local_start.date() != local_end.date()
+        or local_start.utcoffset() != local_end.utcoffset()
+        or (local_start.hour == 0 and local_start.minute < 15)
+    )
+
+
+def _price_calendar_for_window(states, context, now, horizon):
+    try:
+        zone = context["calendar_tz"]
+        local_start = now.astimezone(zone)
+        local_end = (now + timedelta(hours=horizon + PRICE_LOOKAHEAD_HOURS)).astimezone(
+            zone
+        )
+        return (
+            _build_replay_price_calendar(states, context, now)
+            if _needs_price_calendar(local_start, local_end)
+            else None
+        )
+    except (KeyError, AttributeError, TypeError, ValueError, OverflowError):
+        return None
+
+
+def _calendar_covers_lookahead(calendar, end):
+    """Unknown following-day prices must not affect short-peak filtering."""
+    from .settings import PEAK_FILTER_MIN_DURATION_MINUTES
+
+    if not calendar.days:
+        return False
+    zone = calendar.context["calendar_tz"]
+    last_day = max(calendar.days)
+    next_day = last_day + timedelta(days=1)
+    midnight = datetime(next_day.year, next_day.month, next_day.day, tzinfo=zone)
+    # A missing next day's first expensive slot can affect the last run.
+    interval = calendar.context["interval_minutes"]
+    min_slots = max(1, math.ceil(PEAK_FILTER_MIN_DURATION_MINUTES / interval))
+    safe_end = midnight.astimezone(timezone.utc) - timedelta(
+        minutes=interval * (min_slots - 1)
+    )
+    return _timestamp(end) <= safe_end
 
 
 def _weather_intervals(rows, now, horizon_hours=2):
@@ -67,7 +286,9 @@ def _quarters(segments, now, horizon_hours=2):
     return result
 
 
-def _shared_window_is_eligible(context, now, hours, price_states, weather_rows, target):
+def _shared_window_is_eligible(
+    context, now, hours, price_states, weather_rows, target, *, price_calendar=None
+):
     """Cheap qualification before choosing a shorter shared planning horizon."""
     from .settings import HOLIDAY_TEMP
 
@@ -80,11 +301,11 @@ def _shared_window_is_eligible(context, now, hours, price_states, weather_rows, 
         price_end = end + timedelta(hours=PRICE_LOOKAHEAD_HOURS)
         zone = context["calendar_tz"]
         local_start, local_end = now.astimezone(zone), price_end.astimezone(zone)
-        if (
-            local_start.date() != local_end.date()
-            or local_start.utcoffset() != local_end.utcoffset()
-        ):
-            return False
+        if _needs_price_calendar(local_start, local_end):
+            if price_calendar is None or not _calendar_covers_lookahead(
+                price_calendar, price_end
+            ):
+                return False
         segments = price_window(
             price_states, now, timedelta(hours=hours + PRICE_LOOKAHEAD_HOURS)
         )
@@ -201,12 +422,16 @@ def hypothetical_plan(
     # Bounded beam search: at most 48 quarter-hour steps per planning run.
     max_steps = 48
     horizons = list(range(max_steps // 4, 1, -1))
+    price_calendar = None
     if (
         replay_context is not None
         and not current_domain_invalid
         and replay_context.get("inputs_qualified")
         and replay_context.get("holiday_context_known")
     ):
+        price_calendar = _price_calendar_for_window(
+            price_states, replay_context, now, max_steps // 4
+        )
         # Prefer the longest horizon for which both alternatives can be
         # evaluated using the additional forecasts the real controller uses.
         shared_horizon = next(
@@ -214,7 +439,13 @@ def hypothetical_plan(
                 hours
                 for hours in horizons
                 if _shared_window_is_eligible(
-                    replay_context, now, hours, price_states, weather_rows, target
+                    replay_context,
+                    now,
+                    hours,
+                    price_states,
+                    weather_rows,
+                    target,
+                    price_calendar=price_calendar,
                 )
             ),
             None,
@@ -331,6 +562,15 @@ def hypothetical_plan(
         else "assumed_model_and_heat_state",
         "horizon_minutes": 60 * horizon,
         "forecast_coverage": "complete_issue_time_unknown",
+        "initial_context": {
+            "indoor_temperature": indoor,
+            "outdoor_temperature": outdoor,
+            "target_temperature": target,
+            "comfort_floor": floor,
+            "comfort_ceiling": ceiling,
+            "virtual_temperature_command": command,
+            "physical_measurement_time": "unknown",
+        },
         "cost_kind": "proxy_not_currency",
         "response_status": "validated_response_only"
         if response_context is not None
@@ -368,6 +608,43 @@ def hypothetical_plan(
             "resource_cap_reached": horizon * 4 == max_steps,
         },
     }
+    if isinstance(replay_context, dict):
+        from .control import PIController
+        from .control_replay import ControlReplayState
+
+        state = replay_context.get("state")
+        if isinstance(state, ControlReplayState) and isinstance(state.pi, PIController):
+
+            def timestamp(value):
+                return (
+                    value.isoformat()
+                    if isinstance(value, datetime) and _timestamp(value) is not None
+                    else None
+                )
+
+            def number(value):
+                return (
+                    value
+                    if isinstance(value, (int, float))
+                    and not isinstance(value, bool)
+                    and math.isfinite(value)
+                    else None
+                )
+
+            result["initial_context"]["controller"] = {
+                "pi_integral": number(state.pi._integral),
+                "pi_last_error": number(state.pi._last_error),
+                "pi_last_time": timestamp(state.pi._last_time),
+                "brake_ramp": number(state.brake_ramp),
+                "brake_last_time": timestamp(state.brake_last_t),
+                "brake_last_expensive_time": timestamp(state.brake_last_expensive_t),
+                "preheat_ramp": number(state.preheat_ramp),
+                "preheat_last_time": timestamp(state.preheat_last_t),
+                "pi_precool_paused": state.pi_precool_paused,
+                "previous_aggressiveness": state.prev_aggressiveness,
+                "was_braking_last_cycle": state.was_braking_last_cycle,
+                "bridge_short_dip_active": state.bridge_short_dip_active,
+            }
     reference = None
     if replay_context is not None and not current_domain_invalid:
         reference = _shared_control_reference(
@@ -393,6 +670,7 @@ def hypothetical_plan(
             offset=output_clamp,
             house_scope=house_context if validated else None,
             response_scope=response_scope if validated else None,
+            price_calendar=price_calendar,
         )
         if reference is None:
             longer_horizon = next(
@@ -453,7 +731,30 @@ def hypothetical_plan(
             result["comparison"]["shared_control_reason"] = (
                 "context_or_forecast_coverage_unavailable"
             )
+            try:
+                zone = replay_context["calendar_tz"]
+                local_start = now.astimezone(zone)
+                local_end = (
+                    now + timedelta(hours=horizon + PRICE_LOOKAHEAD_HOURS)
+                ).astimezone(zone)
+                if _needs_price_calendar(local_start, local_end):
+                    result["comparison"]["shared_control_reason"] = (
+                        "published_price_day_or_cache_unavailable"
+                        if price_calendar is None
+                        else "price_lookahead_not_fully_qualified"
+                        if not _calendar_covers_lookahead(
+                            price_calendar,
+                            now + timedelta(hours=horizon + PRICE_LOOKAHEAD_HOURS),
+                        )
+                        else result["comparison"]["shared_control_reason"]
+                    )
+            except (KeyError, TypeError, ValueError, OverflowError):
+                pass
         else:
+            if price_calendar is not None:
+                reference["price_publication_assumption"] = (
+                    "frozen_intervals_available_as_today_not_verified_future_ha"
+                )
             result["comparison"].update(reference)
             result["comparison"]["shared_control_status"] = "available"
     elif replay_context is not None:
@@ -772,6 +1073,7 @@ def _shared_control_reference(
     offset,
     house_scope=None,
     response_scope=None,
+    price_calendar=None,
 ):
     """Replay the shared controller each minute and the Pilot model each quarter.
 
@@ -823,8 +1125,13 @@ def _shared_control_reference(
         if not math.isclose(target, expected_target, abs_tol=1e-9):
             return None
         if (
-            local_start.date() != price_end.astimezone(zone).date()
-            or local_start.utcoffset() != price_end.astimezone(zone).utcoffset()
+            (
+                _needs_price_calendar(local_start, price_end.astimezone(zone))
+                and (
+                    price_calendar is None
+                    or not _calendar_covers_lookahead(price_calendar, price_end)
+                )
+            )
             or not control_price_segments
             or control_price_segments[0][0] != now
             or control_price_segments[-1][1] != price_end
@@ -943,9 +1250,17 @@ def _shared_control_reference(
                         forecast = forecast_at(tick)
                         if forecast is None:
                             return None
-                        current_slot = slot + math.floor(
-                            (seconds_into + elapsed * 60) / (interval * 60)
-                        )
+                        if price_calendar is None:
+                            current_slot = slot + math.floor(
+                                (seconds_into + elapsed * 60) / (interval * 60)
+                            )
+                            active_categories = categories
+                        else:
+                            snapshot = price_calendar.at(tick)
+                            if snapshot is None:
+                                return None
+                            current_slot = snapshot.slot
+                            active_categories = snapshot.categories
                         inputs = ControlReplayInput(
                             now=tick.astimezone(zone),
                             cfg=context["cfg"],
@@ -955,7 +1270,7 @@ def _shared_control_reference(
                             summer_threshold=context["summer_threshold"],
                             aggressiveness=context["aggressiveness"],
                             holiday=holiday_at(tick),
-                            categories=categories,
+                            categories=active_categories,
                             current_slot=current_slot,
                             interval_minutes=interval,
                             house_inertia=context["house_inertia"],

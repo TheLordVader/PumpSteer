@@ -139,9 +139,17 @@ def test_real_cycle_invalidates_cached_reference_on_control_context_change(
     assert len(calls) == 1
 
     unchanged = cycle(1)
-    assert (
-        unchanged["thermal_intelligence_planning_status"] == "hypothetical_unvalidated"
-    )
+    assert unchanged["thermal_intelligence_planning_status"] == "unavailable"
+    previous_plan = unchanged["thermal_intelligence_plan_detail"]["comparison"][
+        "historical_reference"
+    ]["pilot_plan"]
+    initial_plan = initial["thermal_intelligence_plan_detail"]
+    for key in ("planning_status", "horizon_minutes", "temperatures", "duties"):
+        assert previous_plan[key] == initial_plan[key]
+    assert previous_plan["assumed_model"] == initial_plan["assumed_model"]
+    assert previous_plan["initial_context"] == initial_plan["initial_context"]
+    assert previous_plan["initial_context"]["target_temperature"] == 21
+    assert previous_plan["outcome_evaluation"] == "not_evaluated"
     assert sensor.state == initial_output
     assert len(calls) == 1
 
@@ -153,6 +161,22 @@ def test_real_cycle_invalidates_cached_reference_on_control_context_change(
     assert changed["thermal_intelligence_planning_status"] == "unavailable"
     assert changed["thermal_intelligence_plan_detail"]["reason"] == (
         "context_changed_waiting_for_replan"
+    )
+    historical = changed["thermal_intelligence_plan_detail"]["comparison"][
+        "historical_reference"
+    ]
+    assert historical["status"] == "historical"
+    assert historical["baseline"] == "shared_control_passive"
+    assert (
+        historical["forecast_start"]
+        == initial["thermal_intelligence_plan_detail"]["forecast_start"]
+    )
+    assert (
+        historical["issued_at"]
+        == initial["thermal_intelligence_plan_detail"]["issued_at"]
+    )
+    assert (
+        historical["pilot_plan"]["initial_context"] == initial_plan["initial_context"]
     )
     assert len(calls) == 1
 
@@ -209,3 +233,80 @@ def test_changed_brake_ramp_invalidates_reference_even_when_output_matches(monke
     assert comparison["baseline"] == "unavailable"
     assert comparison["baseline_reason"] == "control_state_changed_waiting_for_replan"
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize("failure", ["weather", "indoor"])
+def test_interruption_preserves_reference_as_historical_not_current(
+    monkeypatch, failure
+):
+    sensor, states, calls = _ready_sensor(monkeypatch)
+    initial = _cycle(sensor, monkeypatch, 0)["thermal_intelligence_plan_detail"]
+    assert initial["comparison"]["baseline"] == "shared_control_passive"
+    states[
+        "weather.local" if failure == "weather" else "sensor.indoor"
+    ].state = "unavailable"
+    result = _cycle(sensor, monkeypatch, 1)["thermal_intelligence_plan_detail"]
+    assert result["planning_status"] == "unavailable"
+    comparison = result["comparison"]
+    assert comparison["baseline"] == "unavailable"
+    historical = comparison["historical_reference"]
+    assert historical["status"] == "historical"
+    assert historical["forecast_start"] == initial["forecast_start"]
+    assert historical["issued_at"] == initial["issued_at"]
+    for key in ("planning_status", "horizon_minutes", "temperatures", "duties"):
+        assert historical["pilot_plan"][key] == initial[key]
+    assert historical["pilot_plan"]["outcome_evaluation"] == "not_evaluated"
+    assert len(calls) == 1
+
+
+def test_options_change_preserves_reference_only_as_historical(monkeypatch):
+    import asyncio
+
+    sensor, _, calls = _ready_sensor(monkeypatch)
+    initial = _cycle(sensor, monkeypatch, 0)["thermal_intelligence_plan_detail"]
+
+    async def no_update(*args):
+        pass
+
+    monkeypatch.setattr(sensor, "async_update", no_update)
+    monkeypatch.setattr(sensor, "_load_pilot_store", no_update)
+    sensor._config_entry.options["target_temperature"] = 22
+    asyncio.run(sensor.async_options_update_listener(sensor.hass, sensor._config_entry))
+    result = sensor.extra_state_attributes["thermal_intelligence_plan_detail"]
+    assert result["reason"] == "options_changed"
+    assert result["planning_status"] == "unavailable"
+    assert result["comparison"]["baseline"] == "unavailable"
+    historical = result["comparison"]["historical_reference"]
+    assert historical["status"] == "historical"
+    assert historical["issued_at"] == initial["issued_at"]
+    assert historical["pilot_plan"]["initial_context"]["target_temperature"] == 21
+    assert len(calls) == 1
+
+
+def test_price_threshold_change_invalidates_current_plan_even_if_prices_unchanged(
+    monkeypatch,
+):
+    sensor, _, calls = _ready_sensor(monkeypatch)
+    initial = _cycle(sensor, monkeypatch, 0)["thermal_intelligence_plan_detail"]
+    assert initial["comparison"]["baseline"] == "shared_control_passive"
+    sensor._cached_p30 -= 0.5
+    result = _cycle(sensor, monkeypatch, 1)["thermal_intelligence_plan_detail"]
+    assert result["planning_status"] == "unavailable"
+    assert result["reason"] == "context_changed_waiting_for_replan"
+    assert (
+        result["comparison"]["historical_reference"]["issued_at"]
+        == initial["issued_at"]
+    )
+    assert len(calls) == 1
+
+
+def test_pilot_plan_without_pi_reference_is_also_kept_as_history(monkeypatch):
+    sensor, _, _ = _ready_sensor(monkeypatch)
+    initial = _cycle(sensor, monkeypatch, 0)["thermal_intelligence_plan_detail"]
+    sensor._pilot_plan["comparison"]["baseline"] = "unavailable"
+    result = _cycle(sensor, monkeypatch, 1)["thermal_intelligence_plan_detail"]
+    assert result["planning_status"] == "unavailable"
+    historical = result["comparison"]["historical_reference"]
+    assert historical["status"] == "historical"
+    assert historical["pilot_plan"]["temperatures"] == initial["temperatures"]
+    assert historical["pilot_plan"]["outcome_evaluation"] == "not_evaluated"
