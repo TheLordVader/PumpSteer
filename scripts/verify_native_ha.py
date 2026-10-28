@@ -248,6 +248,12 @@ async def test_native_running_cycles_and_real_store(
             ),
             {"entity": entity.entity_id},
         ).fetchall()
+    assert rows
+    assert any(
+        json.loads(row[0]).get("thermal_intelligence_planning_status")
+        == "hypothetical_unvalidated"
+        for row in rows
+    )
     assert all(
         not {"thermal_intelligence_plan_detail", "thermal_intelligence_plan_outcomes"}
         & json.loads(row[0]).keys()
