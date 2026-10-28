@@ -36,6 +36,42 @@ def issue(
     )
 
 
+def test_large_passive_diagnostics_remain_visible_but_are_not_recorded():
+    from test_brake_provenance import _sensor
+
+    sensor, _ = _sensor()
+    sensor._config_entry.options["thermal_intelligence_enabled"] = True
+    sensor._pilot_plan = {
+        "planning_status": "hypothetical_unvalidated",
+        "temperatures": [20.0] * 9,
+    }
+    assert issue(sensor._plan_audit)
+    attrs = sensor.extra_state_attributes
+    assert attrs["thermal_intelligence_plan_detail"]["temperatures"] == [20.0] * 9
+    assert "thermal_intelligence_plan_outcomes" in attrs
+    assert {
+        "thermal_intelligence_plan_detail",
+        "thermal_intelligence_plan_outcomes",
+    } <= sensor._unrecorded_attributes
+    assert "mode" not in sensor._unrecorded_attributes
+
+
+def test_unexecuted_plan_residuals_never_degrade_conditional_model():
+    audit = ForecastAudit()
+    for index in range(5):
+        start = START + timedelta(hours=3 * index)
+        assert issue(audit, at=start, revision="same-model")
+        for minute in range(1, 121):
+            now = start + timedelta(minutes=minute)
+            audit.observe_plan(now, reading(18.0, now), "sensor.indoor", (None, None))
+    assert len(audit.plan_records) == 15
+    assert audit.plan_summary()["horizons_minutes"]["30"]["mae"] > 1
+    assert audit.summary("same-model") == {
+        "count": 0,
+        "status": "insufficient_outcomes",
+    }
+
+
 def test_issued_context_is_frozen_and_preserved_in_store_after_settings_change():
     context = {
         "indoor_temperature": 20.0,

@@ -110,6 +110,13 @@ class PumpSteerSensor(RestoreEntity):
         normal       -> PI regulates fake temp toward target
     """
 
+    # Keep detailed, potentially large passive plans visible in HA without
+    # duplicating them in Recorder on every controller state update. Qualified
+    # outcome evidence is persisted separately in the bounded HA Store.
+    _unrecorded_attributes = frozenset(
+        {"thermal_intelligence_plan_detail", "thermal_intelligence_plan_outcomes"}
+    )
+
     def __init__(self, hass: HomeAssistant, config_entry: ConfigEntry):
         self.hass = hass
         self._config_entry = config_entry
