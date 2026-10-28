@@ -156,6 +156,8 @@ class PumpSteerSensor(RestoreEntity):
         self._pilot_detection_after = None
         self._pilot_heat_source = "unavailable"
         self._pilot_status = "heat_signal_not_configured"
+        self._pilot_operating_mode = "unknown"
+        self._pilot_operating_quality = "insufficient_evidence"
         self._pilot_price_available = False
         self._pilot_forecast_available = False
         self._pilot_price_forecast = False
@@ -273,11 +275,21 @@ class PumpSteerSensor(RestoreEntity):
             "thermal_intelligence_electrical",
             "thermal_intelligence_heat_source",
             "thermal_intelligence_response",
+            "thermal_intelligence_operating_mode",
+            "thermal_intelligence_operating_quality",
         ):
             attrs.pop(key, None)
         if self._cfg().get("thermal_intelligence_enabled") is True:
             interrupted = (
                 attrs.get("mode") == MODE_SAFE or attrs.get("status") == "error"
+            )
+            attrs["thermal_intelligence_operating_mode"] = (
+                "unknown" if interrupted else self._pilot_operating_mode
+            )
+            attrs["thermal_intelligence_operating_quality"] = (
+                "insufficient_evidence"
+                if interrupted
+                else self._pilot_operating_quality
             )
             attrs["thermal_intelligence_status"] = (
                 "suspended_safe"
@@ -3500,6 +3512,8 @@ class PumpSteerSensor(RestoreEntity):
 
     def _observe_pilot(self, cfg, now, mode):
         """Passive learning from explicitly selected delivered-house-heat state."""
+        self._pilot_operating_mode = "unknown"
+        self._pilot_operating_quality = "insufficient_evidence"
         if cfg.get("thermal_intelligence_enabled") is not True:
             self._pilot = None
             self._pilot_sources = None
@@ -3581,6 +3595,25 @@ class PumpSteerSensor(RestoreEntity):
         if not use_supply and (
             not isinstance(source, str) or not source.startswith("binary_sensor.")
         ):
+            if hot_water_mode:
+                from .pilot_forecast import _timestamp
+                from .pilot_passive import PilotPassive
+
+                state = self.hass.states.get(hot_water_mode)
+                report = PilotPassive._report(
+                    state, now, reported_after=self._temperature_reported_after
+                )
+                changed = _timestamp(getattr(state, "last_changed", None))
+                if (
+                    report is not None
+                    and changed is not None
+                    and changed <= _timestamp(report[0])
+                    and report[1] == 1.0
+                ):
+                    self._pilot_operating_mode = "hot_water"
+                    self._pilot_operating_quality = (
+                        "reported_mode_not_physical_confirmation"
+                    )
             self._pilot_status = "heat_signal_not_configured"
             return
         try:
@@ -3656,6 +3689,27 @@ class PumpSteerSensor(RestoreEntity):
                         attributes={},
                     )
                 )
+            if hot_water_status == "hot_water_active":
+                self._pilot_operating_mode = "hot_water"
+                self._pilot_operating_quality = (
+                    "reported_mode_not_physical_confirmation"
+                )
+            elif hot_water_status is None and heat_state is not None:
+                from .pilot_passive import PilotPassive
+
+                observation = PilotPassive._report(
+                    heat_state, now, reported_after=self._temperature_reported_after
+                )
+                if observation is not None:
+                    if observation[1]:
+                        self._pilot_operating_mode = "radiator_heating"
+                        self._pilot_operating_quality = (
+                            "heat_indicator_not_measured_output"
+                        )
+                    else:
+                        self._pilot_operating_quality = (
+                            "no_heat_detected_idle_unverified"
+                        )
             if self._pilot is None:
                 from .pilot_passive import PilotPassive
 
@@ -3722,6 +3776,8 @@ class PumpSteerSensor(RestoreEntity):
             _LOGGER.exception(
                 "Passive thermal intelligence failed; standard control continues"
             )
+            self._pilot_operating_mode = "unknown"
+            self._pilot_operating_quality = "insufficient_evidence"
             self._pilot = None
             self._pilot_status = "learning_error"
 
@@ -3846,6 +3902,12 @@ class PumpSteerThermalStatusSensor(SensorEntity):
             "plan_reason": plan.get("reason") if enabled else None,
             "price_forecast": attrs.get("thermal_intelligence_price_forecast"),
             "heat_source": attrs.get("thermal_intelligence_heat_source"),
+            "operating_mode": attrs.get(
+                "thermal_intelligence_operating_mode", "unknown"
+            ),
+            "operating_quality": attrs.get(
+                "thermal_intelligence_operating_quality", "insufficient_evidence"
+            ),
             "heat_entity": cfg.get("thermal_heat_activity_entity")
             or cfg.get("thermal_supply_temp_entity"),
             "radiator_mode_entity": cfg.get("thermal_heating_mode_entity"),

@@ -500,15 +500,75 @@ def test_supply_accepts_explicit_inverted_radiator_mode(monkeypatch):
         )
         attrs = _cycle(sensor, monkeypatch, minute)
     assert attrs["thermal_intelligence_learning_intervals"] == 1
+    assert attrs["thermal_intelligence_operating_mode"] == "radiator_heating"
+    assert (
+        attrs["thermal_intelligence_operating_quality"]
+        == "heat_indicator_not_measured_output"
+    )
     states["binary_sensor.valve"].state = "on"
     attrs = _cycle(sensor, monkeypatch, 66)
     assert attrs["thermal_intelligence_status"] == "hot_water_active"
+    assert attrs["thermal_intelligence_operating_mode"] == "hot_water"
     states["binary_sensor.valve"].state = "unknown"
     attrs = _cycle(sensor, monkeypatch, 67)
     assert attrs["thermal_intelligence_status"] == "hot_water_mode_unavailable"
+    assert attrs["thermal_intelligence_operating_mode"] == "unknown"
     states["binary_sensor.valve"].state = "off"
     attrs = _cycle(sensor, monkeypatch, 72)
     assert attrs["thermal_intelligence_status"] == "hot_water_mode_unavailable"
+    assert attrs["thermal_intelligence_operating_mode"] == "unknown"
+
+
+def test_cold_supply_is_an_indicator_not_proof_of_pump_idle(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    sensor, states = _sensor()
+    sensor._config_entry.options.update(
+        thermal_intelligence_enabled=True,
+        thermal_supply_temp_entity="sensor.supply",
+        thermal_heating_mode_entity="binary_sensor.valve",
+        thermal_heating_mode_inverted=True,
+        thermal_hot_water_mode_entity="binary_sensor.valve",
+    )
+    start = datetime(2026, 10, 11, 8, tzinfo=timezone.utc)
+    for key in ("sensor.indoor", "sensor.outdoor"):
+        states[key].attributes["unit_of_measurement"] = "°C"
+        states[key].last_changed = start
+    for minute in range(8):
+        at = start + timedelta(minutes=minute)
+        states["sensor.supply"] = SimpleNamespace(
+            state="25",
+            last_reported=at,
+            last_changed=start,
+            attributes={"unit_of_measurement": "°C"},
+        )
+        states["binary_sensor.valve"] = SimpleNamespace(
+            state="off", last_reported=start, last_changed=start, attributes={}
+        )
+        attrs = _cycle(sensor, monkeypatch, minute)
+        assert attrs["thermal_intelligence_operating_mode"] == "unknown"
+        assert attrs["thermal_intelligence_operating_quality"] == (
+            "no_heat_detected_idle_unverified"
+            if minute <= 5
+            else "insufficient_evidence"
+        )
+
+
+def test_hot_water_can_be_reported_without_a_heat_indicator(monkeypatch):
+    from datetime import datetime, timezone
+
+    sensor, states = _sensor()
+    sensor._config_entry.options.update(
+        thermal_intelligence_enabled=True,
+        thermal_hot_water_mode_entity="binary_sensor.hot_water",
+    )
+    start = datetime(2026, 10, 11, 8, tzinfo=timezone.utc)
+    states["binary_sensor.hot_water"] = SimpleNamespace(
+        state="on", last_reported=start, last_changed=start, attributes={}
+    )
+    attrs = _cycle(sensor, monkeypatch, 0)
+    assert attrs["thermal_intelligence_operating_mode"] == "hot_water"
+    assert attrs["thermal_intelligence_status"] == "heat_signal_not_configured"
 
 
 def test_options_offer_supply_mode_and_threshold(monkeypatch):

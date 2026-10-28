@@ -23,6 +23,7 @@ def test_status_and_no_duplicate_writes():
     ent._async_update_from_controller()
     assert ent.native_value == "waiting"
     assert ent.extra_state_attributes["passive"] is True
+    assert ent.extra_state_attributes["operating_mode"] == "unknown"
     ent._async_update_from_controller()
     assert len(calls) == 2
     control._pilot_plan = {
