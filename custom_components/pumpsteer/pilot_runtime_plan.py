@@ -1087,6 +1087,22 @@ def _known_fallback_conflict(context, now, horizon, weather_rows, summer_thresho
     return False
 
 
+def _economic_intervals_aligned(rows, now, count):
+    """Compare actual instants, including repeated local hours."""
+    try:
+        if now.tzinfo is None or not isinstance(rows, list) or len(rows) != count:
+            return False
+        start = _timestamp(now)
+        return all(
+            _timestamp(row["issued_at"]) <= start < _timestamp(row["valid_until"])
+            and _timestamp(row["start"]) == start + timedelta(minutes=15 * i)
+            and _timestamp(row["end"]) == start + timedelta(minutes=15 * (i + 1))
+            for i, row in enumerate(rows)
+        )
+    except (KeyError, TypeError, AttributeError, OverflowError):
+        return False
+
+
 def _shared_control_reference(
     *,
     context,
@@ -1401,7 +1417,19 @@ def _shared_control_reference(
             ),
             None,
         )
+        # Optional electrical trajectories are supplied independently of the
+        # thermal heat fractions; the latter are not electrical kilowatts.
+        economic = None
+        rows = context.get("economic_forecasts")
+        if rows is not None:
+            from .pilot_marginal import compare_costs
+
+            if _economic_intervals_aligned(rows, now, len(prices)):
+                economic = compare_costs(rows)
+            else:
+                economic = {"status": "unavailable", "saving_verified": False}
         return {
+            "external_economic_scenario": economic,
             "baseline": "shared_control_passive",
             "control_step_seconds": 60,
             "thermal_step_seconds": 900,

@@ -704,3 +704,37 @@ def test_complete_cycle_reports_terminal_and_comfort_deficits_without_free_stora
     corrupted["pilot_temperatures"][0] += 1
     with pytest.raises(AssertionError):
         _assert_complete_comparison(corrupted, values["indoor"])
+
+
+def test_replay_accepts_only_aligned_external_electrical_cost_forecasts():
+    values = args()
+    rows = [
+        {
+            "issued_at": NOW,
+            "valid_until": NOW + timedelta(hours=1),
+            "start": NOW + timedelta(minutes=15 * i),
+            "end": NOW + timedelta(minutes=15 * (i + 1)),
+            "baseline_kw": 2.0,
+            "pilot_kw": 1.0,
+            "surplus_kw": 0.5,
+            "import_price": 1.0,
+            "export_price": 0.2,
+            "battery_dispatch": "none",
+            "peak_fee": "none",
+            "currency": "SEK/kWh",
+        }
+        for i in range(8)
+    ]
+    values["context"]["economic_forecasts"] = rows
+    result = _shared_control_reference(**values)
+    assert result["external_economic_scenario"]["status"] == "estimated"
+    assert (
+        result["external_economic_scenario"]["pilot_cost"]
+        < result["external_economic_scenario"]["baseline_cost"]
+    )
+    assert result["external_economic_scenario"]["saving_verified"] is False
+    rows[0]["start"] += timedelta(minutes=1)
+    assert (
+        _shared_control_reference(**values)["external_economic_scenario"]["status"]
+        == "unavailable"
+    )
