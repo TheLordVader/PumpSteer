@@ -124,6 +124,10 @@ async def test_native_running_cycles_and_real_store(
         "aggressiveness": 0,
         "house_inertia": 2,
         "thermal_intelligence_enabled": False,
+        "thermal_supply_temp_entity": "sensor.test_supply",
+        "thermal_heating_mode_entity": "binary_sensor.test_valve",
+        "thermal_heating_mode_inverted": True,
+        "thermal_hot_water_mode_entity": "binary_sensor.test_valve",
     }
     entry = MockConfigEntry(domain="pumpsteer", title="test", data={}, options=options)
     entry.add_to_hass(hass)
@@ -146,10 +150,17 @@ async def test_native_running_cycles_and_real_store(
     )
     hass.states.async_set("sensor.test_indoor", "20.5", {"unit_of_measurement": "°C"})
     hass.states.async_set("sensor.test_outdoor", "5", {"unit_of_measurement": "°C"})
+    hass.states.async_set("binary_sensor.test_valve", "off")
+    hass.states.async_set("sensor.test_supply", "35", {"unit_of_measurement": "°C"})
     hass.states.async_set(
         "sensor.test_price",
         "1",
-        {"today": [1.0] * 96, "raw_today": raw, "unit_of_measurement": "SEK/kWh"},
+        {
+            "today": [1.0] * 96,
+            "raw_today": raw,
+            "prices": [{"start": midnight.isoformat(), "value": 1.0}],
+            "unit_of_measurement": "SEK/kWh",
+        },
     )
     hass.states.async_set(
         "sensor.test_tomorrow",
@@ -195,6 +206,7 @@ async def test_native_running_cycles_and_real_store(
         round((time.process_time() - cpu_started) * 1000, 1),
     )
     assert entity._pilot_plan.get("planning_status") == "hypothetical_unvalidated"
+    assert entity._pilot_heat_source == "supply_temperature_indicator"
     assert entity._plan_audit.plan_pending
     entity.async_write_ha_state()
     current = hass.states.get(entity.entity_id)
@@ -271,6 +283,9 @@ async def test_native_running_cycles_and_real_store(
     )
     assert counts["store_writes"] == 1
     assert all(domain not in {"number", "switch"} for domain, _ in calls)
+    hass.states.async_set("binary_sensor.test_valve", "on")
+    await entity.async_update()
+    assert entity._pilot_status == "hot_water_active"
     hass.states.async_set("sensor.test_indoor", "unavailable")
     await entity.async_update()
     assert entity.extra_state_attributes["mode"] == "safe_mode"
@@ -301,6 +316,35 @@ async def test_native_running_cycles_and_real_store(
     assert counts["optimize"] == before
     assert "thermal_intelligence_plan_detail" not in restored.extra_state_attributes
     assert all(domain not in {"number", "switch"} for domain, _ in calls)
+
+
+async def test_native_supply_detector_uses_heating_mode_and_refuses_hot_water(
+    hass, freezer
+):
+    from custom_components.pumpsteer.pilot_passive import SupplyHeatDetector
+
+    freezer.move_to("2026-10-20 10:00:00+00:00")
+    await hass.async_start()
+    hass.states.async_set("binary_sensor.radiator_mode", "on")
+    hass.states.async_set("sensor.supply", "35", {"unit_of_measurement": "°C"})
+    detector = SupplyHeatDetector()
+    assert (
+        detector.observe(
+            dt_util.utcnow(),
+            hass.states.get("sensor.supply"),
+            hass.states.get("binary_sensor.radiator_mode"),
+        )
+        is True
+    )
+    hass.states.async_set("binary_sensor.radiator_mode", "off")
+    assert (
+        detector.observe(
+            dt_util.utcnow(),
+            hass.states.get("sensor.supply"),
+            hass.states.get("binary_sensor.radiator_mode"),
+        )
+        is None
+    )
 
 
 async def test_native_power_events_estimate_energy_and_price(

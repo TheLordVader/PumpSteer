@@ -80,7 +80,7 @@ class _ReplayPriceCalendar:
 
 def _build_replay_price_calendar(price_states, context, now):
     """Qualify full original timestamped days, never invent future prices."""
-    from .pilot_forecast import source_is_current
+    from .pilot_forecast import price_series_names, source_is_current
     from .sensor import PumpSteerSensor
 
     try:
@@ -113,7 +113,7 @@ def _build_replay_price_calendar(price_states, context, now):
             ):
                 return None
             unit = current_unit
-            for name in ("raw_today", "raw_tomorrow", "prices", "forecast"):
+            for name in price_series_names(attrs):
                 entries = attrs.get(name, [])
                 if not isinstance(entries, list) or len(entries) > 192:
                     return None

@@ -2434,6 +2434,23 @@ class PumpSteerSensor(RestoreEntity):
         self._power_signature = None
         self._power_last_report = None
 
+    def _heating_mode_state(self, cfg):
+        """Interpret the configured polarity without changing report timestamps."""
+        from types import SimpleNamespace
+
+        entity_id = cfg.get("thermal_heating_mode_entity")
+        state = self.hass.states.get(entity_id) if entity_id else None
+        if cfg.get("thermal_heating_mode_inverted") is not True or getattr(
+            state, "state", None
+        ) not in ("on", "off"):
+            return state
+        return SimpleNamespace(
+            state="off" if state.state == "on" else "on",
+            last_reported=getattr(state, "last_reported", None),
+            last_changed=getattr(state, "last_changed", None),
+            attributes=getattr(state, "attributes", {}),
+        )
+
     def _record_power_snapshot(self, when):
         """Read existing HA in-memory states; preserve their actual report times."""
         cfg = self._cfg()
@@ -2446,9 +2463,7 @@ class PumpSteerSensor(RestoreEntity):
             self._power_ledger.observe(
                 when,
                 power,
-                self.hass.states.get(cfg.get("thermal_heating_mode_entity"))
-                if cfg.get("thermal_heating_mode_entity")
-                else None,
+                self._heating_mode_state(cfg),
                 self.hass.states.get(cfg.get("thermal_hot_water_mode_entity"))
                 if cfg.get("thermal_hot_water_mode_entity")
                 else None,
@@ -2519,7 +2534,8 @@ class PumpSteerSensor(RestoreEntity):
             "electricity_price_entity",
             "price_tomorrow_entity",
         )
-        signature = tuple(cfg.get(key) for key in keys)
+        entities = tuple(cfg.get(key) for key in keys)
+        signature = entities + (cfg.get("thermal_heating_mode_inverted") is True,)
         if (
             cfg.get("thermal_intelligence_enabled") is True
             and self._power_signature == signature
@@ -2539,7 +2555,7 @@ class PumpSteerSensor(RestoreEntity):
 
         self._power_signature = signature
         self._power_ledger = PowerLedger(started_after=dt_util.now())
-        entity_ids = list(dict.fromkeys(value for value in signature if value))
+        entity_ids = list(dict.fromkeys(value for value in entities if value))
 
         @callback
         def changed(event):
@@ -3511,7 +3527,11 @@ class PumpSteerSensor(RestoreEntity):
             cfg.get("external_heat_sources") is True,
         )
         if use_supply:
-            signature += (radiator_mode, threshold)
+            signature += (
+                radiator_mode,
+                threshold,
+                cfg.get("thermal_heating_mode_inverted") is True,
+            )
         if hot_water_mode:
             signature += ("hot_water_mode", hot_water_mode)
         signature += (
@@ -3596,7 +3616,7 @@ class PumpSteerSensor(RestoreEntity):
                 detected = self._pilot_detector.observe(
                     now,
                     heat_state,
-                    self.hass.states.get(radiator_mode),
+                    self._heating_mode_state(cfg),
                     reported_after=after,
                 )
                 heat_state = (

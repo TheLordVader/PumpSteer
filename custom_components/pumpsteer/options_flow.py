@@ -132,6 +132,12 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
                         },
                     ): selector({"entity": {"domain": "binary_sensor"}}),
                     vol.Optional(
+                        "thermal_heating_mode_inverted",
+                        default=current_data.get(
+                            "thermal_heating_mode_inverted", False
+                        ),
+                    ): selector({"boolean": {}}),
+                    vol.Optional(
                         "thermal_supply_threshold",
                         default=current_data.get("thermal_supply_threshold", 30),
                     ): selector(

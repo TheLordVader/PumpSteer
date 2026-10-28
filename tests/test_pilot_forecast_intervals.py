@@ -90,3 +90,19 @@ def test_parallel_undated_price_list_does_not_mask_timestamped_intervals():
     state = make_state(rows)
     state.attributes["prices"] = [1.0] * 8
     assert len(price_window([state], T, timedelta(hours=2))) == 8
+
+
+def test_incomplete_hourly_view_does_not_hide_complete_raw_quarters():
+    rows = [row(T + timedelta(minutes=15 * i), 15, i) for i in range(8)]
+    state = make_state(rows[:4])
+    state.attributes["raw_tomorrow"] = rows[4:]
+    state.attributes["prices"] = [{"start": T.isoformat(), "value": 2.0}]
+    result = price_window([state], T, timedelta(hours=2))
+    assert result is not None and [item[2] for item in result] == list(range(8))
+
+
+def test_incomplete_raw_cannot_be_patched_by_parallel_hourly_view():
+    rows = [row(T + timedelta(minutes=15 * i), 15, i) for i in range(8)]
+    state = make_state(rows[:3] + rows[4:])
+    state.attributes["prices"] = [row(T + timedelta(hours=i), 60, i) for i in range(2)]
+    assert price_window([state], T, timedelta(hours=2)) is None

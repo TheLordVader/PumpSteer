@@ -34,6 +34,13 @@ def source_is_current(state, now):
     )
 
 
+def price_series_names(attrs):
+    """Choose one coherent series, keeping raw quarter hours ahead of summaries."""
+    if attrs.get("raw_today") or attrs.get("raw_tomorrow"):
+        return ("raw_today", "raw_tomorrow")
+    return ("prices", "forecast")
+
+
 def price_window(states, now, horizon):
     """Return genuine contiguous clipped intervals, or None for any ambiguity."""
     now = _timestamp(now)
@@ -64,7 +71,9 @@ def price_window(states, now, horizon):
         ):
             return None
         unit = current_unit
-        for name in ("raw_today", "raw_tomorrow", "prices", "forecast"):
+        # A raw series is one coherent source; a parallel hourly summary may
+        # omit end times or overlap its quarters and must not corrupt it.
+        for name in price_series_names(attrs):
             entries = attrs.get(name, [])
             if not isinstance(entries, list) or len(entries) > 192:
                 return None

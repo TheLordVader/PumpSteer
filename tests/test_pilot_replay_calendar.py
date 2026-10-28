@@ -58,6 +58,9 @@ def test_calendar_matches_real_live_cache_and_slots_across_dst(day, minutes):
     rows_today, rows_next = _rows(day, minutes), _rows(tomorrow, minutes, 3)
     issue = datetime(day.year, day.month, day.day, 23, 45, tzinfo=ZONE)
     states["sensor.price"] = _state(rows_today, rows_next, issue)
+    states["sensor.price"].attributes["prices"] = [
+        {"start": issue.isoformat(), "value": 1.0}
+    ]
     cfg = sensor._cfg()
     live_prices, categories, interval, slot = asyncio.run(
         sensor._get_prices(cfg, issue)

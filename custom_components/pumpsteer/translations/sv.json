@@ -46,6 +46,7 @@
           "thermal_heat_activity_entity": "Verifierad värmetillförsel till huset (valfri)",
           "thermal_supply_temp_entity": "Framledning till radiatorer (valfri)",
           "thermal_heating_mode_entity": "Verifierat radiatorvärmeläge (valfri)",
+          "thermal_heating_mode_inverted": "Radiatorläge motsvarar av",
           "thermal_supply_threshold": "Framledningens indikationströskel",
           "thermal_power_entity": "Värmepumpens eleffekt (valfri)",
           "thermal_hot_water_mode_entity": "Verifierat varmvattenläge (valfritt)"
@@ -70,7 +71,8 @@
           "external_heat_sources": "Exempelvis braskamin eller luftvärmepump. Tillfällig extravärme kan inte identifieras säkert; inlärningsresultat förblir ovaliderade.",
           "thermal_heat_activity_entity": "En binär sensor där på betyder uppmätt värmetillförsel till huset och av betyder ingen. Kompressorstatus eller varmvattenläge räcker inte. Rapporttider bevisar inte fysisk mättid.",
           "thermal_supply_temp_entity": "Välj en givare för radiatorkretsen. Temperaturen är en indikator, inte uppmätt värmeeffekt.",
-          "thermal_heating_mode_entity": "På ska betyda radiatorvärme; av eller okänt stoppar inlärning. Krävs för framledningsindikatorn.",
+          "thermal_heating_mode_entity": "Välj ett verifierat radiatorläge. Krävs för framledningsindikatorn.",
+          "thermal_heating_mode_inverted": "Aktivera endast om av betyder radiatorläge. Okänd eller gammal status stoppar inlärning.",
           "thermal_supply_threshold": "Anpassa till värmesystemet. Fel tröskel kan ge felaktig värmeindikation.",
           "thermal_power_entity": "Uppmätt eleffekt för den utrustning som ska analyseras. Energi skattas från HA-rapporter; det är inte levererad värme.",
           "thermal_hot_water_mode_entity": "På betyder verifierad varmvattenproduktion. Värmeinlärning pausas vid på eller okänt läge; okända perioder klassas inte."

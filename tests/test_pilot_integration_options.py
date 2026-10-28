@@ -472,6 +472,45 @@ def test_supply_and_verified_heating_mode_feed_observer(monkeypatch):
     assert attrs["thermal_intelligence_status"] == "heat_signal_unavailable"
 
 
+def test_supply_accepts_explicit_inverted_radiator_mode(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    sensor, states = _sensor()
+    sensor._config_entry.options.update(
+        thermal_intelligence_enabled=True,
+        thermal_supply_temp_entity="sensor.supply",
+        thermal_heating_mode_entity="binary_sensor.valve",
+        thermal_heating_mode_inverted=True,
+        thermal_hot_water_mode_entity="binary_sensor.valve",
+    )
+    start = datetime(2026, 10, 11, 8, tzinfo=timezone.utc)
+    for key in ("sensor.indoor", "sensor.outdoor"):
+        states[key].attributes["unit_of_measurement"] = "°C"
+        states[key].last_changed = start
+    for minute in range(0, 66, 5):
+        at = start + timedelta(minutes=minute)
+        states["sensor.supply"] = SimpleNamespace(
+            state="32",
+            last_reported=at,
+            last_changed=start,
+            attributes={"unit_of_measurement": "°C"},
+        )
+        states["binary_sensor.valve"] = SimpleNamespace(
+            state="off", last_reported=at, last_changed=start, attributes={}
+        )
+        attrs = _cycle(sensor, monkeypatch, minute)
+    assert attrs["thermal_intelligence_learning_intervals"] == 1
+    states["binary_sensor.valve"].state = "on"
+    attrs = _cycle(sensor, monkeypatch, 66)
+    assert attrs["thermal_intelligence_status"] == "hot_water_active"
+    states["binary_sensor.valve"].state = "unknown"
+    attrs = _cycle(sensor, monkeypatch, 67)
+    assert attrs["thermal_intelligence_status"] == "hot_water_mode_unavailable"
+    states["binary_sensor.valve"].state = "off"
+    attrs = _cycle(sensor, monkeypatch, 72)
+    assert attrs["thermal_intelligence_status"] == "hot_water_mode_unavailable"
+
+
 def test_options_offer_supply_mode_and_threshold(monkeypatch):
     flow = options_flow.PumpSteerOptionsFlowHandler()
     flow.config_entry = SimpleNamespace(data={}, options={})
@@ -779,8 +818,73 @@ def test_power_telemetry_uses_bounded_event_subscription_and_no_new_entity(monke
     assert sensor.extra_state_attributes["thermal_intelligence_electrical"][
         "energy_kwh_estimate"
     ] == pytest.approx(1 / 12, abs=0.0001)
+    prior_ledger = sensor._power_ledger
+    sensor._config_entry.options["thermal_heating_mode_inverted"] = True
+    sensor._setup_power_telemetry()
+    assert sensor._power_ledger is not prior_ledger
+    assert prior_ledger.anchor is None
+    assert set(callbacks[-1][0]) == {
+        "sensor.power",
+        "binary_sensor.radiator",
+        "sensor.price",
+    }
     sensor._stop_power_telemetry()
-    assert unsubscribed == [True]
+    assert unsubscribed == [True, True]
+
+
+@pytest.mark.parametrize("with_water", [False, True])
+def test_inverted_valve_classifies_power_without_changing_report_times(with_water):
+    from datetime import datetime, timedelta, timezone
+    from custom_components.pumpsteer.pilot_power_ledger import PowerLedger
+
+    sensor, states = _sensor()
+    sensor._config_entry.options.update(
+        thermal_power_entity="sensor.power",
+        thermal_heating_mode_entity="binary_sensor.valve",
+        thermal_heating_mode_inverted=True,
+    )
+    if with_water:
+        sensor._config_entry.options["thermal_hot_water_mode_entity"] = (
+            "binary_sensor.valve"
+        )
+    sensor._power_ledger = PowerLedger()
+    start = datetime(2026, 10, 11, 8, tzinfo=timezone.utc)
+    for minute in (0, 1):
+        at = start + timedelta(minutes=minute)
+        states["sensor.power"] = SimpleNamespace(
+            state="1000",
+            last_reported=at,
+            last_changed=start,
+            attributes={"unit_of_measurement": "W"},
+        )
+        states["binary_sensor.valve"] = SimpleNamespace(
+            state="off", last_reported=at, last_changed=start, attributes={}
+        )
+        sensor._record_power_snapshot(at)
+    assert sensor._power_ledger.summary()[
+        "radiator_mode_kwh_estimate"
+    ] == pytest.approx(1 / 60, abs=0.0001)
+    assert states["binary_sensor.valve"].state == "off"
+    assert states["binary_sensor.valve"].last_reported == start + timedelta(minutes=1)
+    if with_water:
+        for minute in (10, 11):
+            at = start + timedelta(minutes=minute)
+            states["sensor.power"] = SimpleNamespace(
+                state="1000",
+                last_reported=at,
+                last_changed=at,
+                attributes={"unit_of_measurement": "W"},
+            )
+            states["binary_sensor.valve"] = SimpleNamespace(
+                state="on",
+                last_reported=at,
+                last_changed=start + timedelta(minutes=10),
+                attributes={},
+            )
+            sensor._record_power_snapshot(at)
+        assert sensor._power_ledger.summary()[
+            "hot_water_mode_kwh_estimate"
+        ] == pytest.approx(1 / 60, abs=0.0001)
 
 
 def test_existing_control_cycle_recovers_unchanged_ha_power_reports(monkeypatch):
