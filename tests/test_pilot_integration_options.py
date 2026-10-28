@@ -62,6 +62,22 @@ def test_disabled_is_state_identical_and_enabled_reports_honest_fallback(monkeyp
     assert candidate.state == base.state
 
 
+def test_enabled_without_weather_does_not_query_an_invalid_ha_entity(monkeypatch):
+    sensor, _ = _sensor()
+    sensor._config_entry.options["thermal_intelligence_enabled"] = True
+    get_state = sensor.hass.states.get
+
+    def strict_get(entity_id):
+        if entity_id is None:
+            raise AttributeError("Home Assistant requires an entity ID")
+        return get_state(entity_id)
+
+    sensor.hass.states.get = strict_get
+    attrs = _cycle(sensor, monkeypatch, 15)
+    assert attrs["mode"] != "safe_mode"
+    assert attrs["thermal_intelligence_plan_detail"]["reason"] != "planning_error"
+
+
 def test_safe_and_recovery_never_turn_on_assistance(monkeypatch):
     sensor, states = _sensor()
     sensor._config_entry.options["thermal_intelligence_enabled"] = True

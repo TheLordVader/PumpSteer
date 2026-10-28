@@ -137,6 +137,7 @@ class PumpSteerSensor(RestoreEntity):
 
         self._plan_audit = ForecastAudit()
         self._plan_audit_loaded = False
+        self._pilot_store_read_failed = False
         self._plan_cycle_identity = None
         self._pilot_persisted = None
         self._pilot_sources = None
@@ -285,6 +286,7 @@ class PumpSteerSensor(RestoreEntity):
                 "temperature_report_unavailable",
                 "hot_water_active",
                 "hot_water_mode_unavailable",
+                "history_unavailable",
             }:
                 reason = self._pilot_status
             elif not self._pilot_price_forecast:
@@ -509,6 +511,7 @@ class PumpSteerSensor(RestoreEntity):
             try:
                 self._plan_audit.cancel_plans("unload")
                 await self._save_pilot_store()
+                await self._flush_pilot_store()
             except Exception:
                 _LOGGER.exception("Passive plan audit cleanup failed")
         self._stop_power_telemetry()
@@ -529,6 +532,8 @@ class PumpSteerSensor(RestoreEntity):
             try:
                 self._plan_audit.cancel_plans("disabled")
                 await self._save_pilot_store()
+                await self._flush_pilot_store()
+                self._pilot_store = None
             except Exception:
                 _LOGGER.exception("Passive plan audit cleanup failed")
         self._setup_power_telemetry()
@@ -2314,6 +2319,8 @@ class PumpSteerSensor(RestoreEntity):
         )
         if cfg.get("thermal_intelligence_enabled") is True:
             try:
+                if self._pilot_store_read_failed:
+                    await self._load_pilot_store()
                 if self._temperature_inputs_match(cfg, expected):
                     self._observe_plan_outcomes(cfg, dt_util.now())
                     sample = self._observe_pilot(cfg, now, mode)
@@ -2566,16 +2573,43 @@ class PumpSteerSensor(RestoreEntity):
                 self._pilot_store = Store(
                     self.hass, 1, f"pumpsteer.pilot.{self._config_entry.entry_id}"
                 )
-            saved = await self._pilot_store.async_load()
+            try:
+                saved = await self._pilot_store.async_load()
+            except Exception:
+                saved = None
+                self._pilot_store_read_failed = (
+                    self._pilot_store_read_failed or self._pilot_persisted is None
+                )
+                _LOGGER.warning(
+                    "Passive thermal history could not be read", exc_info=True
+                )
+            else:
+                self._pilot_store_read_failed = False
+                if saved is not None and (
+                    not isinstance(saved, dict) or saved.get("version") != 1
+                ):
+                    # Do not replace a payload written by an unknown version.
+                    self._pilot_store_read_failed = True
+            if self._pilot_store_read_failed:
+                return
             if isinstance(saved, dict) and saved.get("version") == 1:
                 if self._pilot_persisted is None:
                     self._pilot_persisted = saved
+            if (
+                isinstance(self._pilot_persisted, dict)
+                and self._pilot_persisted.get("version") == 1
+            ):
                 self._pilot_restore = self._pilot_persisted
                 if not self._plan_audit_loaded:
-                    self._plan_audit.restore_plan(
-                        saved.get("plan_audit"),
-                        dt_util.now(),
-                    )
+                    audit = self._plan_audit
+                    if not (
+                        audit.plan_pending
+                        or audit.plan_records
+                        or audit.plan_unverifiable
+                    ):
+                        audit.restore_plan(
+                            self._pilot_persisted.get("plan_audit"), dt_util.now()
+                        )
             self._plan_audit_loaded = True
         except Exception:
             self._pilot_restore = None
@@ -2583,10 +2617,19 @@ class PumpSteerSensor(RestoreEntity):
                 "Passive thermal history could not be restored", exc_info=True
             )
 
+    async def _flush_pilot_store(self):
+        """Finish any pending history write before this instance is discarded."""
+        if (
+            not self._pilot_store_read_failed
+            and self._pilot_store is not None
+            and self._pilot_persisted is not None
+        ):
+            await self._pilot_store.async_save(self._pilot_persisted)
+
     async def _save_pilot_store(self):
         """Save bounded model or plan evidence, only when it changes."""
         pilot = self._pilot
-        if self._pilot_store is None:
+        if self._pilot_store is None or self._pilot_store_read_failed:
             return
         model_available = pilot is not None and (
             pilot.house_intervals or pilot.manager.pump.history
@@ -2953,9 +2996,13 @@ class PumpSteerSensor(RestoreEntity):
 
     async def _plan_pilot(self, cfg, now, extra, command):
         """Run a bounded diagnostic only; it never changes the control output."""
+        if self._pilot_store_read_failed:
+            self._pilot_plan = self._unavailable_pilot_plan("history_unavailable")
+            return
         price_id = cfg.get("electricity_price_entity")
         tomorrow_id = cfg.get("price_tomorrow_entity")
-        weather_state = self.hass.states.get(cfg.get("weather_entity"))
+        weather_id = cfg.get("weather_entity")
+        weather_state = self.hass.states.get(weather_id) if weather_id else None
         weather_attrs = getattr(weather_state, "attributes", {}) or {}
         unit = weather_attrs.get("temperature_unit")
         if getattr(weather_state, "state", None) in (None, "unknown", "unavailable"):
@@ -2966,7 +3013,7 @@ class PumpSteerSensor(RestoreEntity):
         if not source_is_current(weather_state, now):
             unit = None
 
-        price_state = self.hass.states.get(price_id)
+        price_state = self.hass.states.get(price_id) if price_id else None
         tomorrow_state = (
             self.hass.states.get(tomorrow_id)
             if tomorrow_id and tomorrow_id != price_id
@@ -3414,6 +3461,9 @@ class PumpSteerSensor(RestoreEntity):
             self._pilot = None
             self._pilot_sources = None
             return
+        if self._pilot_store_read_failed:
+            self._pilot_status = "history_unavailable"
+            return None
         price_state = self.hass.states.get(cfg.get("electricity_price_entity"))
         from .pilot_forecast import price_window, source_is_current
 
