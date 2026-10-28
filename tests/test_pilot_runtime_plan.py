@@ -743,6 +743,7 @@ def test_ha_cycle_exposes_validated_passive_with_synthetic_qualified_fixture(
         return original(*args, **kwargs)
 
     monkeypatch.setattr(response_optimizer, "optimize", change_weather)
+    sensor._pilot_grid_marginal = {"status": "available_conditional_grid_import"}
     sensor._pilot_plan_next = None
     attrs = _cycle(sensor, monkeypatch, 2)
     assert attrs["thermal_intelligence_planning_status"] == "unavailable"
@@ -750,6 +751,7 @@ def test_ha_cycle_exposes_validated_passive_with_synthetic_qualified_fixture(
         attrs["thermal_intelligence_plan_detail"]["reason"]
         == "inputs_changed_during_planning"
     )
+    assert attrs["thermal_intelligence_grid_marginal"]["status"] == "unavailable"
     states["weather.local"].state = "cloudy"
     sensor._config_entry.options["thermal_hot_water_mode_entity"] = (
         "binary_sensor.hot_water"

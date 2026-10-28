@@ -106,3 +106,47 @@ def test_incomplete_raw_cannot_be_patched_by_parallel_hourly_view():
     state = make_state(rows[:3] + rows[4:])
     state.attributes["prices"] = [row(T + timedelta(hours=i), 60, i) for i in range(2)]
     assert price_window([state], T, timedelta(hours=2)) is None
+
+
+def test_conditional_grid_price_preserves_negative_and_real_intervals():
+    from custom_components.pumpsteer.pilot_marginal import grid_import_forecast
+
+    rows = [
+        row(T + timedelta(minutes=15 * i), 15, -0.25 if i == 0 else 1.0)
+        for i in range(8)
+    ]
+    result = grid_import_forecast([make_state(rows)], T, timedelta(hours=2))
+    assert result["intervals"][0]["price_per_extra_kwh"] == -0.25
+    assert result["solar_battery_and_peak_tariff"] == "unknown"
+    assert result["strategy_comparison"] == "unavailable"
+    assert (
+        grid_import_forecast([make_state(rows[:3] + rows[4:])], T, timedelta(hours=2))[
+            "status"
+        ]
+        == "unavailable"
+    )
+    assert (
+        grid_import_forecast([make_state(rows, unit="unknown")], T, timedelta(hours=2))[
+            "status"
+        ]
+        == "unavailable"
+    )
+
+
+def test_conditional_grid_price_retains_dst_instants():
+    from zoneinfo import ZoneInfo
+
+    from custom_components.pumpsteer.pilot_marginal import grid_import_forecast
+
+    z = ZoneInfo("Europe/Stockholm")
+    rows = [
+        {
+            "start": (T + timedelta(minutes=15 * i)).astimezone(z).isoformat(),
+            "end": (T + timedelta(minutes=15 * (i + 1))).astimezone(z).isoformat(),
+            "value": i,
+        }
+        for i in range(8)
+    ]
+    result = grid_import_forecast([make_state(rows)], T, timedelta(hours=2))
+    assert result["intervals"][4]["start"] == (T + timedelta(hours=1)).isoformat()
+    assert result["intervals"][4]["price_per_extra_kwh"] == 4

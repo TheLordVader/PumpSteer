@@ -228,6 +228,7 @@ def test_safe_does_not_expose_previous_forecast_or_price_as_current(monkeypatch)
     attrs = _cycle(sensor, monkeypatch, 16)
     assert attrs["thermal_intelligence_price"] == "unavailable"
     assert attrs["thermal_intelligence_forecast"] == "unavailable"
+    assert attrs["thermal_intelligence_grid_marginal"]["status"] == "unavailable"
 
 
 def test_disable_then_enable_does_not_continue_old_learning_interval(monkeypatch):
@@ -249,6 +250,7 @@ def test_options_reload_does_not_show_previous_source_diagnostics(monkeypatch):
     sensor, _ = _sensor()
     sensor._config_entry.options["thermal_intelligence_enabled"] = True
     sensor._pilot_price_available = True
+    sensor._pilot_grid_marginal = {"status": "available_conditional_grid_import"}
     sensor._pilot_forecast_available = True
     sensor._current_price = 2.0
     sensor._current_price_unit = "SEK/kWh"
@@ -262,6 +264,7 @@ def test_options_reload_does_not_show_previous_source_diagnostics(monkeypatch):
     attrs = sensor.extra_state_attributes
     assert attrs["thermal_intelligence_price"] == "unavailable"
     assert attrs["thermal_intelligence_forecast"] == "unavailable"
+    assert attrs["thermal_intelligence_grid_marginal"]["status"] == "unavailable"
 
 
 def test_enabled_diagnoses_original_quarter_hour_price_coverage(monkeypatch):
@@ -286,6 +289,13 @@ def test_enabled_diagnoses_original_quarter_hour_price_coverage(monkeypatch):
         == "coverage_complete_issue_time_unknown"
     )
     assert sensor.extra_state_attributes["thermal_intelligence_plan"] == "not_available"
+    marginal = sensor.extra_state_attributes["thermal_intelligence_grid_marginal"]
+    assert marginal["status"] == "available_conditional_grid_import"
+    assert marginal["unit"] == "SEK/kWh"
+    assert len(marginal["intervals"]) == 8
+    assert marginal["intervals"][0]["price_per_extra_kwh"] == 1.0
+    assert marginal["solar_battery_and_peak_tariff"] == "unknown"
+    assert marginal["strategy_comparison"] == "unavailable"
 
 
 def test_diagnostic_failure_never_changes_primary_control(monkeypatch):
@@ -294,6 +304,7 @@ def test_diagnostic_failure_never_changes_primary_control(monkeypatch):
     base, _ = _sensor()
     sensor, _ = _sensor()
     sensor._config_entry.options["thermal_intelligence_enabled"] = True
+    sensor._pilot_grid_marginal = {"status": "available_conditional_grid_import"}
     monkeypatch.setattr(
         pilot_forecast,
         "price_window",
@@ -306,6 +317,7 @@ def test_diagnostic_failure_never_changes_primary_control(monkeypatch):
     assert sensor.state == base.state
     assert attrs["thermal_intelligence_status"] == "learning_error"
     assert attrs["thermal_intelligence_plan"] == "not_available"
+    assert attrs["thermal_intelligence_grid_marginal"]["status"] == "unavailable"
 
 
 def test_extra_heat_setting_allows_background_aware_unvalidated_learning(monkeypatch):
@@ -1442,3 +1454,69 @@ def test_hot_water_roundtrip_between_cycles_breaks_learning_interval(monkeypatch
     _cycle(sensor, monkeypatch, 1)
     assert pilot.validation_after == (start + timedelta(minutes=1)).timestamp()
     assert pilot.manager.house.start == (start + timedelta(minutes=1)).timestamp()
+
+
+def test_grid_marginal_is_passive_unrecorded_and_cleared_on_disable_or_safe():
+    from datetime import UTC, datetime, timedelta
+
+    sensor, states = _sensor()
+    at = datetime(2026, 10, 11, 8, tzinfo=UTC)
+    sensor._config_entry.options["thermal_intelligence_enabled"] = True
+    states["sensor.price"].last_reported = at
+    states["sensor.price"].attributes.update(
+        unit_of_measurement="SEK/kWh",
+        raw_today=[
+            {
+                "start": (at + timedelta(minutes=15 * i)).isoformat(),
+                "end": (at + timedelta(minutes=15 * (i + 1))).isoformat(),
+                "value": 1,
+            }
+            for i in range(8)
+        ],
+    )
+    sensor._observe_pilot(sensor._cfg(), at, "normal")
+    assert (
+        sensor.extra_state_attributes["thermal_intelligence_grid_marginal"]["status"]
+        == "available_conditional_grid_import"
+    )
+    assert "thermal_intelligence_grid_marginal" in sensor._unrecorded_attributes
+    sensor._attributes["mode"] = "safe_mode"
+    assert (
+        sensor.extra_state_attributes["thermal_intelligence_grid_marginal"]["status"]
+        == "unavailable"
+    )
+    sensor._config_entry.options["thermal_intelligence_enabled"] = False
+    assert "thermal_intelligence_grid_marginal" not in sensor.extra_state_attributes
+
+
+def test_price_change_during_learning_invalidates_grid_forecast(monkeypatch):
+    from datetime import UTC, datetime
+
+    from custom_components.pumpsteer import sensor as sensor_module
+
+    sensor, states = _sensor()
+    sensor._config_entry.options["thermal_intelligence_enabled"] = True
+    at = datetime(2026, 10, 11, 8, tzinfo=UTC)
+
+    class Pump:
+        def add_interval(self, sample):
+            states["sensor.price"].attributes["changed_during_fit"] = True
+
+    class Pilot:
+        def __init__(self):
+            self.manager = SimpleNamespace(pump=Pump())
+            self.reset = False
+
+        def reset_interval(self):
+            self.reset = True
+
+    pilot = Pilot()
+    sensor._pilot = pilot
+    sensor._pilot_grid_marginal = {"status": "available_conditional_grid_import"}
+    monkeypatch.setattr(sensor, "_observe_pilot", lambda *args: object())
+    monkeypatch.setattr(sensor_module.dt_util, "now", lambda: at)
+    for key in ("sensor.indoor", "sensor.outdoor"):
+        states[key].last_reported = at
+    asyncio.run(sensor._do_update())
+    assert pilot.reset
+    assert sensor._pilot_grid_marginal["status"] == "unavailable"

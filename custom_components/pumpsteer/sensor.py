@@ -125,6 +125,7 @@ class PumpSteerSensor(RestoreEntity):
             "thermal_intelligence_plan_detail",
             "thermal_intelligence_plan_outcomes",
             "thermal_fixed_horizon_audit",
+            "thermal_intelligence_grid_marginal",
         }
     )
 
@@ -169,6 +170,7 @@ class PumpSteerSensor(RestoreEntity):
         self._pilot_price_available = False
         self._pilot_forecast_available = False
         self._pilot_price_forecast = False
+        self._pilot_grid_marginal = {"status": "unavailable", "reason": "not_evaluated"}
         self._pilot_price_context = None
         self._pilot_plan = {"planning_status": "unavailable", "reason": "not_evaluated"}
         self._pilot_plan_next = None
@@ -273,6 +275,7 @@ class PumpSteerSensor(RestoreEntity):
             "thermal_intelligence_forecast",
             "thermal_intelligence_price",
             "thermal_intelligence_price_forecast",
+            "thermal_intelligence_grid_marginal",
             "thermal_intelligence_model",
             "thermal_intelligence_physical_freshness",
             "thermal_intelligence_external_heat",
@@ -383,6 +386,11 @@ class PumpSteerSensor(RestoreEntity):
                 "coverage_complete_issue_time_unknown"
                 if not interrupted and self._pilot_price_forecast
                 else "unavailable"
+            )
+            attrs["thermal_intelligence_grid_marginal"] = (
+                {"status": "unavailable", "reason": "control_interrupted"}
+                if interrupted
+                else self._pilot_grid_marginal
             )
             attrs["thermal_intelligence_model"] = (
                 "validated_conditional"
@@ -590,6 +598,9 @@ class PumpSteerSensor(RestoreEntity):
         self._pilot_price_available = False
         self._pilot_forecast_available = False
         self._pilot_price_forecast = False
+        self._pilot_grid_marginal = {
+            "status": "unavailable", "reason": "options_changed"
+        }
         self._pilot_plan = self._unavailable_pilot_plan("options_changed")
         self._pilot_plan_next = None
         self._pilot_weather_raw = None
@@ -2433,6 +2444,8 @@ class PumpSteerSensor(RestoreEntity):
                             for key in (
                                 "indoor_temp_entity",
                                 "real_outdoor_entity",
+                                "electricity_price_entity",
+                                "price_tomorrow_entity",
                                 "thermal_heat_activity_entity",
                                 "thermal_supply_temp_entity",
                                 "thermal_heating_mode_entity",
@@ -2458,6 +2471,7 @@ class PumpSteerSensor(RestoreEntity):
                                     getattr(state, "state", None),
                                     getattr(state, "last_reported", None),
                                     getattr(state, "last_changed", None),
+                                    repr(getattr(state, "attributes", None)),
                                 )
                                 for state in states
                             )
@@ -2484,6 +2498,10 @@ class PumpSteerSensor(RestoreEntity):
                             or not self._temperature_inputs_match(cfg, expected)
                         ):
                             observed_pilot.reset_interval()
+                            self._pilot_grid_marginal = {
+                                "status": "unavailable",
+                                "reason": "inputs_changed_during_learning",
+                            }
                             self._pilot_plan = {
                                 "planning_status": "unavailable",
                                 "reason": "inputs_changed_during_learning",
@@ -2504,6 +2522,10 @@ class PumpSteerSensor(RestoreEntity):
                         }
                         self._pilot_plan_next = None
                 else:
+                    self._pilot_grid_marginal = {
+                        "status": "unavailable",
+                        "reason": "temperature_changed_during_update",
+                    }
                     self._plan_audit.cancel_plans("temperature_changed_during_update")
                     await self._save_pilot_store()
                     if self._pilot is not None:
@@ -2518,6 +2540,9 @@ class PumpSteerSensor(RestoreEntity):
                 self._pilot_price_available = False
                 self._pilot_forecast_available = False
                 self._pilot_price_forecast = False
+                self._pilot_grid_marginal = {
+                    "status": "unavailable", "reason": "learning_error"
+                }
                 self._pilot_plan = {
                     "planning_status": "unavailable",
                     "reason": "planning_error",
@@ -3488,6 +3513,9 @@ class PumpSteerSensor(RestoreEntity):
             or control_snapshot() != control_before
             or not self._temperature_inputs_match(cfg, expected)
         ):
+            self._pilot_grid_marginal = {
+                "status": "unavailable", "reason": "inputs_changed_during_planning"
+            }
             self._pilot_plan = {
                 "planning_status": "unavailable",
                 "reason": "inputs_changed_during_planning",
@@ -3496,6 +3524,9 @@ class PumpSteerSensor(RestoreEntity):
             return
         issued_at = dt_util.now()
         if issued_at < now or issued_at - now > timedelta(minutes=1):
+            self._pilot_grid_marginal = {
+                "status": "unavailable", "reason": "planning_result_delayed"
+            }
             self._pilot_plan = {
                 "planning_status": "unavailable",
                 "reason": "planning_result_delayed",
@@ -3628,9 +3659,6 @@ class PumpSteerSensor(RestoreEntity):
             self._heat_operation = None
             self._heat_operation_signature = None
             return
-        if self._pilot_store_read_failed:
-            self._pilot_status = "history_unavailable"
-            return None
         price_state = self.hass.states.get(cfg.get("electricity_price_entity"))
         from .pilot_forecast import price_window, source_is_current
 
@@ -3640,9 +3668,21 @@ class PumpSteerSensor(RestoreEntity):
             if tomorrow and tomorrow != cfg.get("electricity_price_entity")
             else None
         )
-        self._pilot_price_forecast = (
-            price_window((price_state, tomorrow_state), now, timedelta(hours=2))
-            is not None
+        from .pilot_marginal import grid_import_forecast
+
+        price_intervals = price_window(
+            (price_state, tomorrow_state), now, timedelta(hours=2)
+        )
+        self._pilot_price_forecast = price_intervals is not None
+        self._pilot_grid_marginal = (
+            grid_import_forecast(
+                (price_state, tomorrow_state),
+                now,
+                timedelta(hours=2),
+                intervals=price_intervals,
+            )
+            if price_intervals is not None
+            else {"status": "unavailable", "reason": "price_forecast_unavailable"}
         )
         price_unit = (getattr(price_state, "attributes", {}) or {}).get(
             "unit_of_measurement"
@@ -3657,6 +3697,9 @@ class PumpSteerSensor(RestoreEntity):
             self._last_outlook.night_min_temp is not None
             or self._last_outlook.day_max_temp is not None
         )
+        if self._pilot_store_read_failed:
+            self._pilot_status = "history_unavailable"
+            return None
         method = cfg.get("thermal_detection_method")
         heat_id = cfg.get("thermal_heat_activity_entity")
         aliased_heat = bool(

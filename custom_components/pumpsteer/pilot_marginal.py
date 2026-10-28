@@ -111,3 +111,42 @@ def compare_costs(rows):
         "comparison_bound_to_replay": False,
         "fee_and_battery_verification": "provided_by_caller_not_independently_verified",
     }
+
+
+def grid_import_forecast(states, now, horizon, *, intervals=None):
+    """Conditional price per extra imported kWh, not total marginal cost.
+
+    Reuse the existing timestamp/unit/coverage checks. Neither onsite generation,
+    battery dispatch, unrepresented fees nor upstream forecast issue time are known.
+    """
+    from .pilot_forecast import price_window, source_is_current
+
+    if intervals is None:
+        intervals = price_window(states, now, horizon)
+    if not intervals or len(intervals) > 128:
+        return {"status": "unavailable", "reason": "price_forecast_unavailable"}
+    units = {
+        state.attributes.get("unit_of_measurement")
+        for state in states
+        if state is not None
+        and source_is_current(state, now)
+        and any(
+            state.attributes.get(key)
+            for key in ("raw_today", "raw_tomorrow", "prices", "forecast")
+        )
+    }
+    if len(units) != 1 or next(iter(units), None) not in ("SEK/kWh", "EUR/kWh"):
+        return {"status": "unavailable", "reason": "price_unit_unavailable"}
+    return {
+        "status": "available_conditional_grid_import",
+        "unit": units.pop(),
+        "intervals": [
+            {"start": a.isoformat(), "end": b.isoformat(), "price_per_extra_kwh": v}
+            for a, b, v in intervals
+        ],
+        "scope": "one_extra_kwh_imported_not_a_heat_plan",
+        "price_basis": "configured_price_entity_fees_not_verified",
+        "forecast_issue_time": "unknown",
+        "solar_battery_and_peak_tariff": "unknown",
+        "strategy_comparison": "unavailable",
+    }
