@@ -696,6 +696,141 @@ def test_automatic_mode_requires_a_configured_missing_radiator_sensor(monkeypatc
     assert sensor._pilot.manager.house.start is None
 
 
+@pytest.mark.parametrize(
+    "role", ["thermal_compressor_entity", "thermal_heating_mode_entity"]
+)
+def test_automatic_mode_discards_unobserved_operating_transition(monkeypatch, role):
+    from datetime import datetime, timedelta, timezone
+
+    sensor, states = _sensor()
+    sensor._config_entry.options.update(
+        thermal_intelligence_enabled=True,
+        thermal_detection_method="automatic",
+        thermal_heat_activity_entity="binary_sensor.heat",
+        **{role: "binary_sensor.operation"},
+    )
+    start = datetime(2026, 10, 11, 8, tzinfo=timezone.utc)
+    for key in ("sensor.indoor", "sensor.outdoor"):
+        states[key].attributes["unit_of_measurement"] = "°C"
+        states[key].last_changed = start
+    states["binary_sensor.heat"] = SimpleNamespace(
+        state="on", last_reported=start, last_changed=start, attributes={}
+    )
+    states["binary_sensor.operation"] = SimpleNamespace(
+        state="on", last_reported=start, last_changed=start, attributes={}
+    )
+    _cycle(sensor, monkeypatch, 0)
+    pilot = sensor._pilot
+    assert pilot.manager.house.start is not None
+    pilot.manager.pump.ready = True
+    changed = start + timedelta(seconds=40)
+    at = start + timedelta(minutes=1)
+    states["binary_sensor.operation"].last_changed = changed
+    states["binary_sensor.operation"].last_reported = at
+    states["binary_sensor.heat"].last_reported = at
+    _cycle(sensor, monkeypatch, 1)
+    assert not pilot.manager.pump.ready
+    assert pilot.manager.house.start == at.timestamp()
+
+
+def test_automatic_learning_waits_through_compressor_source_outage(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    sensor, states = _sensor()
+    sensor._config_entry.options.update(
+        thermal_intelligence_enabled=True,
+        thermal_detection_method="automatic",
+        thermal_heat_activity_entity="binary_sensor.heat",
+        thermal_compressor_entity="binary_sensor.compressor",
+    )
+    start = datetime(2026, 10, 11, 8, tzinfo=timezone.utc)
+    for key in ("sensor.indoor", "sensor.outdoor"):
+        states[key].attributes["unit_of_measurement"] = "°C"
+        states[key].last_changed = start
+    states["binary_sensor.heat"] = SimpleNamespace(
+        state="on", last_reported=start, last_changed=start, attributes={}
+    )
+    states["binary_sensor.compressor"] = SimpleNamespace(
+        state="on", last_reported=start, last_changed=start, attributes={}
+    )
+    _cycle(sensor, monkeypatch, 0)
+    pilot = sensor._pilot
+    for minute in range(1, 5):
+        at = start + timedelta(minutes=minute)
+        states["binary_sensor.heat"].last_reported = at
+        states["binary_sensor.compressor"].state = "unavailable"
+        states["binary_sensor.compressor"].last_changed = at
+        states["binary_sensor.compressor"].last_reported = at
+        _cycle(sensor, monkeypatch, minute)
+        assert pilot.manager.house.start is None
+    at = start + timedelta(minutes=5)
+    states["binary_sensor.heat"].last_reported = at
+    states["binary_sensor.compressor"].state = "on"
+    states["binary_sensor.compressor"].last_changed = at - timedelta(seconds=10)
+    states["binary_sensor.compressor"].last_reported = at
+    _cycle(sensor, monkeypatch, 5)
+    assert pilot.manager.house.start == at.timestamp()
+
+
+def test_calibrated_multi_signal_indication_does_not_become_pilot_heat(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    sensor, states = _sensor()
+    sensor._config_entry.options.update(
+        thermal_intelligence_enabled=True,
+        thermal_detection_method="automatic",
+        thermal_compressor_entity="binary_sensor.compressor",
+        thermal_heating_mode_entity="binary_sensor.radiator",
+        thermal_hot_water_mode_entity="binary_sensor.water",
+        thermal_supply_temp_entity="sensor.supply",
+        thermal_return_temp_entity="sensor.return",
+        thermal_power_entity="sensor.power",
+    )
+    start = datetime(2026, 10, 11, 8, tzinfo=timezone.utc)
+    for key in ("sensor.indoor", "sensor.outdoor"):
+        states[key].attributes["unit_of_measurement"] = "°C"
+        states[key].last_changed = start
+    for key, value in (
+        ("binary_sensor.compressor", "on"),
+        ("binary_sensor.radiator", "on"),
+        ("binary_sensor.water", "off"),
+    ):
+        states[key] = SimpleNamespace(
+            state=value, last_reported=start, last_changed=start, attributes={}
+        )
+    for key, value, unit in (
+        ("sensor.supply", "35", "°C"),
+        ("sensor.return", "30", "°C"),
+        ("sensor.power", "1200", "W"),
+    ):
+        states[key] = SimpleNamespace(
+            state=value,
+            last_reported=start,
+            last_changed=start,
+            attributes={"unit_of_measurement": unit},
+        )
+    _cycle(sensor, monkeypatch, 0)
+    # Explicit synthetic fixture: no claim that Tallåsen has these calibrated bands.
+    operation = sensor._heat_operation
+    operation.samples = {"idle": [0.1] * 3, "heating": [1.2] * 3}
+    operation.temperatures = {"supply": [35] * 3, "return": [30] * 3}
+    at = start + timedelta(minutes=2)
+    for key in (
+        "binary_sensor.compressor",
+        "binary_sensor.radiator",
+        "binary_sensor.water",
+        "sensor.supply",
+        "sensor.return",
+        "sensor.power",
+    ):
+        states[key].last_reported = at
+    attrs = _cycle(sensor, monkeypatch, 2)
+    assert attrs["thermal_intelligence_operating_mode"] == "space_heating"
+    assert attrs["thermal_intelligence_operating_quality"] == "probable"
+    assert not attrs["thermal_intelligence_operation_detail"]["learning_qualified"]
+    assert sensor._pilot is None
+
+
 def test_options_offer_supply_mode_and_threshold(monkeypatch):
     flow = options_flow.PumpSteerOptionsFlowHandler()
     flow.config_entry = SimpleNamespace(data={}, options={})

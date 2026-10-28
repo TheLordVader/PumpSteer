@@ -163,7 +163,12 @@ class HeatOperation:
             and ((r is not None and r[1] == 0) or (c is not None and c[1] == 0))
         )
         if water_active:
-            result.update(mode="hot_water", quality="verified")
+            # A selected water circuit does not prove the compressor is heating.
+            result.update(
+                mode="hot_water",
+                quality="probable",
+                reason="hot_water_mode_report_not_production",
+            )
         elif conflict:
             pass
         elif h is not None and (water is None or w is not None):
@@ -208,12 +213,13 @@ class HeatOperation:
             result["learning_qualified"]
             and h
             and h[1] == 1
+            and (compressor is None or c is not None)
             and (radiator is None or (r and r[1] == 1))
             and (water is None or (w and w[1] == 0))
         ):
             changes = [
                 _timestamp(getattr(state, "last_changed", None))
-                for state in (heat, radiator, water)
+                for state in (heat, compressor, radiator, water)
                 if state is not None
             ]
             if all(change is not None for change in changes):

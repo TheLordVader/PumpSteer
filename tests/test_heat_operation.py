@@ -28,6 +28,20 @@ def test_water_and_contradictory_signals_are_not_radiator_heat():
     assert not result["learning_qualified"]
 
 
+def test_hot_water_valve_is_a_mode_report_not_verified_production():
+    model = HeatOperation()
+    result = model.observe(
+        T,
+        water=reading("on", T),
+        compressor=reading("off", T),
+        power=reading("100", T, "W"),
+    )
+    assert result["mode"] == "hot_water"
+    assert result["quality"] == "probable"
+    assert result["reason"] == "hot_water_mode_report_not_production"
+    assert not result["learning_qualified"]
+
+
 def test_direct_heat_signal_and_restored_signal():
     model = HeatOperation()
     result = model.observe(T, heat=reading("on", T), radiator=reading("on", T))
@@ -189,3 +203,16 @@ def test_temperature_calibration_does_not_require_electrical_power():
         )
     assert model.temperatures == {"supply": [35] * 3, "return": [30] * 3}
     assert model.samples == {"idle": [], "heating": []}
+
+
+def test_temperature_calibration_rejects_configured_unavailable_compressor():
+    model = HeatOperation()
+    now = T + timedelta(minutes=2)
+    model.observe(
+        now,
+        heat=reading("on", now, changed=T),
+        compressor=reading("unavailable", now, changed=T),
+        supply=reading(35, now, "°C"),
+        return_temp=reading(30, now, "°C"),
+    )
+    assert model.temperatures == {"supply": [], "return": []}

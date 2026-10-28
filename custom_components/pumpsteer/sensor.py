@@ -161,6 +161,7 @@ class PumpSteerSensor(RestoreEntity):
         self._heat_operation = None
         self._heat_operation_signature = None
         self._heat_operation_detail = {}
+        self._pilot_operation_checked_at = None
         self._pilot_price_available = False
         self._pilot_forecast_available = False
         self._pilot_price_forecast = False
@@ -3669,6 +3670,7 @@ class PumpSteerSensor(RestoreEntity):
             self._pilot_detector = None
             self._pilot_sources = signature
             self._pilot_hot_water_checked_at = None
+            self._pilot_operation_checked_at = None
         self._pilot_heat_source = (
             "supply_temperature_indicator"
             if use_supply
@@ -3736,6 +3738,46 @@ class PumpSteerSensor(RestoreEntity):
             self._heat_operation_detail = operation
             self._pilot_operating_mode = operation["mode"]
             self._pilot_operating_quality = operation["quality"]
+            # Independent operating transitions can happen between controller
+            # cycles even if the verified heat indicator repeats unchanged.
+            from .pilot_forecast import _timestamp
+            from .pilot_passive import PilotPassive
+
+            role_states = [
+                source_state(key)
+                for key in ("thermal_compressor_entity", "thermal_heating_mode_entity")
+                if cfg.get(key)
+            ]
+            checked = self._pilot_operation_checked_at
+            instant = _timestamp(now)
+            valid = True
+            changed_since = False
+            for state in role_states:
+                report = PilotPassive._report(
+                    state, now, reported_after=self._temperature_reported_after
+                )
+                changed = _timestamp(getattr(state, "last_changed", None))
+                if report is None or changed is None or changed > _timestamp(report[0]):
+                    valid = False
+                    break
+                if checked is not None and changed > checked:
+                    changed_since = True
+            if not valid:
+                operation["learning_qualified"] = False
+                operation["learning_reason"] = "operating_context_unavailable"
+            if checked is not None and (
+                not valid or changed_since or instant < checked
+            ):
+                if self._pilot is not None:
+                    self._pilot.reset_interval()
+                if self._pilot_plan.get("planning_status") == "validated_passive":
+                    self._pilot_plan = {
+                        "planning_status": "unavailable",
+                        "reason": "operation_context_changed",
+                    }
+            self._pilot_operation_checked_at = (
+                instant if valid and role_states else None
+            )
         if not use_supply and (
             not isinstance(source, str) or not source.startswith("binary_sensor.")
         ):
