@@ -100,7 +100,7 @@ async def test_native_running_cycles_and_real_store(
     weather_rows = [
         {
             "datetime": (
-                now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=i)
+                now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=i + 1)
             ).isoformat(),
             "temperature": 5.0,
         }
@@ -220,6 +220,12 @@ async def test_native_running_cycles_and_real_store(
         round((time.process_time() - cpu_started) * 1000, 1),
     )
     assert entity._pilot_plan.get("planning_status") == "hypothetical_unvalidated"
+    assert entity._pilot_plan["weather_initial_assumption"] == (
+        "current_outdoor_held_until_first_forecast"
+    )
+    assert entity.extra_state_attributes["thermal_intelligence_price_forecast"] == (
+        "coverage_complete_issue_time_unknown"
+    )
     assert entity._pilot_heat_source == "supply_temperature_indicator"
     diagnostic = next(
         e
@@ -459,7 +465,7 @@ async def test_active_price_and_fake_ohmigo(
         for i, v in enumerate(vals)
     ]
     weather = [
-        {"datetime": (now + timedelta(hours=i)).isoformat(), "temperature": -5.0}
+        {"datetime": (now + timedelta(hours=i + 1)).isoformat(), "temperature": -5.0}
         for i in range(26)
     ]
 
@@ -613,6 +619,11 @@ async def test_active_price_and_fake_ohmigo(
         va = [v for eid, v in pushes if eid == "number.test_off"]
         vb = [v for eid, v in pushes if eid == "number.test_on"]
         aa, ab = sa.extra_state_attributes, sb.extra_state_attributes
+        if minute == 0:
+            assert sb._pilot_plan["planning_status"] == "hypothetical_unvalidated"
+            assert sb._pilot_plan["weather_initial_assumption"] == (
+                "current_outdoor_held_until_first_forecast"
+            )
         assert (
             sa.state,
             aa.get("mode"),

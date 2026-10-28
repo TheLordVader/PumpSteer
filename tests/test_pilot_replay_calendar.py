@@ -189,7 +189,18 @@ def test_unknown_next_price_day_cannot_influence_qualified_peak_filter():
 
 
 @pytest.mark.parametrize("day", [datetime(2026, 3, 28), datetime(2026, 10, 24)])
-def test_passive_ha_plan_crosses_midnight_and_dst_with_published_prices(day):
+@pytest.mark.parametrize("first_hour", [0, 1])
+def test_passive_ha_plan_crosses_midnight_and_dst_with_published_prices(day, first_hour, monkeypatch):
+    from custom_components.pumpsteer.pilot_vendor import response_optimizer
+
+    calls = []
+    optimize = response_optimizer.optimize
+
+    def count_optimization(*args, **kwargs):
+        calls.append(True)
+        return optimize(*args, **kwargs)
+
+    monkeypatch.setattr(response_optimizer, "optimize", count_optimization)
     sensor, states = _sensor()
     issue = datetime(day.year, day.month, day.day, 23, 45, tzinfo=ZONE)
     today, tomorrow = _rows(day, 15), _rows(day + timedelta(days=1), 15, 3)
@@ -227,7 +238,7 @@ def test_passive_ha_plan_crosses_midnight_and_dst_with_published_prices(day):
     )
     weather = [
         {
-            "datetime": (current_hour + timedelta(hours=i)).isoformat(),
+            "datetime": (current_hour + timedelta(hours=i + first_hour)).isoformat(),
             "temperature": 5.0,
         }
         for i in range(40)
@@ -246,6 +257,12 @@ def test_passive_ha_plan_crosses_midnight_and_dst_with_published_prices(day):
         replay_context=context,
     )
     assert result["planning_status"] == "hypothetical_unvalidated"
+    if first_hour:
+        # The live merged price/weather outlook may include a price-only
+        # current hour. Do not assert PI parity from a different outlook.
+        assert result["comparison"]["baseline"] == "unavailable"
+        assert len(calls) == 1
+        return
     assert result["comparison"]["baseline"] == "shared_control_passive"
     initial = result["initial_context"]
     assert initial["indoor_temperature"] == 20.5

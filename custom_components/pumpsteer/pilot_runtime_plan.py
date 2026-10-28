@@ -228,9 +228,10 @@ def _calendar_covers_lookahead(calendar, end):
     return _timestamp(end) <= safe_end
 
 
-def _weather_intervals(rows, now, horizon_hours=2):
-    """Hourly provider points are held to the next actual provider timestamp."""
-    if not isinstance(rows, (list, tuple)) or len(rows) > 100:
+def _weather_intervals(rows, now, horizon_hours=2, *, current_outdoor=None):
+    """Hold the current observation only until the first future hourly point."""
+    now = _timestamp(now)
+    if now is None or not isinstance(rows, (list, tuple)) or len(rows) > 100:
         return None
     points = []
     for row in rows:
@@ -251,6 +252,23 @@ def _weather_intervals(rows, now, horizon_hours=2):
     if any(points[i][0] >= points[i + 1][0] for i in range(len(points) - 1)):
         return None
     segments = []
+    if points and now < points[0][0] <= now + timedelta(hours=1):
+        if (
+            isinstance(current_outdoor, bool)
+            or not isinstance(current_outdoor, (int, float))
+            or not math.isfinite(current_outdoor)
+            or not -60 <= current_outdoor <= 60
+        ):
+            return None
+        # This is a held initial condition, not a new measurement or a
+        # forecast issued by the provider. All later points remain genuine.
+        segments.append(
+            (
+                now,
+                min(points[0][0], now + timedelta(hours=horizon_hours)),
+                current_outdoor,
+            )
+        )
     for (start, value), (end, _) in zip(points, points[1:]):
         if end - start != timedelta(hours=1):
             continue
@@ -287,7 +305,9 @@ def _quarters(segments, now, horizon_hours=2):
 
 
 def _shared_window_is_eligible(
-    context, now, hours, price_states, weather_rows, target, *, price_calendar=None
+    context, now, hours, price_states, weather_rows, target, *,
+    price_calendar=None,
+    current_outdoor=None,
 ):
     """Cheap qualification before choosing a shorter shared planning horizon."""
     from .settings import HOLIDAY_TEMP
@@ -339,7 +359,12 @@ def _shared_window_is_eligible(
         ):
             return False
         return (
-            _weather_intervals(weather_rows, now, hours + PRECOOL_LOOKAHEAD) is not None
+            _weather_intervals(
+                weather_rows,
+                now,
+                hours + PRECOOL_LOOKAHEAD,
+                current_outdoor=current_outdoor,
+            ) is not None
         )
     except (
         KeyError,
@@ -403,7 +428,9 @@ def hypothetical_plan(
         return {**unavailable, "reason": "invalid_temperature_or_comfort"}
     if price_window(price_states, now, timedelta(hours=2)) is None:
         return {**unavailable, "reason": "price_forecast_unavailable"}
-    if weather_unit != "°C" or _weather_intervals(weather_rows, now) is None:
+    if weather_unit != "°C" or _weather_intervals(
+        weather_rows, now, current_outdoor=outdoor
+    ) is None:
         return {**unavailable, "reason": "weather_forecast_unavailable"}
     current_domain_invalid = (
         house_context is not None
@@ -446,6 +473,7 @@ def hypothetical_plan(
                     weather_rows,
                     target,
                     price_calendar=price_calendar,
+                    current_outdoor=outdoor,
                 )
             ),
             None,
@@ -454,7 +482,7 @@ def hypothetical_plan(
             horizons = [shared_horizon]
     for horizon in horizons:
         prices = price_window(price_states, now, timedelta(hours=horizon))
-        weather = _weather_intervals(weather_rows, now, horizon)
+        weather = _weather_intervals(weather_rows, now, horizon, current_outdoor=outdoor)
         if prices is not None and weather is not None:
             break
     price_values, outdoor_values = (
@@ -562,6 +590,12 @@ def hypothetical_plan(
         else "assumed_model_and_heat_state",
         "horizon_minutes": 60 * horizon,
         "forecast_coverage": "complete_issue_time_unknown",
+        "weather_initial_assumption": (
+            "current_outdoor_held_until_first_forecast"
+            if weather_rows
+            and all(_timestamp(row.get("datetime")) > now for row in weather_rows)
+            else "provider_forecast"
+        ),
         "initial_context": {
             "indoor_temperature": indoor,
             "outdoor_temperature": outdoor,
@@ -679,7 +713,9 @@ def hypothetical_plan(
                     for hours in range(max_steps // 4, horizon, -1)
                     if price_window(price_states, now, timedelta(hours=hours))
                     is not None
-                    and _weather_intervals(weather_rows, now, hours) is not None
+                    and _weather_intervals(
+                        weather_rows, now, hours, current_outdoor=outdoor
+                    ) is not None
                 ),
                 None,
             )
@@ -1159,7 +1195,10 @@ def _shared_control_reference(
             return None
         # The live outlook and precooling examine up to 24 future hours.
         weather = _weather_intervals(
-            weather_rows, now, len(prices) / 4 + PRECOOL_LOOKAHEAD
+            weather_rows,
+            now,
+            len(prices) / 4 + PRECOOL_LOOKAHEAD,
+            current_outdoor=actual_outdoor,
         )
         if weather is None:
             return None

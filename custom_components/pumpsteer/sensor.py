@@ -3058,7 +3058,13 @@ class PumpSteerSensor(RestoreEntity):
         )
         prices = price_window((price_state, tomorrow_state), now, timedelta(hours=2))
         weather = (
-            _weather_intervals(self._pilot_weather_raw, now) if unit == "°C" else None
+            _weather_intervals(
+                self._pilot_weather_raw,
+                now,
+                current_outdoor=extra.get("outdoor_temperature"),
+            )
+            if unit == "°C"
+            else None
         )
         if prices is None or weather is None:
             self._pilot_plan = self._unavailable_pilot_plan(

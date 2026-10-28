@@ -2,6 +2,7 @@
 
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 import pytest
 from custom_components.pumpsteer.pilot_runtime_plan import hypothetical_plan
 
@@ -74,6 +75,90 @@ def test_missing_forecast_abstains_without_running():
     )
     assert result["planning_status"] == "unavailable"
     assert result["reason"] == "weather_forecast_unavailable"
+
+
+@pytest.mark.parametrize(
+    "start",
+    [
+        datetime(2026, 10, 28, 13, 38, tzinfo=timezone.utc),
+        datetime(2026, 10, 28, 23, 38, tzinfo=timezone.utc),
+        datetime(2026, 10, 25, 0, 38, tzinfo=timezone.utc),
+        datetime(2026, 3, 29, 0, 38, tzinfo=timezone.utc),
+    ],
+)
+def test_next_hour_weather_uses_current_outdoor_as_initial_assumption(start):
+    from custom_components.pumpsteer.pilot_runtime_plan import _weather_intervals
+
+    next_hour = start.replace(minute=0) + timedelta(hours=1)
+    rows = [
+        {"datetime": (next_hour + timedelta(hours=i)).isoformat(), "temperature": 8 - i}
+        for i in range(4)
+    ]
+    prices = SimpleNamespace(
+        state="1",
+        last_reported=start,
+        attributes={
+            "unit_of_measurement": "SEK/kWh",
+            "raw_today": [
+                {
+                    "start": (start + timedelta(minutes=15 * i)).isoformat(),
+                    "end": (start + timedelta(minutes=15 * (i + 1))).isoformat(),
+                    "value": 1.0,
+                }
+                for i in range(8)
+            ],
+        },
+    )
+    result = hypothetical_plan(
+        now=start, indoor=21, outdoor=9, command=9, target=21,
+        floor=20.5, ceiling=21.5, price_states=[prices],
+        weather_rows=rows, weather_unit="°C",
+    )
+    assert result["planning_status"] == "hypothetical_unvalidated"
+    intervals = _weather_intervals(rows, start, 2, current_outdoor=9)
+    assert intervals[0] == (start, next_hour, 9)
+    assert intervals[1][2] == 8
+    assert result["weather_initial_assumption"] == (
+        "current_outdoor_held_until_first_forecast"
+    )
+
+
+def test_initial_observation_does_not_bridge_missing_forecast_hours():
+    from custom_components.pumpsteer.pilot_runtime_plan import _weather_intervals
+
+    now = T + timedelta(minutes=20)
+    rows = [
+        {"datetime": (T + timedelta(hours=i)).isoformat(), "temperature": 5}
+        for i in (2, 3, 4)
+    ]
+    assert _weather_intervals(rows, now, 2, current_outdoor=5) is None
+    rows[0]["datetime"] = (T + timedelta(hours=1)).isoformat()
+    assert _weather_intervals(rows, now, 2, current_outdoor=5) is None
+
+
+@pytest.mark.parametrize("fold", [0, 1])
+def test_weather_initial_interval_uses_utc_across_repeated_local_hour(fold):
+    from custom_components.pumpsteer.pilot_runtime_plan import _weather_intervals
+
+    local_now = datetime(2026, 10, 25, 2, 38, tzinfo=ZoneInfo("Europe/Stockholm"), fold=fold)
+    now = local_now.astimezone(timezone.utc)
+    first = now.replace(minute=0) + timedelta(hours=1)
+    rows = [
+        {"datetime": (first + timedelta(hours=i)).isoformat(), "temperature": 5}
+        for i in range(4)
+    ]
+    assert _weather_intervals(rows, local_now, 2, current_outdoor=6)[0] == (now, first, 6)
+
+
+@pytest.mark.parametrize("outdoor", [None, True, float("nan"), 100])
+def test_weather_initial_interval_rejects_invalid_observation(outdoor):
+    from custom_components.pumpsteer.pilot_runtime_plan import _weather_intervals
+
+    rows = [
+        {"datetime": (T + timedelta(hours=i)).isoformat(), "temperature": 5}
+        for i in (1, 2, 3)
+    ]
+    assert _weather_intervals(rows, T + timedelta(minutes=20), 2, current_outdoor=outdoor) is None
 
 
 def test_ha_cycle_runs_optimizer_with_no_heat_sensor_and_keeps_pi_unchanged(
