@@ -126,6 +126,12 @@ class PumpSteerSensor(RestoreEntity):
         self._pi_precool_paused: bool = False
         self._thermal_model = ThermalModel()
         self._pilot = None
+        from .pilot_forecast_audit import ForecastAudit
+
+        self._plan_audit = ForecastAudit()
+        self._plan_audit_loaded = False
+        self._plan_cycle_identity = None
+        self._pilot_persisted = None
         self._pilot_sources = None
         self._pilot_detector = None
         self._pilot_detection_after = None
@@ -247,6 +253,7 @@ class PumpSteerSensor(RestoreEntity):
             "thermal_intelligence_planning_status",
             "thermal_intelligence_plan_detail",
             "thermal_intelligence_forecast_quality",
+            "thermal_intelligence_plan_outcomes",
             "thermal_intelligence_electrical",
             "thermal_intelligence_heat_source",
             "thermal_intelligence_response",
@@ -297,6 +304,18 @@ class PumpSteerSensor(RestoreEntity):
             )
             attrs["thermal_intelligence_planning_status"] = plan["planning_status"]
             attrs["thermal_intelligence_plan_detail"] = plan
+            if (
+                self._plan_audit.plan_pending
+                or self._plan_audit.plan_records
+                or self._plan_audit.plan_unverifiable
+            ):
+                cfg = self._cfg()
+                attrs["thermal_intelligence_plan_outcomes"] = (
+                    self._plan_audit.plan_summary(
+                        cfg.get("indoor_temp_entity") or "",
+                        self._plan_current_identity(cfg),
+                    )
+                )
             if self._power_ledger is not None:
                 attrs["thermal_intelligence_electrical"] = self._power_ledger.summary()
             if (
@@ -479,6 +498,12 @@ class PumpSteerSensor(RestoreEntity):
     async def async_will_remove_from_hass(self) -> None:
         """Cancel options update listener on unload."""
         self._temperature_unloaded = True
+        if self._cfg().get("thermal_intelligence_enabled") is True:
+            try:
+                self._plan_audit.cancel_plans("unload")
+                await self._save_pilot_store()
+            except Exception:
+                _LOGGER.exception("Passive plan audit cleanup failed")
         self._stop_power_telemetry()
         if self._remove_start_listener is not None:
             self._remove_start_listener()
@@ -493,6 +518,12 @@ class PumpSteerSensor(RestoreEntity):
     ) -> None:
         """Handle updated options."""
         self._config_entry = entry
+        if self._cfg().get("thermal_intelligence_enabled") is not True:
+            try:
+                self._plan_audit.cancel_plans("disabled")
+                await self._save_pilot_store()
+            except Exception:
+                _LOGGER.exception("Passive plan audit cleanup failed")
         self._setup_power_telemetry()
         self._pilot = None
         self._pilot_sources = None
@@ -1024,6 +1055,12 @@ class PumpSteerSensor(RestoreEntity):
                 "last_updated": now.isoformat(),
                 "receiver_state": "unverified",
             }
+        if self._cfg().get("thermal_intelligence_enabled") is True:
+            try:
+                self._plan_audit.cancel_plans("safe_mode")
+                await self._save_pilot_store()
+            except Exception:
+                _LOGGER.exception("Passive plan audit cleanup failed in safe mode")
 
     def _temperature_inputs_match(self, cfg, expected) -> bool:
         current_cfg = self._cfg()
@@ -1220,6 +1257,8 @@ class PumpSteerSensor(RestoreEntity):
         outdoor = get_temperature(
             self.hass, cfg.get("real_outdoor_entity"), self._temperature_reported_after
         )
+        if cfg.get("thermal_intelligence_enabled") is True:
+            self._plan_cycle_identity = self._plan_current_identity(cfg)
         target = self._helper_value_with_fallback(
             helper_key="target_temperature",
             cfg=cfg,
@@ -2269,6 +2308,7 @@ class PumpSteerSensor(RestoreEntity):
         if cfg.get("thermal_intelligence_enabled") is True:
             try:
                 if self._temperature_inputs_match(cfg, expected):
+                    self._observe_plan_outcomes(cfg, dt_util.now())
                     sample = self._observe_pilot(cfg, now, mode)
                     if sample is not None and self._pilot is not None:
                         import asyncio
@@ -2348,9 +2388,12 @@ class PumpSteerSensor(RestoreEntity):
                             "reason": "planning_error",
                         }
                         self._pilot_plan_next = None
-                elif self._pilot is not None:
-                    self._pilot.reset_interval()
-                    self._pilot_status = "temperature_changed_during_update"
+                else:
+                    self._plan_audit.cancel_plans("temperature_changed_during_update")
+                    await self._save_pilot_store()
+                    if self._pilot is not None:
+                        self._pilot.reset_interval()
+                        self._pilot_status = "temperature_changed_during_update"
             except Exception:
                 _LOGGER.exception(
                     "Passive thermal diagnostics failed; standard control continues"
@@ -2518,7 +2561,15 @@ class PumpSteerSensor(RestoreEntity):
                 )
             saved = await self._pilot_store.async_load()
             if isinstance(saved, dict) and saved.get("version") == 1:
-                self._pilot_restore = saved
+                if self._pilot_persisted is None:
+                    self._pilot_persisted = saved
+                self._pilot_restore = self._pilot_persisted
+                if not self._plan_audit_loaded:
+                    self._plan_audit.restore_plan(
+                        saved.get("plan_audit"),
+                        dt_util.now(),
+                    )
+            self._plan_audit_loaded = True
         except Exception:
             self._pilot_restore = None
             _LOGGER.warning(
@@ -2526,43 +2577,64 @@ class PumpSteerSensor(RestoreEntity):
             )
 
     async def _save_pilot_store(self):
-        """Write only after a completed observed learning interval."""
+        """Save bounded model or plan evidence, only when it changes."""
         pilot = self._pilot
-        if (
-            self._pilot_store is None
-            or pilot is None
-            or not (pilot.house_intervals or pilot.manager.pump.history)
+        if self._pilot_store is None:
+            return
+        model_available = pilot is not None and (
+            pilot.house_intervals or pilot.manager.pump.history
+        )
+        plan_data = self._plan_audit.export_plan()
+        if not model_available and not (
+            plan_data["records"]
+            or plan_data["pending_count"]
+            or plan_data["unverifiable"]
         ):
             return
         pump_last = (
-            pilot.manager.pump.history[-1][0] if pilot.manager.pump.history else None
+            pilot.manager.pump.history[-1][0]
+            if model_available and pilot.manager.pump.history
+            else None
         )
         audit_last = (
-            pilot.audit.records[-1]["observed"] if pilot.audit.records else None
+            pilot.audit.records[-1]["observed"]
+            if model_available and pilot.audit.records
+            else None
         )
         audit_pending = (
-            pilot.audit.pending["issued"].isoformat() if pilot.audit.pending else None
+            pilot.audit.pending["issued"].isoformat()
+            if model_available and pilot.audit.pending
+            else None
+        )
+        plan_last = (
+            plan_data["records"][-1]["observed"] if plan_data["records"] else None
         )
         key = (
             self._pilot_sources,
-            pilot.house_intervals,
+            pilot.house_intervals if model_available else None,
             pump_last,
             audit_last,
             audit_pending,
+            plan_last,
+            plan_data["pending_count"],
+            plan_data["unverifiable"],
         )
         if key == self._pilot_saved:
             return
-        payload = {
-            "version": 1,
-            "sources": list(self._pilot_sources),
-            "identity": pilot.source_identity,
-            "house": pilot.manager.model.export_state(),
-            "pump": pilot.manager.pump.export_state(),
-            "forecast_audit": pilot.audit.export_state(),
-        }
+        payload = dict(self._pilot_persisted or {})
+        payload.update(version=1, plan_audit=plan_data)
+        if model_available:
+            payload.update(
+                sources=list(self._pilot_sources),
+                identity=pilot.source_identity,
+                house=pilot.manager.model.export_state(),
+                pump=pilot.manager.pump.export_state(),
+                forecast_audit=pilot.audit.export_state(),
+            )
         try:
             self._pilot_store.async_delay_save(lambda: payload, 30)
             self._pilot_saved = key
+            self._pilot_persisted = payload
         except Exception:
             _LOGGER.warning("Passive thermal history could not be saved", exc_info=True)
 
@@ -2664,6 +2736,50 @@ class PumpSteerSensor(RestoreEntity):
     def _capture_pilot_weather(self, rows):
         """Capture only the forecast already fetched for the normal outlook."""
         self._pilot_weather_raw = rows
+
+    def _plan_source_identity(self, cfg):
+        """Identify selected HA sources without asserting physical freshness."""
+        inside = self.hass.states.get(cfg.get("indoor_temp_entity"))
+        outside = self.hass.states.get(cfg.get("real_outdoor_entity"))
+        inside_attrs = getattr(inside, "attributes", {}) or {}
+        outside_attrs = getattr(outside, "attributes", {}) or {}
+        components = inside_attrs.get("source_temperatures_used")
+        if isinstance(components, dict) and all(isinstance(k, str) for k in components):
+            components = tuple(sorted(components))
+        else:
+            components = None
+        selected = outside_attrs.get("selected_source")
+        return (
+            components,
+            selected if isinstance(selected, str) else None,
+            cfg.get("real_outdoor_entity"),
+        )
+
+    def _plan_current_identity(self, cfg):
+        """Do not label restored or absent sources as the current identity."""
+        if any(
+            get_temperature(self.hass, cfg.get(key), self._temperature_reported_after)
+            is None
+            for key in ("indoor_temp_entity", "real_outdoor_entity")
+        ):
+            return None
+        return self._plan_source_identity(cfg)
+
+    def _observe_plan_outcomes(self, cfg, now):
+        if not self._plan_audit.plan_pending:
+            return
+        identity = self._plan_current_identity(cfg)
+        if identity is None or identity != self._plan_cycle_identity:
+            self._plan_audit.cancel_plans("source_changed_during_cycle")
+            return
+        source = cfg.get("indoor_temp_entity")
+        self._plan_audit.observe_plan(
+            now,
+            self.hass.states.get(source),
+            source,
+            identity,
+            reported_after=self._temperature_reported_after,
+        )
 
     def _capture_replay_context(self, cfg, now, aggression):
         """Freeze existing HA inputs for an isolated passive control replay."""
@@ -2806,6 +2922,9 @@ class PumpSteerSensor(RestoreEntity):
                             "forecast_quality",
                             "monitoring_forecast",
                             "initial_context",
+                            "plan_outcome_revision",
+                            "plan_outcome_status",
+                            "plan_outcome_reason",
                         )
                         if key in previous
                     },
@@ -3230,6 +3349,57 @@ class PumpSteerSensor(RestoreEntity):
         result["forecast_start"] = now.isoformat()
         result["issued_at"] = issued_at.isoformat()
         self._pilot_plan = result
+        if result.get("planning_status") in {
+            "validated_passive",
+            "hypothetical_unvalidated",
+        }:
+            from .pilot_passive import PilotPassive
+            import hashlib
+
+            source = cfg.get("indoor_temp_entity")
+            report = PilotPassive._report(
+                self.hass.states.get(source),
+                issued_at,
+                temperature=True,
+                reported_after=self._temperature_reported_after,
+            )
+            result["plan_outcome_status"] = "unverifiable"
+            result["plan_outcome_reason"] = "initial_temperature_report_unavailable"
+            identity = self._plan_current_identity(cfg)
+            if identity is None or identity != self._plan_cycle_identity:
+                result["plan_outcome_reason"] = "source_changed_during_cycle"
+            elif result.get("initial_context") is None:
+                result["plan_outcome_reason"] = "initial_context_unavailable"
+            elif report is not None:
+                result["plan_outcome_reason"] = "invalid_plan_metadata"
+                model = tuple(
+                    (house or {}).get(key) for key in ("loss", "gain", "background")
+                )
+                response = (
+                    tuple(sorted(vars(response_context[0]).items()))
+                    if response_context
+                    else None
+                )
+                revision = hashlib.sha256(
+                    repr(
+                        ("pilot-plan-v1", result["planning_status"], model, response)
+                    ).encode()
+                ).hexdigest()[:16]
+                if self._plan_audit.issue_plan(
+                    forecast_start=now,
+                    issued_at=issued_at,
+                    temperatures=result.get("temperatures"),
+                    revision=revision,
+                    status=result["planning_status"],
+                    source_entity=source,
+                    source_identity=identity,
+                    source_reported=report[0],
+                    initial_context=result.get("initial_context"),
+                ):
+                    result["plan_outcome_revision"] = revision
+                    result["plan_outcome_status"] = "awaiting_reports"
+                    result.pop("plan_outcome_reason", None)
+                    await self._save_pilot_store()
 
     def _observe_pilot(self, cfg, now, mode):
         """Passive learning from explicitly selected delivered-house-heat state."""

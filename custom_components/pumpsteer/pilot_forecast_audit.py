@@ -9,10 +9,120 @@ from datetime import timedelta
 import math
 
 
+def _plan_context(value):
+    """Keep only bounded numeric inputs actually published with the plan."""
+    if not isinstance(value, dict):
+        return None
+    keys = (
+        "indoor_temperature",
+        "outdoor_temperature",
+        "target_temperature",
+        "comfort_floor",
+        "comfort_ceiling",
+        "virtual_temperature_command",
+    )
+    if any(
+        isinstance(value.get(key), bool)
+        or not isinstance(value.get(key), (int, float))
+        or not math.isfinite(value[key])
+        or not -200 <= value[key] <= 200
+        for key in keys
+    ):
+        return None
+    result = {
+        **{key: value[key] for key in keys},
+        "physical_measurement_time": "unknown",
+    }
+    if "controller" not in value:
+        return result
+    state = value["controller"]
+    if not isinstance(state, dict):
+        return None
+    numbers = (
+        "pi_integral",
+        "pi_last_error",
+        "brake_ramp",
+        "preheat_ramp",
+        "previous_aggressiveness",
+    )
+    times = (
+        "pi_last_time",
+        "brake_last_time",
+        "brake_last_expensive_time",
+        "preheat_last_time",
+    )
+    flags = ("pi_precool_paused", "was_braking_last_cycle", "bridge_short_dip_active")
+    if any(key not in state for key in (*numbers, *times, *flags)):
+        return None
+    if any(
+        state[key] is not None
+        and (
+            isinstance(state[key], bool)
+            or not isinstance(state[key], (int, float))
+            or not math.isfinite(state[key])
+            or abs(state[key]) > 1_000_000
+        )
+        for key in numbers
+    ) or any(not isinstance(state[key], bool) for key in flags):
+        return None
+    from .pilot_forecast import _timestamp
+
+    if any(state[key] is not None and _timestamp(state[key]) is None for key in times):
+        return None
+    result["controller"] = {
+        **{key: state[key] for key in (*numbers, *flags)},
+        **{
+            key: _timestamp(state[key]).isoformat() if state[key] is not None else None
+            for key in times
+        },
+    }
+    return result
+
+
+def _plan_identity(value):
+    """Normalize the indoor contributors and selected outdoor source."""
+    if not isinstance(value, (tuple, list)) or len(value) not in (2, 3):
+        return None
+    components, outdoor = value[:2]
+    outdoor_entity = value[2] if len(value) == 3 else None
+    if components is not None:
+        if not isinstance(components, (tuple, list)) or not all(
+            isinstance(item, str) and item for item in components
+        ):
+            return None
+        components = tuple(sorted(components))
+    if outdoor is not None and not isinstance(outdoor, str):
+        return None
+    if outdoor_entity is not None and not isinstance(outdoor_entity, str):
+        return None
+    return components, outdoor, outdoor_entity
+
+
+def _plan_context_causal(value, start):
+    from .pilot_forecast import _timestamp
+
+    controller = (value or {}).get("controller", {})
+    return all(
+        controller.get(key) is None or _timestamp(controller[key]) <= start
+        for key in (
+            "pi_last_time",
+            "brake_last_time",
+            "brake_last_expensive_time",
+            "preheat_last_time",
+        )
+    )
+
+
 class ForecastAudit:
     def __init__(self):
         self.pending = None
         self.records = []
+        # Passive plan residuals are separate from model-validation evidence.
+        self.plan_pending = []
+        self.plan_records = []
+        self.plan_unverifiable = 0
+        self.plan_last_reason = None
+        self._plan_last_report = None
 
     def issue(
         self,
@@ -245,3 +355,378 @@ class ForecastAudit:
             if len(rows) < 5
             else "monitoring",
         }
+
+    def issue_plan(
+        self,
+        *,
+        forecast_start,
+        issued_at,
+        temperatures,
+        revision,
+        status,
+        source_entity,
+        source_identity,
+        source_reported,
+        initial_context=None,
+    ):
+        """Freeze issued grid points; the planned commands are never executed."""
+        from .pilot_forecast import _timestamp
+
+        start, issued, reported = map(
+            _timestamp, (forecast_start, issued_at, source_reported)
+        )
+        if (
+            start is None
+            or issued is None
+            or reported is None
+            or not 0 <= (issued - start).total_seconds() <= 60
+            or not 0 <= (issued - reported).total_seconds() <= 300
+            or status not in {"validated_passive", "hypothetical_unvalidated"}
+            or not isinstance(revision, str)
+            or not revision
+            or len(revision) > 80
+            or not isinstance(source_entity, str)
+            or not source_entity
+            or _plan_identity(source_identity) is None
+            or (initial_context is not None and _plan_context(initial_context) is None)
+            or not isinstance(temperatures, (list, tuple))
+            or not 3 <= len(temperatures) <= 49
+            or any(
+                isinstance(v, bool)
+                or not isinstance(v, (int, float))
+                or not math.isfinite(v)
+                or not -50 <= v <= 60
+                for v in temperatures
+            )
+        ):
+            return False
+        if (
+            initial_context is not None
+            and abs(initial_context["indoor_temperature"] - temperatures[0])
+            > 0.005000001
+        ):
+            return False
+        if not _plan_context_causal(initial_context, start):
+            return False
+        horizons = {
+            h: temperatures[h // 15]
+            for h in (30, 60, 120)
+            if h // 15 < len(temperatures)
+        }
+        if not horizons or any(item["issued"] == issued for item in self.plan_pending):
+            return False
+        if len(self.plan_pending) >= 5:
+            self._discard_plan(self.plan_pending.pop(0), "capacity")
+        self.plan_pending.append(
+            {
+                "start": start,
+                "issued": issued,
+                "source_reported": reported,
+                "source_entity": source_entity,
+                "identity": _plan_identity(source_identity),
+                "revision": revision,
+                "status": status,
+                "initial": temperatures[0],
+                "initial_context": _plan_context(initial_context),
+                "horizons": horizons,
+                "last": issued,
+            }
+        )
+        return True
+
+    def _discard_plan(self, plan, reason):
+        self.plan_unverifiable += len(plan["horizons"])
+        self.plan_last_reason = reason
+
+    def cancel_plans(self, reason):
+        for plan in self.plan_pending:
+            self._discard_plan(plan, reason)
+        self.plan_pending = []
+
+    def observe_plan(
+        self, now, indoor, source_entity, source_identity, *, reported_after=None
+    ):
+        """Pair each issued forecast with a real report, which may be shared."""
+        from .pilot_forecast import _timestamp
+        from .pilot_passive import PilotPassive
+
+        now = _timestamp(now)
+        if now is None:
+            self.cancel_plans("invalid_clock")
+            return False
+        report = PilotPassive._report(
+            indoor, now, temperature=True, reported_after=reported_after, max_age=None
+        )
+        changed = _timestamp(getattr(indoor, "last_changed", None))
+        if report is None or changed is None:
+            self.cancel_plans("sensor_unavailable")
+            return False
+        at, value = _timestamp(report[0]), report[1]
+        if at is None or changed > at:
+            self.cancel_plans("invalid_report")
+            return False
+        if self._plan_last_report is not None and at < self._plan_last_report:
+            self.cancel_plans("report_reordered")
+            return False
+        new = self._plan_last_report is None or at > self._plan_last_report
+        self._plan_last_report = at
+        for plan in list(self.plan_pending):
+            if (
+                plan["source_entity"] != source_entity
+                or plan["identity"] != _plan_identity(source_identity)
+                or now < plan["last"]
+                or now - plan["last"] > timedelta(minutes=5)
+            ):
+                self._discard_plan(plan, "source_change_or_gap")
+                self.plan_pending.remove(plan)
+            else:
+                plan["last"] = now
+        paired = False
+        for plan in list(self.plan_pending):
+            for horizon, predicted in list(plan["horizons"].items()):
+                target = plan["start"] + timedelta(minutes=horizon)
+                offset = (at - target).total_seconds()
+                if (
+                    new
+                    and at > plan["issued"]
+                    and at > plan["source_reported"]
+                    and abs(offset) <= 60
+                    and now - at <= timedelta(minutes=5)
+                ):
+                    self.plan_records.append(
+                        {
+                            "forecast_start": plan["start"].isoformat(),
+                            "issued_at": plan["issued"].isoformat(),
+                            "source_reported": plan["source_reported"].isoformat(),
+                            "forecast_at": target.isoformat(),
+                            "observed": at.isoformat(),
+                            "horizon_minutes": horizon,
+                            "lead_seconds": (at - plan["issued"]).total_seconds(),
+                            "time_error_seconds": offset,
+                            "predicted": predicted,
+                            "actual": value,
+                            "initial": plan["initial"],
+                            "initial_context": plan["initial_context"],
+                            "error": predicted - value,
+                            "persistence_error": plan["initial"] - value,
+                            "revision": plan["revision"],
+                            "status": plan["status"],
+                            "source_entity": source_entity,
+                            "source_identity": plan["identity"],
+                            "kind": "unexecuted_scenario_residual",
+                        }
+                    )
+                    self.plan_records = self.plan_records[-48:]
+                    del plan["horizons"][horizon]
+                    paired = True
+                elif now > target + timedelta(seconds=60):
+                    del plan["horizons"][horizon]
+                    self.plan_unverifiable += 1
+                    self.plan_last_reason = "no_distinct_report_near_forecast_time"
+            if not plan["horizons"]:
+                self.plan_pending.remove(plan)
+        return paired
+
+    def plan_summary(self, source_entity=None, source_identity=None):
+        identity = _plan_identity(source_identity)
+        records = self.plan_records
+        pending = self.plan_pending
+        if source_entity is not None:
+            records = [
+                row
+                for row in records
+                if identity is not None
+                and row["source_entity"] == source_entity
+                and row["source_identity"] == identity
+            ]
+            pending = [
+                plan
+                for plan in pending
+                if identity is not None
+                and plan["source_entity"] == source_entity
+                and plan["identity"] == identity
+            ]
+        groups = {}
+        for row in records:
+            key = (
+                row["revision"],
+                row["status"],
+                row["source_entity"],
+                row["source_identity"],
+                row["horizon_minutes"],
+            )
+            groups.setdefault(key, []).append(row)
+        # Only the newest model/status is summarized to keep attributes compact.
+        latest = records[-1] if records else None
+        summaries = {}
+        if latest is not None:
+            for (revision, status, source, identity, horizon), rows in groups.items():
+                if (revision, status, source, identity) != (
+                    latest["revision"],
+                    latest["status"],
+                    latest["source_entity"],
+                    latest["source_identity"],
+                ):
+                    continue
+                summaries[str(horizon)] = {
+                    "count": len(rows),
+                    "mae": round(sum(abs(r["error"]) for r in rows) / len(rows), 3),
+                    "bias": round(sum(r["error"] for r in rows) / len(rows), 3),
+                    "persistence_mae": round(
+                        sum(abs(r["persistence_error"]) for r in rows) / len(rows), 3
+                    ),
+                }
+        return {
+            "kind": "unexecuted_scenario_residual",
+            "physical_measurement_time": "unknown",
+            "interpretation": "plan_not_executed_not_model_validation_or_savings",
+            "count_semantics": "forecast_outcome_pairs_not_independent_reports",
+            "pending": sum(len(p["horizons"]) for p in pending),
+            "unverifiable": self.plan_unverifiable,
+            "last_reason": self.plan_last_reason,
+            "model_revision": latest["revision"] if latest else None,
+            "planning_status": latest["status"] if latest else None,
+            "horizons_minutes": summaries,
+            "latest_pair": {
+                key: latest[key]
+                for key in (
+                    "forecast_start",
+                    "issued_at",
+                    "forecast_at",
+                    "observed",
+                    "horizon_minutes",
+                    "lead_seconds",
+                    "time_error_seconds",
+                    "predicted",
+                    "actual",
+                    "initial",
+                    "initial_context",
+                )
+            }
+            if latest
+            else None,
+        }
+
+    def export_plan(self):
+        return {
+            "records": list(self.plan_records),
+            "pending_count": sum(len(p["horizons"]) for p in self.plan_pending),
+            "unverifiable": self.plan_unverifiable,
+            "last_reason": self.plan_last_reason,
+        }
+
+    def restore_plan(self, payload, now):
+        """Restore completed pairs only; observation gaps cannot be bridged."""
+        from .pilot_forecast import _timestamp
+
+        self.plan_pending = []
+        self.plan_records = []
+        self._plan_last_report = None
+        now = _timestamp(now)
+        if not isinstance(payload, dict) or now is None:
+            return
+        count = payload.get("unverifiable", 0)
+        pending = payload.get("pending_count", 0)
+        if (
+            isinstance(count, int)
+            and not isinstance(count, bool)
+            and 0 <= count <= 1_000_000
+        ):
+            self.plan_unverifiable = count
+        if (
+            isinstance(pending, int)
+            and not isinstance(pending, bool)
+            and 0 <= pending <= 15
+        ):
+            self.plan_unverifiable += pending
+            if pending:
+                self.plan_last_reason = "restart"
+        rows = payload.get("records")
+        if not isinstance(rows, list) or len(rows) > 48:
+            return
+        candidates = {}
+        conflicting = set()
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            source_entity = row.get("source_entity")
+            start, issued, source, target, observed = (
+                _timestamp(row.get(k))
+                for k in (
+                    "forecast_start",
+                    "issued_at",
+                    "source_reported",
+                    "forecast_at",
+                    "observed",
+                )
+            )
+            horizon = row.get("horizon_minutes")
+            values = (row.get("predicted"), row.get("actual"), row.get("initial"))
+            revision, status = row.get("revision"), row.get("status")
+            identity = _plan_identity(row.get("source_identity"))
+            context = row.get("initial_context")
+            if (
+                any(v is None for v in (start, issued, source, target, observed))
+                or horizon not in (30, 60, 120)
+                or not isinstance(revision, str)
+                or not revision
+                or len(revision) > 80
+                or not isinstance(source_entity, str)
+                or not source_entity
+                or identity is None
+                or (context is not None and _plan_context(context) is None)
+                or status not in {"validated_passive", "hypothetical_unvalidated"}
+                or observed > now
+                or not 0 <= (issued - start).total_seconds() <= 60
+                or not 0 <= (issued - source).total_seconds() <= 300
+                or target != start + timedelta(minutes=horizon)
+                or abs((observed - target).total_seconds()) > 60
+                or observed <= issued
+                or any(
+                    isinstance(v, bool)
+                    or not isinstance(v, (int, float))
+                    or not math.isfinite(v)
+                    or not -50 <= v <= 60
+                    for v in values
+                )
+            ):
+                continue
+            if (
+                context is not None
+                and abs(context["indoor_temperature"] - values[2]) > 0.005000001
+            ):
+                continue
+            if not _plan_context_causal(context, start):
+                continue
+            predicted, actual, initial = values
+            pair_key = (start, issued, horizon)
+            item = {
+                "forecast_start": start.isoformat(),
+                "issued_at": issued.isoformat(),
+                "source_reported": source.isoformat(),
+                "forecast_at": target.isoformat(),
+                "observed": observed.isoformat(),
+                "horizon_minutes": horizon,
+                "lead_seconds": (observed - issued).total_seconds(),
+                "time_error_seconds": (observed - target).total_seconds(),
+                "predicted": predicted,
+                "actual": actual,
+                "initial": initial,
+                "initial_context": _plan_context(context),
+                "error": predicted - actual,
+                "persistence_error": initial - actual,
+                "revision": revision,
+                "status": status,
+                "source_entity": source_entity,
+                "source_identity": identity,
+                "kind": "unexecuted_scenario_residual",
+            }
+            if pair_key in conflicting:
+                continue
+            prior = candidates.get(pair_key)
+            if prior is not None and prior != item:
+                del candidates[pair_key]
+                conflicting.add(pair_key)
+            elif prior is None:
+                candidates[pair_key] = item
+        self.plan_records = list(candidates.values())
