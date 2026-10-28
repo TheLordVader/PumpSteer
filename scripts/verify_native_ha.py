@@ -47,7 +47,7 @@ def hass_storage():
 async def test_native_running_cycles_and_real_store(
     recorder_mock, hass, enable_custom_integrations, monkeypatch, tmp_path
 ):
-    from custom_components.pumpsteer import pump_log
+    from custom_components.pumpsteer import pump_log, sensor as sensor_module
     from custom_components.pumpsteer.pilot_vendor import response_optimizer
 
     monkeypatch.setattr(pump_log, "_PUMP_LOG_PATH", str(tmp_path / "pump.log"))
@@ -117,7 +117,7 @@ async def test_native_running_cycles_and_real_store(
         "indoor_temp_entity": "sensor.test_indoor",
         "real_outdoor_entity": "sensor.test_outdoor",
         "electricity_price_entity": "sensor.test_price",
-        "price_tomorrow_entity": "sensor.test_tomorrow",
+        "price_tomorrow_entity": "sensor.test_price",
         "weather_entity": "weather.test",
         "target_temperature": 21,
         "summer_threshold": 18,
@@ -158,6 +158,7 @@ async def test_native_running_cycles_and_real_store(
         {
             "today": [1.0] * 96,
             "raw_today": raw,
+            "raw_tomorrow": raw_tomorrow,
             "prices": [{"start": midnight.isoformat(), "value": 1.0}],
             "unit_of_measurement": "SEK/kWh",
         },
@@ -178,6 +179,19 @@ async def test_native_running_cycles_and_real_store(
         entity.async_write_ha_state()
         await asyncio.sleep(0.01)
     assert entity.extra_state_attributes["mode"] == "normal"
+    companions = [
+        e
+        for e in hass.data[SENSOR].entities
+        if getattr(e, "_controller", None) is entity
+    ]
+    assert len(companions) == 3
+    temperatures = [
+        e
+        for e in companions
+        if isinstance(e, sensor_module.PumpSteerInputTemperatureSensor)
+    ]
+    assert {e.native_value for e in temperatures} == {20.5, 5.0}
+    assert all(e.device_info == entity.device_info for e in companions)
     baseline = entity.state
     assert counts["optimize"] == counts["store_writes"] == 0
     gaps = []
@@ -207,6 +221,13 @@ async def test_native_running_cycles_and_real_store(
     )
     assert entity._pilot_plan.get("planning_status") == "hypothetical_unvalidated"
     assert entity._pilot_heat_source == "supply_temperature_indicator"
+    diagnostic = next(
+        e
+        for e in companions
+        if isinstance(e, sensor_module.PumpSteerThermalStatusSensor)
+    )
+    assert diagnostic.native_value == "hypothetical_plan"
+    assert diagnostic.extra_state_attributes["passive"] is True
     assert entity._plan_audit.plan_pending
     entity.async_write_ha_state()
     current = hass.states.get(entity.entity_id)
@@ -1041,3 +1062,96 @@ async def test_unknown_store_version_is_not_overwritten(
     )
     await hass.async_block_till_done(wait_background_tasks=True)
     assert not sensor._pilot_store_read_failed
+
+
+async def test_native_options_menu_preserves_other_pages(
+    recorder_mock, hass, enable_custom_integrations, monkeypatch, tmp_path
+):
+    from custom_components.pumpsteer import pump_log
+
+    monkeypatch.setattr(pump_log, "_PUMP_LOG_PATH", str(tmp_path / "pump.log"))
+    await hass.async_start()
+    for entity, value, attrs in [
+        (
+            "sensor.room",
+            "20",
+            {"unit_of_measurement": "°C", "device_class": "temperature"},
+        ),
+        (
+            "sensor.outside",
+            "5",
+            {"unit_of_measurement": "°C", "device_class": "temperature"},
+        ),
+        ("sensor.price", "1", {"unit_of_measurement": "SEK/kWh"}),
+    ]:
+        hass.states.async_set(entity, value, attrs)
+    entry = MockConfigEntry(
+        domain="pumpsteer",
+        title="test",
+        data={},
+        options={
+            "indoor_temp_entity": "sensor.room",
+            "real_outdoor_entity": "sensor.outside",
+            "electricity_price_entity": "sensor.price",
+            "price_tomorrow_entity": "sensor.price",
+            "notification_level": "braking_only",
+            "notification_cooldown_minutes": "60",
+            "thermal_power_entity": "sensor.test_power",
+        },
+    )
+    entry.add_to_hass(hass)
+    assert await async_setup_component(hass, "pumpsteer", {})
+    await hass.async_block_till_done()
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    assert result["type"] == "menu"
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"next_step_id": "thermal"}
+    )
+    assert result["type"] == "form" and result["step_id"] == "thermal"
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        {"thermal_intelligence_enabled": True, "external_heat_sources": True},
+    )
+    assert result["type"] == "create_entry"
+    assert entry.options["notification_level"] == "braking_only"
+    assert entry.options["notification_cooldown_minutes"] == "60"
+    assert entry.options["indoor_temp_entity"] == "sensor.room"
+    assert entry.options["thermal_intelligence_enabled"] is True
+    hass.states.async_set("sensor.room", "unavailable")
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"next_step_id": "thermal"}
+    )
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        {"thermal_intelligence_enabled": False, "external_heat_sources": True},
+    )
+    assert result["type"] == "create_entry"
+    assert entry.options["thermal_intelligence_enabled"] is False
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"next_step_id": "telemetry"}
+    )
+    result = await hass.config_entries.options.async_configure(result["flow_id"], {})
+    assert result["type"] == "create_entry"
+    assert entry.options["thermal_power_entity"] == ""
+    assert entry.options["notification_cooldown_minutes"] == "60"
+    hass.states.async_set("number.test_output", "5")
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    assert result["menu_options"] == [
+        "basic",
+        "thermal",
+        "telemetry",
+        "notifications",
+        "ohmigo",
+    ]
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"next_step_id": "ohmigo"}
+    )
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        {"ohmigo_entity": "number.test_output", "ohmigo_interval_minutes": 5},
+    )
+    assert result["type"] == "create_entry"
+    assert entry.options["ohmigo_entity"] == "number.test_output"
+    assert entry.options["notification_cooldown_minutes"] == "60"

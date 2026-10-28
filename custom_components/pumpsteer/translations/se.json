@@ -20,7 +20,17 @@
   "options": {
     "step": {
       "init": {
-        "title": "PumpSteer – alternativ",
+        "title": "PumpSteer",
+        "menu_options": {
+          "basic": "Grundinställningar",
+          "thermal": "Thermal Intelligence",
+          "telemetry": "Avancerade givare",
+          "notifications": "Notiser",
+          "ohmigo": "Ohmigo och säkerhet"
+        }
+      },
+      "basic": {
+        "title": "Grundinställningar",
         "data": {
           "indoor_temp_entity": "Inomhustemperatursensor",
           "real_outdoor_entity": "Utomhustemperatursensor",
@@ -31,19 +41,7 @@
           "pid_kd": "Dämpning vid snabba förändringar (Kd)",
           "pid_integral_clamp": "Gräns för långsiktig korrigering",
           "pid_output_clamp": "Maximal temperaturregel",
-          "notify_service": "Notifieringstjänst (valfri, t.ex. notify.mobile_app_min_telefon)",
-          "preheat_boost_enabled": "Aktivera förvärmning",
-          "ohmigo_entity": "Ohmigo-entitet (valfri)",
-          "ohmigo_interval_minutes": "Ohmigo push-intervall",
-          "modbus_service": "Generisk utgångstjänst",
-          "modbus_payload_template": "Mall för generisk utgångspayload",
-          "modbus_interval_minutes": "Intervall för generisk utgång",
-          "ohmigo_relay_entity": "Ohmigo Active/Bypass-relä (valfritt)",
-          "notification_level": "Prisnotiser",
-          "notification_cooldown_minutes": "Spärrtid för upprepade prisnotiser",
-          "thermal_intelligence_enabled": "Thermal Intelligence (experimentell diagnostik)",
-          "external_heat_sources": "Använder du ibland en extra värmekälla?",
-          "thermal_heat_activity_entity": "Verifierad värmetillförsel till huset (valfri)"
+          "preheat_boost_enabled": "Aktivera förvärmning"
         },
         "data_description": {
           "pid_kp": "Hur kraftigt PumpSteer reagerar på aktuell temperaturdifferens. Typiskt intervall: 2,0 till 5,0.",
@@ -51,19 +49,72 @@
           "pid_kd": "Hur mycket PumpSteer reagerar på snabba temperaturförändringar. Håll på 0,0 om du inte trimmar det medvetet.",
           "pid_integral_clamp": "Begränsar uppbyggd långsiktig korrigering för att minska windup. Typiskt intervall: 5,0 till 10,0.",
           "pid_output_clamp": "Begränsar hur många grader PumpSteer maximalt justerar börvärdet.",
+          "preheat_boost_enabled": "När aktiverad värmer PumpSteer extra inför dyra perioder för att bygga upp termisk massa."
+        }
+      },
+      "thermal": {
+        "title": "Thermal Intelligence",
+        "data": {
+          "thermal_intelligence_enabled": "Thermal Intelligence (experimentell diagnostik)",
+          "external_heat_sources": "Använder du ibland en extra värmekälla?"
+        },
+        "data_description": {
+          "thermal_intelligence_enabled": "Samlar passivt kvalificerade observationer om en verifierad värmesignal väljs. Påverkar inte värmestyrningen.",
+          "external_heat_sources": "Exempelvis braskamin eller luftvärmepump. Tillfällig extravärme kan inte identifieras säkert; inlärningsresultat förblir ovaliderade."
+        },
+        "description": "Planering och inlärning är passiva och ändrar inte värmestyrningen."
+      },
+      "telemetry": {
+        "title": "Avancerade givare",
+        "data": {
+          "thermal_heat_activity_entity": "Verifierad värmetillförsel till huset (valfri)",
+          "thermal_supply_temp_entity": "Framledning till radiatorer (valfri)",
+          "thermal_heating_mode_entity": "Verifierat radiatorvärmeläge (valfri)",
+          "thermal_heating_mode_inverted": "Radiatorläge motsvarar av",
+          "thermal_supply_threshold": "Framledningens indikationströskel",
+          "thermal_power_entity": "Värmepumpens eleffekt (valfri)",
+          "thermal_hot_water_mode_entity": "Verifierat varmvattenläge (valfritt)"
+        },
+        "data_description": {
+          "thermal_heat_activity_entity": "En binär sensor där på betyder uppmätt värmetillförsel till huset och av betyder ingen. Kompressorstatus eller varmvattenläge räcker inte. Rapporttider bevisar inte fysisk mättid.",
+          "thermal_supply_temp_entity": "Välj en givare för radiatorkretsen. Temperaturen är en indikator, inte uppmätt värmeeffekt.",
+          "thermal_heating_mode_entity": "Välj ett verifierat radiatorläge. Krävs för framledningsindikatorn.",
+          "thermal_heating_mode_inverted": "Aktivera endast om av betyder radiatorläge. Okänd eller gammal status stoppar inlärning.",
+          "thermal_supply_threshold": "Anpassa till värmesystemet. Fel tröskel kan ge felaktig värmeindikation.",
+          "thermal_power_entity": "Uppmätt eleffekt för den utrustning som ska analyseras. Energi skattas från HA-rapporter; det är inte levererad värme.",
+          "thermal_hot_water_mode_entity": "På betyder verifierad varmvattenproduktion. Värmeinlärning pausas vid på eller okänt läge; okända perioder klassas inte."
+        }
+      },
+      "notifications": {
+        "title": "Notiser",
+        "data": {
+          "notify_service": "Notifieringstjänst (valfri, t.ex. notify.mobile_app_min_telefon)",
+          "notification_level": "Prisnotiser",
+          "notification_cooldown_minutes": "Spärrtid för upprepade prisnotiser"
+        },
+        "data_description": {
           "notify_service": "Lämna tomt för att använda beständiga notifieringar i HA:s sidofält istället.",
-          "preheat_boost_enabled": "När aktiverad värmer PumpSteer extra inför dyra perioder för att bygga upp termisk massa.",
+          "notification_level": "Välj alla prisnotiser, endast bromsning eller inga. Den befintliga notisbrytaren är fortfarande huvudbrytare.",
+          "notification_cooldown_minutes": "Minsta tid mellan två notiser av samma typ. Välj 0 för ingen spärr; 60 minuter rekommenderas. Bromsning och förvärmning har separata spärrtider."
+        }
+      },
+      "ohmigo": {
+        "title": "Ohmigo och säkerhet",
+        "data": {
+          "ohmigo_entity": "Ohmigo-entitet (valfri)",
+          "ohmigo_interval_minutes": "Ohmigo push-intervall",
+          "modbus_service": "Generisk utgångstjänst",
+          "modbus_payload_template": "Mall för generisk utgångspayload",
+          "modbus_interval_minutes": "Intervall för generisk utgång",
+          "ohmigo_relay_entity": "Ohmigo Active/Bypass-relä (valfritt)"
+        },
+        "data_description": {
           "ohmigo_entity": "PumpSteer skickar den virtuella utetemperaturen till den här entiteten efter varje uppdatering. Lämna tomt för att inaktivera. Slå av/på utan att konfigurera om via brytaren 'Ohmigo Push'.",
           "ohmigo_interval_minutes": "Minsta tid mellan push-uppdateringar till Ohmigo. Standard 5 minuter. Förändringar under 0,2 °C behandlas som oförändrade, men aktuellt börvärde skickas på nytt när intervallet löpt ut för att hålla Ohmigos watchdog aktiv.",
           "modbus_service": "Home Assistant-tjänsten som ska anropas, till exempel modbus.write_register, mqtt.publish eller input_number.set_value.",
           "modbus_payload_template": "YAML-mall för tjänsteanropets payload. Mallen kan använda variabeln fake_temp.",
           "modbus_interval_minutes": "Minsta tid mellan anrop från Generic Output System.",
-          "ohmigo_relay_entity": "Valfri switch-entitet för Ohmigos Active/Bypass-relä. När den är konfigurerad skapar PumpSteer en separat Relay Guard-brytare. Skyddet återställer bara ett uttryckligt OFF-läge när Ohmigo Push är på; unknown eller unavailable skickar aldrig något reläkommando.",
-          "notification_level": "Välj alla prisnotiser, endast bromsning eller inga. Den befintliga notisbrytaren är fortfarande huvudbrytare.",
-          "notification_cooldown_minutes": "Minsta tid mellan två notiser av samma typ. Välj 0 för ingen spärr; 60 minuter rekommenderas. Bromsning och förvärmning har separata spärrtider.",
-          "thermal_intelligence_enabled": "Samlar passivt kvalificerade observationer om en verifierad värmesignal väljs. Påverkar inte värmestyrningen.",
-          "external_heat_sources": "Exempelvis braskamin eller luftvärmepump. Tillfällig extravärme kan inte identifieras säkert; inlärningsresultat förblir ovaliderade.",
-          "thermal_heat_activity_entity": "En binär sensor där på betyder uppmätt värmetillförsel till huset och av betyder ingen. Kompressorstatus eller varmvattenläge räcker inte. Rapporttider bevisar inte fysisk mättid."
+          "ohmigo_relay_entity": "Valfri switch-entitet för Ohmigos Active/Bypass-relä. När den är konfigurerad skapar PumpSteer en separat Relay Guard-brytare. Skyddet återställer bara ett uttryckligt OFF-läge när Ohmigo Push är på; unknown eller unavailable skickar aldrig något reläkommando."
         }
       }
     },
@@ -72,6 +123,30 @@
       "entity_not_found": "Entiteten hittades inte",
       "entity_unavailable": "Entiteten är otillgänglig",
       "invalid_notification_setting": "Ogiltig notisinställning"
+    }
+  },
+  "entity": {
+    "sensor": {
+      "indoor_temperature": {
+        "name": "Inomhustemperatur"
+      },
+      "outdoor_temperature": {
+        "name": "Utomhustemperatur"
+      },
+      "control_temperature": {
+        "name": "Styrtemperatur"
+      },
+      "thermal_intelligence": {
+        "name": "Thermal Intelligence",
+        "state": {
+          "disabled": "Avstängd",
+          "waiting": "Passiv – väntar på data",
+          "learning": "Passiv – samlar observationer",
+          "unavailable": "Passiv – tillfälligt otillgänglig",
+          "hypothetical_plan": "Passiv – hypotetisk plan",
+          "validated_plan": "Passiv – validerad modellplan"
+        }
+      }
     }
   }
 }

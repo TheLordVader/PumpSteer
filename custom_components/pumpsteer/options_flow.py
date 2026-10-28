@@ -16,13 +16,76 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 DOMAIN = "pumpsteer"
+_GROUPS = {
+    "thermal": {"thermal_intelligence_enabled", "external_heat_sources"},
+    "telemetry": {
+        "thermal_heat_activity_entity",
+        "thermal_supply_temp_entity",
+        "thermal_heating_mode_entity",
+        "thermal_heating_mode_inverted",
+        "thermal_supply_threshold",
+        "thermal_power_entity",
+        "thermal_hot_water_mode_entity",
+    },
+    "notifications": {
+        "notify_service",
+        NOTIFICATION_LEVEL_OPTION,
+        NOTIFICATION_COOLDOWN_OPTION,
+    },
+    "basic": {
+        "indoor_temp_entity",
+        "real_outdoor_entity",
+        "weather_entity",
+        "electricity_price_entity",
+        "price_tomorrow_entity",
+    },
+    "ohmigo": {
+        "ohmigo_entity",
+        OHMIGO_RELAY_ENTITY,
+        "ohmigo_interval_minutes",
+        "modbus_service",
+        "modbus_payload_template",
+        "modbus_interval_minutes",
+    },
+}
+_CLEARABLE = {
+    "weather_entity",
+    "ohmigo_entity",
+    OHMIGO_RELAY_ENTITY,
+    "thermal_heat_activity_entity",
+    "thermal_supply_temp_entity",
+    "thermal_heating_mode_entity",
+    "thermal_power_entity",
+    "thermal_hot_water_mode_entity",
+}
 
 
 class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
     """Handle options flow for PumpSteer."""
 
     async def async_step_init(self, user_input=None):
-        """Manage the options flow."""
+        return self.async_show_menu(
+            step_id="init",
+            menu_options=["basic", "thermal", "telemetry", "notifications", "ohmigo"],
+        )
+
+    async def async_step_basic(self, user_input=None):
+        return await self._section("basic", user_input)
+
+    async def async_step_thermal(self, user_input=None):
+        return await self._section("thermal", user_input)
+
+    async def async_step_telemetry(self, user_input=None):
+        return await self._section("telemetry", user_input)
+
+    async def async_step_notifications(self, user_input=None):
+        return await self._section("notifications", user_input)
+
+    async def async_step_ohmigo(self, user_input=None):
+        return await self._section("ohmigo", user_input)
+
+    async def _section(self, section, user_input=None):
+        """Save only the selected page while preserving all other options."""
         errors = {}
 
         entry = self.config_entry
@@ -35,222 +98,217 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
 
         if user_input is not None:
             try:
-                entity_errors = self._validate_entities(user_input)
-                errors = {**entity_errors}
+                updated = {**entry.options, **user_input}
+                for key in _GROUPS[section] & _CLEARABLE:
+                    if key not in user_input and current_data.get(key):
+                        updated[key] = ""
+                entity_errors = self._validate_entities({**entry.data, **updated})
+                errors = {
+                    k: v
+                    for k, v in entity_errors.items()
+                    if k in _GROUPS[section] or k == "base"
+                }
 
                 if not errors:
-                    return self.async_create_entry(title="", data={**user_input})
+                    return self.async_create_entry(title="", data=updated)
 
             except Exception as err:
                 _LOGGER.exception("Options flow save failed: %s", err)
                 errors["base"] = "unknown"
 
-        return self.async_show_form(
-            step_id="init",
-            data_schema=vol.Schema(
+        fields = {
+            vol.Required(
+                "indoor_temp_entity",
+                default=current_data.get("indoor_temp_entity"),
+            ): selector(
+                {"entity": {"domain": "sensor", "device_class": "temperature"}}
+            ),
+            vol.Required(
+                "real_outdoor_entity",
+                default=current_data.get("real_outdoor_entity"),
+            ): selector(
+                {"entity": {"domain": "sensor", "device_class": "temperature"}}
+            ),
+            vol.Optional(
+                "weather_entity",
+                description={"suggested_value": current_data.get("weather_entity")},
+            ): selector({"entity": {"domain": "weather"}}),
+            vol.Required(
+                "electricity_price_entity",
+                default=current_data.get(
+                    "electricity_price_entity",
+                    "sensor.elpris_today",
+                ),
+            ): selector({"entity": {"domain": "sensor"}}),
+            vol.Required(
+                "price_tomorrow_entity",
+                default=current_data.get(
+                    "price_tomorrow_entity",
+                    "sensor.elpris_tomorrow",
+                ),
+            ): selector({"entity": {"domain": "sensor"}}),
+            vol.Optional(
+                "thermal_intelligence_enabled",
+                default=current_data.get("thermal_intelligence_enabled", False),
+            ): selector({"boolean": {}}),
+            vol.Optional(
+                "external_heat_sources",
+                default=current_data.get("external_heat_sources", False),
+            ): selector({"boolean": {}}),
+            vol.Optional(
+                "thermal_heat_activity_entity",
+                description={
+                    "suggested_value": current_data.get("thermal_heat_activity_entity")
+                },
+            ): selector({"entity": {"domain": "binary_sensor"}}),
+            vol.Optional(
+                "thermal_power_entity",
+                description={
+                    "suggested_value": current_data.get("thermal_power_entity")
+                },
+            ): selector({"entity": {"domain": "sensor", "device_class": "power"}}),
+            vol.Optional(
+                "thermal_hot_water_mode_entity",
+                description={
+                    "suggested_value": current_data.get("thermal_hot_water_mode_entity")
+                },
+            ): selector({"entity": {"domain": "binary_sensor"}}),
+            vol.Optional(
+                "thermal_supply_temp_entity",
+                description={
+                    "suggested_value": current_data.get("thermal_supply_temp_entity")
+                },
+            ): selector(
+                {"entity": {"domain": "sensor", "device_class": "temperature"}}
+            ),
+            vol.Optional(
+                "thermal_heating_mode_entity",
+                description={
+                    "suggested_value": current_data.get("thermal_heating_mode_entity")
+                },
+            ): selector({"entity": {"domain": "binary_sensor"}}),
+            vol.Optional(
+                "thermal_heating_mode_inverted",
+                default=current_data.get("thermal_heating_mode_inverted", False),
+            ): selector({"boolean": {}}),
+            vol.Optional(
+                "thermal_supply_threshold",
+                default=current_data.get("thermal_supply_threshold", 30),
+            ): selector(
                 {
-                    vol.Required(
-                        "indoor_temp_entity",
-                        default=current_data.get("indoor_temp_entity"),
-                    ): selector(
-                        {"entity": {"domain": "sensor", "device_class": "temperature"}}
-                    ),
-                    vol.Required(
-                        "real_outdoor_entity",
-                        default=current_data.get("real_outdoor_entity"),
-                    ): selector(
-                        {"entity": {"domain": "sensor", "device_class": "temperature"}}
-                    ),
-                    vol.Optional(
-                        "weather_entity",
-                        description={
-                            "suggested_value": current_data.get("weather_entity")
-                        },
-                    ): selector({"entity": {"domain": "weather"}}),
-                    vol.Required(
-                        "electricity_price_entity",
-                        default=current_data.get(
-                            "electricity_price_entity",
-                            "sensor.elpris_today",
-                        ),
-                    ): selector({"entity": {"domain": "sensor"}}),
-                    vol.Required(
-                        "price_tomorrow_entity",
-                        default=current_data.get(
-                            "price_tomorrow_entity",
-                            "sensor.elpris_tomorrow",
-                        ),
-                    ): selector({"entity": {"domain": "sensor"}}),
-                    vol.Optional(
-                        "thermal_intelligence_enabled",
-                        default=current_data.get("thermal_intelligence_enabled", False),
-                    ): selector({"boolean": {}}),
-                    vol.Optional(
-                        "external_heat_sources",
-                        default=current_data.get("external_heat_sources", False),
-                    ): selector({"boolean": {}}),
-                    vol.Optional(
-                        "thermal_heat_activity_entity",
-                        description={
-                            "suggested_value": current_data.get(
-                                "thermal_heat_activity_entity"
-                            )
-                        },
-                    ): selector({"entity": {"domain": "binary_sensor"}}),
-                    vol.Optional(
-                        "thermal_power_entity",
-                        description={
-                            "suggested_value": current_data.get("thermal_power_entity")
-                        },
-                    ): selector(
-                        {"entity": {"domain": "sensor", "device_class": "power"}}
-                    ),
-                    vol.Optional(
-                        "thermal_hot_water_mode_entity",
-                        description={
-                            "suggested_value": current_data.get(
-                                "thermal_hot_water_mode_entity"
-                            )
-                        },
-                    ): selector({"entity": {"domain": "binary_sensor"}}),
-                    vol.Optional(
-                        "thermal_supply_temp_entity",
-                        description={
-                            "suggested_value": current_data.get(
-                                "thermal_supply_temp_entity"
-                            )
-                        },
-                    ): selector(
-                        {"entity": {"domain": "sensor", "device_class": "temperature"}}
-                    ),
-                    vol.Optional(
-                        "thermal_heating_mode_entity",
-                        description={
-                            "suggested_value": current_data.get(
-                                "thermal_heating_mode_entity"
-                            )
-                        },
-                    ): selector({"entity": {"domain": "binary_sensor"}}),
-                    vol.Optional(
-                        "thermal_heating_mode_inverted",
-                        default=current_data.get(
-                            "thermal_heating_mode_inverted", False
-                        ),
-                    ): selector({"boolean": {}}),
-                    vol.Optional(
-                        "thermal_supply_threshold",
-                        default=current_data.get("thermal_supply_threshold", 30),
-                    ): selector(
-                        {
-                            "number": {
-                                "min": 0,
-                                "max": 60,
-                                "step": 0.5,
-                                "unit_of_measurement": "°C",
-                                "mode": "box",
-                            }
-                        }
-                    ),
-                    vol.Optional(
-                        "notify_service",
-                        default=current_data.get("notify_service", ""),
-                    ): selector({"text": {}}),
-                    vol.Optional(
-                        NOTIFICATION_LEVEL_OPTION,
-                        default=current_data.get(NOTIFICATION_LEVEL_OPTION, "all"),
-                    ): selector(
-                        {
-                            "select": {
-                                "options": [
-                                    {
-                                        "value": "all",
-                                        "label": "All price notifications",
-                                    },
-                                    {"value": "braking_only", "label": "Braking only"},
-                                    {"value": "off", "label": "No price notifications"},
-                                ],
-                                "mode": "dropdown",
-                            }
-                        }
-                    ),
-                    vol.Optional(
-                        NOTIFICATION_COOLDOWN_OPTION,
-                        default=str(
-                            current_data.get(NOTIFICATION_COOLDOWN_OPTION, "0")
-                        ),
-                    ): selector(
-                        {
-                            "select": {
-                                "options": [
-                                    {"value": "0", "label": "No repeat limit"},
-                                    {"value": "30", "label": "30 minutes"},
-                                    {
-                                        "value": "60",
-                                        "label": "60 minutes (recommended)",
-                                    },
-                                    {"value": "120", "label": "120 minutes"},
-                                ],
-                                "mode": "dropdown",
-                            }
-                        }
-                    ),
-                    vol.Optional(
-                        "ohmigo_entity",
-                        default=current_data.get("ohmigo_entity", ""),
-                    ): selector(
-                        {
-                            "select": {
-                                "options": number_entities,
-                                "custom_value": True,
-                                "mode": "dropdown",
-                            }
-                        }
-                    ),
-                    vol.Optional(
-                        OHMIGO_RELAY_ENTITY,
-                        description={
-                            "suggested_value": current_data.get(OHMIGO_RELAY_ENTITY, "")
-                        },
-                    ): selector({"entity": {"domain": "switch"}}),
-                    vol.Optional(
-                        "ohmigo_interval_minutes",
-                        default=current_data.get("ohmigo_interval_minutes", 5),
-                    ): selector(
-                        {
-                            "number": {
-                                "min": 1,
-                                "max": 60,
-                                "step": 1,
-                                "unit_of_measurement": "min",
-                                "mode": "slider",
-                            }
-                        }
-                    ),
-                    vol.Optional(
-                        "modbus_service",
-                        default=current_data.get("modbus_service", ""),
-                    ): selector({"text": {}}),
-                    vol.Optional(
-                        "modbus_payload_template",
-                        default=current_data.get("modbus_payload_template", ""),
-                    ): selector({"text": {"multiline": True}}),
-                    vol.Optional(
-                        "modbus_interval_minutes",
-                        default=current_data.get("modbus_interval_minutes", 5),
-                    ): selector(
-                        {
-                            "number": {
-                                "min": 1,
-                                "max": 60,
-                                "step": 1,
-                                "unit_of_measurement": "min",
-                                "mode": "slider",
-                            }
-                        }
-                    ),
+                    "number": {
+                        "min": 0,
+                        "max": 60,
+                        "step": 0.5,
+                        "unit_of_measurement": "°C",
+                        "mode": "box",
+                    }
                 }
             ),
-            errors=errors,
+            vol.Optional(
+                "notify_service",
+                default=current_data.get("notify_service", ""),
+            ): selector({"text": {}}),
+            vol.Optional(
+                NOTIFICATION_LEVEL_OPTION,
+                default=current_data.get(NOTIFICATION_LEVEL_OPTION, "all"),
+            ): selector(
+                {
+                    "select": {
+                        "options": [
+                            {
+                                "value": "all",
+                                "label": "All price notifications",
+                            },
+                            {"value": "braking_only", "label": "Braking only"},
+                            {"value": "off", "label": "No price notifications"},
+                        ],
+                        "mode": "dropdown",
+                    }
+                }
+            ),
+            vol.Optional(
+                NOTIFICATION_COOLDOWN_OPTION,
+                default=str(current_data.get(NOTIFICATION_COOLDOWN_OPTION, "0")),
+            ): selector(
+                {
+                    "select": {
+                        "options": [
+                            {"value": "0", "label": "No repeat limit"},
+                            {"value": "30", "label": "30 minutes"},
+                            {
+                                "value": "60",
+                                "label": "60 minutes (recommended)",
+                            },
+                            {"value": "120", "label": "120 minutes"},
+                        ],
+                        "mode": "dropdown",
+                    }
+                }
+            ),
+            vol.Optional(
+                "ohmigo_entity",
+                default=current_data.get("ohmigo_entity", ""),
+            ): selector(
+                {
+                    "select": {
+                        "options": number_entities,
+                        "custom_value": True,
+                        "mode": "dropdown",
+                    }
+                }
+            ),
+            vol.Optional(
+                OHMIGO_RELAY_ENTITY,
+                description={
+                    "suggested_value": current_data.get(OHMIGO_RELAY_ENTITY, "")
+                },
+            ): selector({"entity": {"domain": "switch"}}),
+            vol.Optional(
+                "ohmigo_interval_minutes",
+                default=current_data.get("ohmigo_interval_minutes", 5),
+            ): selector(
+                {
+                    "number": {
+                        "min": 1,
+                        "max": 60,
+                        "step": 1,
+                        "unit_of_measurement": "min",
+                        "mode": "slider",
+                    }
+                }
+            ),
+            vol.Optional(
+                "modbus_service",
+                default=current_data.get("modbus_service", ""),
+            ): selector({"text": {}}),
+            vol.Optional(
+                "modbus_payload_template",
+                default=current_data.get("modbus_payload_template", ""),
+            ): selector({"text": {"multiline": True}}),
+            vol.Optional(
+                "modbus_interval_minutes",
+                default=current_data.get("modbus_interval_minutes", 5),
+            ): selector(
+                {
+                    "number": {
+                        "min": 1,
+                        "max": 60,
+                        "step": 1,
+                        "unit_of_measurement": "min",
+                        "mode": "slider",
+                    }
+                }
+            ),
+        }
+        selected = {
+            k: v
+            for k, v in fields.items()
+            if getattr(k, "schema", k[0] if isinstance(k, tuple) else k)
+            in _GROUPS[section]
+        }
+        return self.async_show_form(
+            step_id=section, data_schema=vol.Schema(selected), errors=errors
         )
 
     def _validate_entities(self, user_input):

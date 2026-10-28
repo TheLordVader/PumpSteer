@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import math
 from datetime import datetime, timedelta, timezone
@@ -8,6 +9,10 @@ from homeassistant.components.sensor import SensorEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.dispatcher import (
+    async_dispatcher_connect,
+    async_dispatcher_send,
+)
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers.typing import StateType
@@ -113,6 +118,8 @@ class PumpSteerSensor(RestoreEntity):
     # Keep detailed, potentially large passive plans visible in HA without
     # duplicating them in Recorder on every controller state update. Qualified
     # outcome evidence is persisted separately in the bounded HA Store.
+    _attr_has_entity_name = True
+    _attr_translation_key = "control_temperature"
     _unrecorded_attributes = frozenset(
         {"thermal_intelligence_plan_detail", "thermal_intelligence_plan_outcomes"}
     )
@@ -122,6 +129,10 @@ class PumpSteerSensor(RestoreEntity):
         self._config_entry = config_entry
         self._state: Optional[float] = None
         self._attributes: Dict[str, Any] = {}
+        self._input_temperatures: Dict[str, Optional[float]] = {}
+        self._input_temperature_signal = (
+            f"{DOMAIN}_{config_entry.entry_id}_input_temperatures"
+        )
         self._ohmigo_last_push = None
         self._temperature_reported_after: Optional[datetime] = None
         self._remove_start_listener = None
@@ -212,6 +223,7 @@ class PumpSteerSensor(RestoreEntity):
         self._remove_update_listener = None
 
         self._attr_unique_id = config_entry.entry_id
+        self.entity_id = "sensor.pumpsteer"
         self._forecast_available_last: Optional[bool] = None
         self._safe_mode_warned: bool = False
         self._helper_fallback_issues: Dict[str, Optional[str]] = {
@@ -233,10 +245,6 @@ class PumpSteerSensor(RestoreEntity):
         )
 
     @property
-    def name(self) -> str:
-        return "PumpSteer"
-
-    @property
     def unique_id(self) -> str:
         return self._attr_unique_id
 
@@ -246,7 +254,7 @@ class PumpSteerSensor(RestoreEntity):
 
     @property
     def extra_state_attributes(self) -> dict:
-        attrs = {**self._attributes, "friendly_name": "PumpSteer"}
+        attrs = {**self._attributes}
         for key in (
             "thermal_intelligence_status",
             "thermal_intelligence_reason",
@@ -507,6 +515,8 @@ class PumpSteerSensor(RestoreEntity):
     async def async_will_remove_from_hass(self) -> None:
         """Cancel options update listener on unload."""
         self._temperature_unloaded = True
+        self._input_temperatures = {}
+        async_dispatcher_send(self.hass, self._input_temperature_signal)
         if self._cfg().get("thermal_intelligence_enabled") is True:
             try:
                 self._plan_audit.cancel_plans("unload")
@@ -1091,6 +1101,7 @@ class PumpSteerSensor(RestoreEntity):
         )
 
     async def _temperature_interrupted(self, cfg) -> None:
+        self._input_temperatures = {}
         # Options invalidation is retried; it must not reset PI/ramp history.
         if self._cfg() != cfg:
             return
@@ -1219,6 +1230,7 @@ class PumpSteerSensor(RestoreEntity):
         try:
             while True:
                 self._options_update_pending = False
+                self._input_temperatures = {}
                 try:
                     if self._temperature_unloaded or not getattr(
                         self.hass, "is_running", True
@@ -1229,6 +1241,7 @@ class PumpSteerSensor(RestoreEntity):
                         return
                     await self._do_update()
                 except Exception as err:
+                    self._input_temperatures = {}
                     if self._pilot is not None:
                         self._pilot.reset_interval()
                     self._pilot_status = "update_error"
@@ -1245,8 +1258,12 @@ class PumpSteerSensor(RestoreEntity):
                     }
                 if not self._options_update_pending:
                     break
+        except asyncio.CancelledError:
+            self._input_temperatures = {}
+            raise
         finally:
             self._update_in_progress = False
+            async_dispatcher_send(self.hass, self._input_temperature_signal)
 
     async def _do_update(self) -> None:
         """Run the main control state machine."""
@@ -1269,6 +1286,10 @@ class PumpSteerSensor(RestoreEntity):
         outdoor = get_temperature(
             self.hass, cfg.get("real_outdoor_entity"), self._temperature_reported_after
         )
+        self._input_temperatures = {
+            "indoor_temperature": indoor,
+            "outdoor_temperature": outdoor,
+        }
         if cfg.get("thermal_intelligence_enabled") is True:
             self._plan_cycle_identity = self._plan_current_identity(cfg)
         target = self._helper_value_with_fallback(
@@ -3699,6 +3720,141 @@ class PumpSteerSensor(RestoreEntity):
             self._pilot_status = "learning_error"
 
 
+class PumpSteerInputTemperatureSensor(SensorEntity):
+    """Expose the qualified control input, without another source read."""
+
+    _attr_has_entity_name = True
+    _attr_should_poll = False
+    _attr_native_unit_of_measurement = "°C"
+    _attr_device_class = "temperature"
+    _attr_state_class = "measurement"
+    _attr_native_value = None
+
+    def __init__(self, controller: PumpSteerSensor, key: str) -> None:
+        self._controller = controller
+        self._key = key
+        self._attr_translation_key = key
+        self._attr_unique_id = f"{controller.unique_id}_{key}"
+        self._attr_device_info = controller._attr_device_info
+
+    @property
+    def available(self) -> bool:
+        return self._attr_native_value is not None
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        self.async_on_remove(
+            async_dispatcher_connect(
+                self.hass,
+                self._controller._input_temperature_signal,
+                self._async_update_from_controller,
+            )
+        )
+        if not self._controller._update_in_progress:
+            self._async_update_from_controller()
+
+    @callback
+    def _async_update_from_controller(self) -> None:
+        value = self._controller._input_temperatures.get(self._key)
+        if value != self._attr_native_value:
+            self._attr_native_value = value
+            self.async_write_ha_state()
+
+
+class PumpSteerThermalStatusSensor(SensorEntity):
+    """Compact passive status, updated only when its summary changes."""
+
+    _attr_has_entity_name = True
+    _attr_should_poll = False
+    _attr_translation_key = "thermal_intelligence"
+    _attr_icon = "mdi:brain"
+    _attr_device_class = "enum"
+    _attr_options = [
+        "disabled",
+        "waiting",
+        "learning",
+        "hypothetical_plan",
+        "validated_plan",
+        "unavailable",
+    ]
+    _attr_native_value = None
+
+    def __init__(self, controller: PumpSteerSensor) -> None:
+        self._controller = controller
+        self._attr_unique_id = f"{controller.unique_id}_thermal_intelligence"
+        self._attr_device_info = controller._attr_device_info
+        self._summary = {}
+
+    @property
+    def extra_state_attributes(self):
+        return self._summary
+
+    async def async_added_to_hass(self):
+        await super().async_added_to_hass()
+        self.async_on_remove(
+            async_dispatcher_connect(
+                self.hass,
+                self._controller._input_temperature_signal,
+                self._async_update_from_controller,
+            )
+        )
+        if not self._controller._update_in_progress:
+            self._async_update_from_controller()
+
+    @callback
+    def _async_update_from_controller(self):
+        controller = self._controller
+        cfg = controller._cfg()
+        enabled = cfg.get("thermal_intelligence_enabled") is True
+        attrs = controller.extra_state_attributes
+        plan = attrs.get("thermal_intelligence_plan_detail") or {}
+        planning_status = plan.get("planning_status", "unavailable")
+        reason = attrs.get("thermal_intelligence_reason")
+        if not enabled:
+            state = "disabled"
+        elif controller._temperature_unloaded or attrs.get("mode") == "safe_mode":
+            state = "unavailable"
+        elif planning_status == "hypothetical_unvalidated":
+            state = "hypothetical_plan"
+        elif planning_status == "validated_passive":
+            state = "validated_plan"
+        elif reason in ("learning_error", "update_error", "history_unavailable"):
+            state = "unavailable"
+        elif attrs.get("thermal_intelligence_learning_intervals", 0) and attrs.get(
+            "thermal_intelligence_status"
+        ) in {
+            "learning",
+            "insufficient_history",
+            "insufficient_weather_variation",
+            "gain_frozen",
+            "ill_conditioned",
+        }:
+            state = "learning"
+        else:
+            state = "waiting"
+        summary = {
+            "enabled": enabled,
+            "passive": True,
+            "planning_status": planning_status if enabled else "unavailable",
+            "reason": reason if enabled else None,
+            "plan_reason": plan.get("reason") if enabled else None,
+            "price_forecast": attrs.get("thermal_intelligence_price_forecast"),
+            "heat_source": attrs.get("thermal_intelligence_heat_source"),
+            "heat_entity": cfg.get("thermal_heat_activity_entity")
+            or cfg.get("thermal_supply_temp_entity"),
+            "radiator_mode_entity": cfg.get("thermal_heating_mode_entity"),
+            "hot_water_entity": cfg.get("thermal_hot_water_mode_entity"),
+            "learning_intervals": attrs.get(
+                "thermal_intelligence_learning_intervals", 0
+            ),
+            "model": attrs.get("thermal_intelligence_model"),
+        }
+        if state != self._attr_native_value or summary != self._summary:
+            self._attr_native_value = state
+            self._summary = summary
+            self.async_write_ha_state()
+
+
 class ThermalOutlookSensor(SensorEntity):
     """Exposes ThermalOutlook as a HA sensor for visualization and debugging."""
 
@@ -3800,4 +3956,13 @@ async def async_setup_entry(
     await hass.async_add_executor_job(setup_pump_log)
     sensor = PumpSteerSensor(hass, config_entry)
     outlook_sensor = ThermalOutlookSensor(hass, config_entry)
-    async_add_entities([sensor, outlook_sensor], update_before_add=False)
+    async_add_entities(
+        [
+            sensor,
+            outlook_sensor,
+            PumpSteerInputTemperatureSensor(sensor, "indoor_temperature"),
+            PumpSteerInputTemperatureSensor(sensor, "outdoor_temperature"),
+            PumpSteerThermalStatusSensor(sensor),
+        ],
+        update_before_add=False,
+    )

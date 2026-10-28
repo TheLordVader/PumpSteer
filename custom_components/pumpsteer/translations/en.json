@@ -19,7 +19,17 @@
   "options": {
     "step": {
       "init": {
-        "title": "PumpSteer options",
+        "title": "PumpSteer",
+        "menu_options": {
+          "basic": "Basic settings",
+          "thermal": "Thermal Intelligence",
+          "telemetry": "Advanced sensors",
+          "notifications": "Notifications",
+          "ohmigo": "Ohmigo and safety"
+        }
+      },
+      "basic": {
+        "title": "Basic settings",
         "data": {
           "indoor_temp_entity": "Indoor temperature sensor",
           "real_outdoor_entity": "Outdoor temperature sensor",
@@ -30,18 +40,32 @@
           "pid_kd": "Rapid-change damping (Kd)",
           "pid_integral_clamp": "Long-term correction limit",
           "pid_output_clamp": "Maximum temperature adjustment",
-          "notify_service": "Notification service (optional, e.g. notify.mobile_app_my_phone)",
-          "preheat_boost_enabled": "Enable preheat boost",
-          "ohmigo_entity": "Ohmigo setpoint entity (optional)",
-          "ohmigo_interval_minutes": "Ohmigo push interval",
-          "modbus_service": "Generic output service",
-          "modbus_payload_template": "Generic output payload template",
-          "modbus_interval_minutes": "Generic output push interval",
-          "ohmigo_relay_entity": "Ohmigo Active/Bypass relay (optional)",
-          "notification_level": "Price notification level",
-          "notification_cooldown_minutes": "Repeat notification cooldown",
+          "preheat_boost_enabled": "Enable preheat boost"
+        },
+        "data_description": {
+          "pid_kp": "How strongly PumpSteer reacts to current temperature error. Typical range: 2.0 to 5.0.",
+          "pid_ki": "How much PumpSteer corrects long-term drift. Typical range: 0.01 to 0.05.",
+          "pid_kd": "How much PumpSteer reacts to fast temperature changes. Keep at 0.0 unless you tune it intentionally.",
+          "pid_integral_clamp": "Limits built-up long-term correction to reduce windup. Typical range: 5.0 to 10.0.",
+          "pid_output_clamp": "Caps how many degrees PumpSteer may adjust the setpoint.",
+          "preheat_boost_enabled": "When enabled, PumpSteer heats extra before expensive periods to build up thermal mass."
+        }
+      },
+      "thermal": {
+        "title": "Thermal Intelligence",
+        "data": {
           "thermal_intelligence_enabled": "Thermal Intelligence (experimental diagnostics)",
-          "external_heat_sources": "Do you sometimes use an additional heat source?",
+          "external_heat_sources": "Do you sometimes use an additional heat source?"
+        },
+        "data_description": {
+          "thermal_intelligence_enabled": "Passively collects qualified observations when a verified heat signal is selected. Does not affect heating control.",
+          "external_heat_sources": "For example, a fireplace or air-to-air heat pump. Intermittent extra heat cannot be reliably identified; learned results remain unvalidated."
+        },
+        "description": "Planning and learning are passive and do not change heating control."
+      },
+      "telemetry": {
+        "title": "Advanced sensors",
+        "data": {
           "thermal_heat_activity_entity": "Verified heat delivery to the home (optional)",
           "thermal_supply_temp_entity": "Radiator supply temperature (optional)",
           "thermal_heating_mode_entity": "Verified radiator heating mode (optional)",
@@ -51,23 +75,6 @@
           "thermal_hot_water_mode_entity": "Verified hot-water mode (optional)"
         },
         "data_description": {
-          "pid_kp": "How strongly PumpSteer reacts to current temperature error. Typical range: 2.0 to 5.0.",
-          "pid_ki": "How much PumpSteer corrects long-term drift. Typical range: 0.01 to 0.05.",
-          "pid_kd": "How much PumpSteer reacts to fast temperature changes. Keep at 0.0 unless you tune it intentionally.",
-          "pid_integral_clamp": "Limits built-up long-term correction to reduce windup. Typical range: 5.0 to 10.0.",
-          "pid_output_clamp": "Caps how many degrees PumpSteer may adjust the setpoint.",
-          "notify_service": "Leave empty to use persistent notifications in the HA sidebar instead.",
-          "preheat_boost_enabled": "When enabled, PumpSteer heats extra before expensive periods to build up thermal mass.",
-          "ohmigo_entity": "PumpSteer will push the fake outdoor temperature to this number entity after each update. Leave empty to disable. Toggle without reconfiguring using the 'Ohmigo Push' switch.",
-          "ohmigo_interval_minutes": "Minimum time between pushes to Ohmigo. Default 5 minutes. Changes below 0.2 °C are treated as unchanged, but the current setpoint is resent when the interval is due to keep the Ohmigo watchdog alive.",
-          "modbus_service": "Home Assistant service to call, for example modbus.write_register, mqtt.publish or input_number.set_value.",
-          "modbus_payload_template": "YAML payload template for the service call. The template can use the fake_temp variable.",
-          "modbus_interval_minutes": "Minimum time between Generic Output System service calls.",
-          "ohmigo_relay_entity": "Optional switch entity for the Ohmigo Active/Bypass relay. When configured, PumpSteer exposes a separate Relay Guard switch. The guard only recovers an explicit OFF state while Ohmigo Push is ON; unknown or unavailable states never cause a relay command.",
-          "notification_level": "Choose all price alerts, braking only, or none. The existing Notifications switch remains the master on/off control.",
-          "notification_cooldown_minutes": "Minimum time between repeated alerts of the same type. Choose 0 for no limit; 60 minutes is recommended. Braking and preheating have independent timers.",
-          "thermal_intelligence_enabled": "Passively collects qualified observations when a verified heat signal is selected. Does not affect heating control.",
-          "external_heat_sources": "For example, a fireplace or air-to-air heat pump. Intermittent extra heat cannot be reliably identified; learned results remain unvalidated.",
           "thermal_heat_activity_entity": "A binary sensor whose on means measured heat delivery to the home and off means none. Compressor status or hot-water mode alone is insufficient. Report times do not establish physical measurement time.",
           "thermal_supply_temp_entity": "Select a radiator-circuit sensor. Temperature is an indicator, not measured heat output.",
           "thermal_heating_mode_entity": "Select a verified radiator mode. Required for the supply indicator.",
@@ -76,6 +83,38 @@
           "thermal_power_entity": "Measured electrical input for the equipment being analysed. Energy is estimated from HA reports; it is not delivered heat.",
           "thermal_hot_water_mode_entity": "On means verified hot-water operation. Heat learning pauses when on or unknown; unknown periods are not classified."
         }
+      },
+      "notifications": {
+        "title": "Notifications",
+        "data": {
+          "notify_service": "Notification service (optional, e.g. notify.mobile_app_my_phone)",
+          "notification_level": "Price notification level",
+          "notification_cooldown_minutes": "Repeat notification cooldown"
+        },
+        "data_description": {
+          "notify_service": "Leave empty to use persistent notifications in the HA sidebar instead.",
+          "notification_level": "Choose all price alerts, braking only, or none. The existing Notifications switch remains the master on/off control.",
+          "notification_cooldown_minutes": "Minimum time between repeated alerts of the same type. Choose 0 for no limit; 60 minutes is recommended. Braking and preheating have independent timers."
+        }
+      },
+      "ohmigo": {
+        "title": "Ohmigo and safety",
+        "data": {
+          "ohmigo_entity": "Ohmigo setpoint entity (optional)",
+          "ohmigo_interval_minutes": "Ohmigo push interval",
+          "modbus_service": "Generic output service",
+          "modbus_payload_template": "Generic output payload template",
+          "modbus_interval_minutes": "Generic output push interval",
+          "ohmigo_relay_entity": "Ohmigo Active/Bypass relay (optional)"
+        },
+        "data_description": {
+          "ohmigo_entity": "PumpSteer will push the fake outdoor temperature to this number entity after each update. Leave empty to disable. Toggle without reconfiguring using the 'Ohmigo Push' switch.",
+          "ohmigo_interval_minutes": "Minimum time between pushes to Ohmigo. Default 5 minutes. Changes below 0.2 °C are treated as unchanged, but the current setpoint is resent when the interval is due to keep the Ohmigo watchdog alive.",
+          "modbus_service": "Home Assistant service to call, for example modbus.write_register, mqtt.publish or input_number.set_value.",
+          "modbus_payload_template": "YAML payload template for the service call. The template can use the fake_temp variable.",
+          "modbus_interval_minutes": "Minimum time between Generic Output System service calls.",
+          "ohmigo_relay_entity": "Optional switch entity for the Ohmigo Active/Bypass relay. When configured, PumpSteer exposes a separate Relay Guard switch. The guard only recovers an explicit OFF state while Ohmigo Push is ON; unknown or unavailable states never cause a relay command."
+        }
       }
     },
     "error": {
@@ -83,6 +122,30 @@
       "entity_not_found": "Entity not found",
       "entity_unavailable": "Entity unavailable",
       "invalid_notification_setting": "Invalid notification setting"
+    }
+  },
+  "entity": {
+    "sensor": {
+      "indoor_temperature": {
+        "name": "Indoor temperature"
+      },
+      "outdoor_temperature": {
+        "name": "Outdoor temperature"
+      },
+      "control_temperature": {
+        "name": "Control temperature"
+      },
+      "thermal_intelligence": {
+        "name": "Thermal Intelligence",
+        "state": {
+          "disabled": "Disabled",
+          "waiting": "Passive – waiting for data",
+          "learning": "Passive – collecting observations",
+          "unavailable": "Passive – temporarily unavailable",
+          "hypothetical_plan": "Passive – hypothetical plan",
+          "validated_plan": "Passive – validated model plan"
+        }
+      }
     }
   }
 }

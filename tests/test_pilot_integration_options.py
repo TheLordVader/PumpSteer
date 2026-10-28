@@ -25,20 +25,20 @@ def test_options_flow_defaults_and_retains_explicit_values(monkeypatch):
         lambda name, default=None, **kwargs: (name, default),
     )
     flow.async_show_form = lambda **kwargs: kwargs
-    schema = asyncio.run(flow.async_step_init())["data_schema"]
+    schema = asyncio.run(flow.async_step_thermal())["data_schema"]
     assert ("thermal_intelligence_enabled", False) in schema
     assert ("external_heat_sources", False) in schema
     flow.config_entry.options = {
         "thermal_intelligence_enabled": True,
         "external_heat_sources": True,
     }
-    schema = asyncio.run(flow.async_step_init())["data_schema"]
+    schema = asyncio.run(flow.async_step_thermal())["data_schema"]
     assert ("thermal_intelligence_enabled", True) in schema
     assert ("external_heat_sources", True) in schema
     flow._validate_entities = lambda data: {}
     flow.async_create_entry = lambda **kwargs: kwargs
     saved = asyncio.run(
-        flow.async_step_init(
+        flow.async_step_thermal(
             {"thermal_intelligence_enabled": True, "external_heat_sources": True}
         )
     )
@@ -97,7 +97,7 @@ def test_safe_and_recovery_never_turn_on_assistance(monkeypatch):
 def test_both_settings_have_english_and_swedish_text():
     root = Path(__file__).parents[1] / "custom_components/pumpsteer"
     for name in ("strings.json", "translations/en.json", "translations/sv.json"):
-        section = json.loads((root / name).read_text())["options"]["step"]["init"]
+        section = json.loads((root / name).read_text())["options"]["step"]["thermal"]
         for key in ("thermal_intelligence_enabled", "external_heat_sources"):
             assert section["data"][key] and section["data_description"][key]
 
@@ -526,7 +526,7 @@ def test_options_offer_supply_mode_and_threshold(monkeypatch):
         lambda name, default=None, **kwargs: (name, default),
     )
     flow.async_show_form = lambda **kwargs: kwargs
-    schema = asyncio.run(flow.async_step_init())["data_schema"]
+    schema = asyncio.run(flow.async_step_telemetry())["data_schema"]
     assert any(
         key[0] == "thermal_supply_temp_entity"
         for key in schema

@@ -46,6 +46,15 @@ Kandidaten är `experiment/thermal-pilot-integration-20261027` på
    kan vara en annan kod: använd ingen HACS-installation utan verifierad exakt
    källa. Automatisk HACS-överskrivning under provet måste vara utesluten eller
    särskilt hanterad med godkännande. Använd inte två PumpSteer-kopior/domäner.
+   Förbered och bevara alltid staging och rollback **utanför** `custom_components`:
+   HA läser även dolda underkatalogers manifest. Före varje uppstart ska
+   `python3 scripts/check_pumpsteer_package.py <konfigurationskatalog>/custom_components`
+   visa exakt en PumpSteer-domän och endast katalogen `pumpsteer`. Avstå vid
+   oläsbara manifest eller dubbla kopior; ta inte bort andra integrationer.
+   Kontrollera det lokalt byggda paketet före överföring. För den faktiska
+   HA-katalogen kan samma skript efter separat GO skickas via standardindata
+   genom den etablerade SSH-profilen till `sudo -n python3 -B - /config/custom_components`;
+   kontrollen är läsande och installerar ingen tjänst.
 4. Vid avtalat tillfälle och efter godkännande för filbyte **och HA Core-omstart**:
    lägg kandidatens kompletta katalog på den verifierade installationsplatsen,
    kontrollera hash och starta om Core enligt installationens befintliga rutin.
