@@ -524,6 +524,22 @@ class ThermalModel:
             duration_minutes,
         )
 
+    def predict_bounded_drop(
+        self, indoor: float, outdoor: float, duration_minutes: float
+    ) -> Optional[float]:
+        """Conditional net response with constant outdoor and unchanged operation.
+
+        Integrate the existing empirical rate rather than extrapolating its initial
+        slope indefinitely. This does not identify heat loss or delivered heat.
+        """
+        if not all(math.isfinite(x) for x in (indoor, outdoor, duration_minutes)):
+            return None
+        if duration_minutes < 0 or duration_minutes > 120:
+            return None
+        return max(0.0, indoor - outdoor) * -math.expm1(
+            -self._k * duration_minutes / 60.0
+        )
+
     def predict_drop_profile(
         self,
         indoor: float,

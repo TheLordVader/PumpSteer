@@ -283,3 +283,67 @@ def test_sensor_closes_session_when_braking_stops():
     assert sensor._thermal_model.learning_sessions == 1
     assert sensor._thermal_model.validated_sessions == 1
     assert sensor._thermal_learning_reason == "price_not_expensive"
+
+
+@pytest.mark.parametrize("outdoor", [10.0, 0.0, -15.0])
+@pytest.mark.parametrize("minutes", [30, 60, 120])
+def test_bounded_response_fixed_horizon(outdoor, minutes):
+    import math
+
+    model = ThermalModel()
+    model.restore_k(0.03)
+    expected = outdoor + (21.0 - outdoor) * math.exp(-0.03 * minutes / 60)
+    predicted = 21.0 - model.predict_bounded_drop(21.0, outdoor, minutes)
+    assert predicted == pytest.approx(expected)
+    linear = 21.0 - model.predict_drop(21.0, outdoor, minutes)
+    assert abs(predicted - expected) < abs(linear - expected)
+    assert abs(predicted - expected) < abs(21.0 - expected)
+
+
+def test_bounded_response_rejects_invalid_and_negative_horizon():
+    model = ThermalModel()
+    assert model.predict_bounded_drop(21, 5, -1) is None
+    assert model.predict_bounded_drop(float("nan"), 5, 60) is None
+
+
+def test_learned_response_on_separated_synthetic_braking_periods():
+    """Learn only observed temperatures; score fixed horizons on later episodes."""
+    import math
+
+    results = []
+    for outdoor in (10.0, 0.0, -15.0):
+        model = ThermalModel()
+        # Training is a separate stable-braking episode, without a heat input.
+        for minute in range(100):
+            indoor = outdoor + (21.0 - outdoor) * math.exp(-0.03 * minute / 60)
+            model.record_temp(_START + timedelta(minutes=minute), indoor)
+            model.collect_braking_sample(indoor, outdoor)
+        assert model.fit()
+        for horizon in (30, 60, 120):
+            start = 20.5
+            actual = outdoor + (start - outdoor) * math.exp(-0.03 * horizon / 60)
+            bounded = start - model.predict_bounded_drop(start, outdoor, horizon)
+            linear = start - model.predict_drop(start, outdoor, horizon)
+            results.append(
+                (abs(actual - bounded), abs(actual - linear), abs(actual - start))
+            )
+    means = [sum(row[i] for row in results) / len(results) for i in range(3)]
+    print("heldout_MAE bounded/linear/persistence:", means)
+    assert means[0] < means[1] < means[2]
+
+
+def test_ha_conditional_projection_is_not_validated_by_old_session_metrics():
+    sensor = _sensor()
+    sensor._thermal_model.restore_k(0.03)
+    sensor._thermal_model.restore_diagnostics(validated_sessions=2, prediction_mae=0.01)
+    sensor._thermal_learning_active = True
+    attrs = sensor._base_attrs(21.0, 21.0, 5.0, "expensive", 3)
+    assert attrs["thermal_conditional_drop_60m_c"] > 0
+    assert attrs["thermal_conditional_forecast_status"] == "experimental_unvalidated"
+    sensor._thermal_learning_active = False
+    assert (
+        sensor._base_attrs(21.0, 21.0, 5.0, "normal", 3)[
+            "thermal_conditional_drop_60m_c"
+        ]
+        is None
+    )

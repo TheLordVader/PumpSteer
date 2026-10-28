@@ -993,6 +993,15 @@ class PumpSteerSensor(RestoreEntity):
             "thermal_learning_sessions": self._thermal_model.learning_sessions,
             "thermal_validated_sessions": self._thermal_model.validated_sessions,
             "thermal_validation_basis": VALIDATION_BASIS,
+            "thermal_conditional_drop_60m_c": (
+                self._thermal_model.predict_bounded_drop(indoor, outdoor, 60)
+                if self._thermal_learning_active
+                and self._thermal_model.is_valid
+                and indoor is not None
+                and outdoor is not None
+                else None
+            ),
+            "thermal_conditional_forecast_status": "experimental_unvalidated",
             "thermal_prediction_mae_c": (
                 round(self._thermal_model.prediction_mae, 3)
                 if self._thermal_model.prediction_mae is not None
