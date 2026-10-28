@@ -170,3 +170,98 @@ def test_restore_rejects_multiple_outcomes_for_one_forecast():
     restored = ForecastAudit()
     restored.restore({"records": [first, different_outcome]}, T + timedelta(hours=1))
     assert restored.summary("a")["count"] == 0
+
+
+def test_fixed_horizons_share_outcomes_and_freeze_parameters():
+    audit = ForecastAudit()
+    assert audit.issue_fixed(T, 21, 5, 0.03, ("inside", "outside"))
+    assert not audit.issue_fixed(
+        T + timedelta(minutes=1), 22, 0, 0.2, ("inside", "outside")
+    )
+    for horizon in (30, 60, 120):
+        at = T + timedelta(minutes=horizon)
+        audit.observe_fixed(at, state(20.9, at), ("inside", "outside"))
+    assert len(audit.fixed_records) == 3
+    assert {r["horizon"] for r in audit.fixed_records} == {30, 60, 120}
+    assert all(r["predictions"][2] == 21 for r in audit.fixed_records)
+    assert audit.fixed_summary()["60"]["status"] == "insufficient_evidence"
+
+
+def test_fixed_missed_outcome_and_source_change_are_not_filled():
+    audit = ForecastAudit()
+    audit.issue_fixed(T, 21, 5, 0.03, ("a", "b"))
+    audit.observe_fixed(T + timedelta(minutes=36), state(20, T), ("a", "b"))
+    assert not audit.fixed_records
+    audit.observe_fixed(
+        T + timedelta(minutes=60),
+        state(20, T + timedelta(minutes=60)),
+        ("changed", "b"),
+    )
+    assert not audit.fixed_pending
+
+
+def test_fixed_trust_requires_many_separated_days_and_nonzero_baseline():
+    audit = ForecastAudit()
+    for i in range(12):
+        at = T + timedelta(hours=6 * i)
+        assert audit.issue_fixed(at, 21, 5, 0.03, ("a", "b"))
+        # Bounded model matches this test outcome, not a claim of real validation.
+        actual = audit.fixed_pending["predictions"][60][1]
+        audit.observe_fixed(
+            at + timedelta(minutes=60),
+            state(actual, at + timedelta(minutes=60)),
+            ("a", "b"),
+        )
+        audit.fixed_pending = None
+        if i < 11:
+            assert audit.fixed_summary()["60"]["status"] == "insufficient_evidence"
+    assert audit.fixed_summary()["60"]["status"] == "improved"
+    for row in audit.fixed_records:
+        row["actual"] = 21
+    summary = audit.fixed_summary()["60"]
+    assert summary["status"] == "insufficient_evidence"
+    assert summary["skill"] is None
+
+
+def test_fixed_restore_completed_only_and_rejects_corrupt_rows():
+    audit = ForecastAudit()
+    audit.issue_fixed(T, 21, 5, 0.03, ("a", "b"))
+    audit.observe_fixed(
+        T + timedelta(minutes=30), state(20.9, T + timedelta(minutes=30)), ("a", "b")
+    )
+    payload = audit.export_plan()
+    restored = ForecastAudit()
+    restored.restore_plan(payload, T + timedelta(minutes=35))
+    assert restored.fixed_pending is None
+    assert len(restored.fixed_records) == 1
+    payload["fixed_v1"][0]["predictions"] = [float("nan"), 1, 2]
+    restored.restore_plan(payload, T + timedelta(minutes=35))
+    assert not restored.fixed_records
+
+
+@pytest.mark.parametrize(
+    "error,status", [(0.3, "worse_than_persistence"), (0.1, "comparable")]
+)
+def test_fixed_summary_distinguishes_worse_from_comparable(error, status):
+    audit = ForecastAudit()
+    for i in range(12):
+        at = T + timedelta(hours=6 * i)
+        audit.fixed_records.append(
+            {
+                "issued": at.isoformat(),
+                "observed": (at + timedelta(hours=1)).isoformat(),
+                "identity": ["a", "b"],
+                "horizon": 60,
+                "predictions": [20.0, 20.0 + error, 20.1],
+                "actual": 20.0,
+            }
+        )
+    assert audit.fixed_summary()["60"]["status"] == status
+
+
+def test_fixed_pending_is_dropped_by_safe_unload_or_disable():
+    audit = ForecastAudit()
+    audit.issue_fixed(T, 21, 5, 0.03, ("a", "b"))
+    audit.cancel_plans("safe_mode")
+    assert audit.fixed_pending is None
+    assert audit.issue_fixed(T + timedelta(minutes=125), 20.8, 4, 0.03, ("a", "b"))

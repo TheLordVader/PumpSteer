@@ -335,3 +335,26 @@ def test_valid_temperatures_remain_visible_when_prices_missing(
     asyncio.run(controller.async_update())
     assert [e.native_value for e in entities] == [21.0, -3.3]
     assert [e.available for e in entities] == [True, True]
+
+
+def test_fixed_audit_completes_in_control_cycle_and_uses_existing_store(temperatures):
+    controller, states, clock, _, _ = temperatures
+    controller._config_entry.options = {
+        **controller._config_entry.options,
+        "thermal_intelligence_enabled": True,
+    }
+    saved = []
+    controller._pilot_store = SimpleNamespace(
+        async_delay_save=lambda callback, delay: saved.append(callback())
+    )
+    controller._thermal_model.restore_k(0.03)
+    controller._update_thermal_learning(
+        active=True, reason="stable_braking", now=clock[0], indoor=21, outdoor=-3.3
+    )
+    assert controller._plan_audit.fixed_pending is not None
+    clock[0] += timedelta(minutes=60)
+    _report(states, clock, unit_of_measurement="°C")
+    asyncio.run(controller._do_update())
+    assert len(controller._plan_audit.fixed_records) == 1
+    assert controller._plan_audit.fixed_records[0]["horizon"] == 60
+    assert saved[-1]["plan_audit"]["fixed_v1"][0]["horizon"] == 60

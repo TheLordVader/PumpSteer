@@ -666,3 +666,41 @@ def test_conditional_pi_fallback_refuses_known_future_overlay(conflict):
         },
     )
     assert result["comparison"]["baseline"] == "unavailable"
+
+
+def _assert_complete_comparison(result, start):
+    """HCO no-horizon-end-drain contract; unknown storage is not free energy."""
+    assert result["baseline_temperatures"][0] == start
+    assert result["pilot_temperatures"][0] == start
+    assert len(result["baseline_temperatures"]) == len(result["pilot_temperatures"])
+    assert result["baseline_final_temperature"] == result["baseline_temperatures"][-1]
+    assert result["pilot_final_temperature"] == result["pilot_temperatures"][-1]
+    assert result["heat_storage"] == "unknown"
+    assert result["savings"] == "unverified"
+    assert result["proxy_definition"] == "price_times_model_heat_fraction_not_currency"
+
+
+def test_complete_cycle_reports_terminal_and_comfort_deficits_without_free_storage():
+    class LossyHouse:
+        def _predict_temp(self, indoor, outdoor, heat):
+            return indoor - 0.08 + 0.04 * heat
+
+    values = args()
+    values["controller"] = LossyHouse()
+    values["pilot_virtuals"] = [20.0] * 8
+    result = _shared_control_reference(**values)
+    assert result is not None
+    _assert_complete_comparison(result, values["indoor"])
+    assert result["pilot_below_floor_degree_hours"] > 0
+    assert result["baseline_below_floor_degree_hours"] > 0
+    assert result["pilot_final_temperature"] < values["indoor"]
+    assert result["pilot_heat_price_proxy"] < result["baseline_heat_price_proxy"]
+    # An intentionally false saving claim must fail the comparison contract.
+    corrupted = deepcopy(result)
+    corrupted["savings"] = "verified"
+    with pytest.raises(AssertionError):
+        _assert_complete_comparison(corrupted, values["indoor"])
+    corrupted = deepcopy(result)
+    corrupted["pilot_temperatures"][0] += 1
+    with pytest.raises(AssertionError):
+        _assert_complete_comparison(corrupted, values["indoor"])

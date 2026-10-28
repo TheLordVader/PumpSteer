@@ -115,6 +115,9 @@ def _plan_context_causal(value, start):
 
 class ForecastAudit:
     def __init__(self):
+        self.fixed_pending = None
+        self.fixed_records = []
+        self.fixed_next = None
         self.pending = None
         self.records = []
         # Passive plan residuals are separate from model-validation evidence.
@@ -123,6 +126,138 @@ class ForecastAudit:
         self.plan_unverifiable = 0
         self.plan_last_reason = None
         self._plan_last_report = None
+
+    def issue_fixed(self, at, indoor, outdoor, k, identity):
+        """Freeze three conditional forecasts; no heat-production assumption.
+
+        Common-outcome comparison follows EMHASS forecast_calibration (MIT,
+        179cbc2b); horizon-specific evidence follows ThermoSmart ForecastModel
+        (MIT, 76f5fe17). No external implementation/dependencies imported.
+        """
+        from .pilot_forecast import _timestamp
+
+        at = _timestamp(at)
+        if (
+            at is None
+            or self.fixed_pending
+            or (self.fixed_next and at < self.fixed_next)
+        ):
+            return False
+        if (
+            not all(
+                isinstance(v, (int, float))
+                and not isinstance(v, bool)
+                and math.isfinite(v)
+                for v in (indoor, outdoor, k)
+            )
+            or not 0.005 < k < 0.5
+        ):
+            return False
+        delta = max(0.0, indoor - outdoor)
+        self.fixed_pending = {
+            "issued": at,
+            "identity": tuple(identity),
+            "predictions": {
+                h: [
+                    indoor - k * delta * h / 60,
+                    indoor + delta * math.expm1(-k * h / 60),
+                    indoor,
+                ]
+                for h in (30, 60, 120)
+            },
+        }
+        # Non-overlapping 120-minute episodes plus endpoint tolerance.
+        self.fixed_next = at + timedelta(minutes=125)
+        return True
+
+    def observe_fixed(self, now, indoor, identity):
+        from .pilot_forecast import _timestamp
+        from .pilot_passive import PilotPassive
+
+        now = _timestamp(now)
+        pending = self.fixed_pending
+        if pending is None:
+            return
+        if (
+            now is None
+            or now < pending["issued"]
+            or tuple(identity) != pending["identity"]
+        ):
+            self.fixed_pending = None
+            return
+        reading = PilotPassive._report(indoor, now, temperature=True, max_age=None)
+        for horizon in list(pending["predictions"]):
+            due = pending["issued"] + timedelta(minutes=horizon)
+            if reading and due <= reading[0] <= due + timedelta(minutes=5):
+                self.fixed_records.append(
+                    {
+                        "issued": pending["issued"].isoformat(),
+                        "observed": reading[0].isoformat(),
+                        "horizon": horizon,
+                        "identity": list(identity),
+                        "predictions": pending["predictions"].pop(horizon),
+                        "actual": reading[1],
+                    }
+                )
+                self.fixed_records = self.fixed_records[-96:]
+            elif now > due + timedelta(minutes=5):
+                pending["predictions"].pop(horizon)
+        if not pending["predictions"]:
+            self.fixed_pending = None
+
+    def fixed_summary(self, identity=None):
+        """Diagnostic heuristics, never authorization for active control."""
+        result = {}
+        for horizon in (30, 60, 120):
+            rows = [
+                r
+                for r in self.fixed_records
+                if r["horizon"] == horizon
+                and (identity is None or tuple(r["identity"]) == tuple(identity))
+            ]
+            # Common actual endpoints for all three methods; one row per episode.
+            unique = {r["issued"]: r for r in rows}
+            rows = list(unique.values())[-24:]
+            mae = (
+                [
+                    sum(abs(r["predictions"][i] - r["actual"]) for r in rows)
+                    / len(rows)
+                    for i in range(3)
+                ]
+                if rows
+                else None
+            )
+            status = "insufficient_evidence"
+            skill = None
+            if mae and mae[2] >= 0.02:
+                skill = 1 - mae[1] / mae[2]
+                if len(rows) >= 12 and len({r["issued"][:10] for r in rows}) >= 3:
+                    halves = (rows[: len(rows) // 2], rows[len(rows) // 2 :])
+                    improved = all(
+                        sum(abs(r["predictions"][1] - r["actual"]) for r in part)
+                        <= 0.9
+                        * sum(abs(r["predictions"][2] - r["actual"]) for r in part)
+                        for part in halves
+                    )
+                    status = (
+                        "improved"
+                        if skill >= 0.1 and improved
+                        else "worse_than_persistence"
+                        if skill < -0.1
+                        else "insufficient_evidence"
+                        if skill >= 0.1
+                        else "comparable"
+                    )
+            result[str(horizon)] = {
+                "count": len(rows),
+                "model_order": ["linear", "bounded", "persistence"],
+                "mae": mae,
+                "skill": skill,
+                "status": status,
+                "passive_only": True,
+                "assumption": "constant_outdoor_net_response_under_actual_control",
+            }
+        return result
 
     def issue(
         self,
@@ -439,6 +574,7 @@ class ForecastAudit:
         self.plan_last_reason = reason
 
     def cancel_plans(self, reason):
+        self.fixed_pending = None
         for plan in self.plan_pending:
             self._discard_plan(plan, reason)
         self.plan_pending = []
@@ -609,6 +745,7 @@ class ForecastAudit:
 
     def export_plan(self):
         return {
+            "fixed_v1": list(self.fixed_records),
             "records": list(self.plan_records),
             "pending_count": sum(len(p["horizons"]) for p in self.plan_pending),
             "unverifiable": self.plan_unverifiable,
@@ -619,12 +756,60 @@ class ForecastAudit:
         """Restore completed pairs only; observation gaps cannot be bridged."""
         from .pilot_forecast import _timestamp
 
+        self.fixed_pending = None
+        self.fixed_records = []
+        self.fixed_next = None
         self.plan_pending = []
         self.plan_records = []
         self._plan_last_report = None
         now = _timestamp(now)
         if not isinstance(payload, dict) or now is None:
             return
+        fixed = payload.get("fixed_v1", [])
+        if isinstance(fixed, list) and len(fixed) <= 96:
+            seen = set()
+            for row in fixed:
+                if not isinstance(row, dict):
+                    continue
+                issued, observed = (
+                    _timestamp(row.get("issued")),
+                    _timestamp(row.get("observed")),
+                )
+                h = row.get("horizon")
+                pred, actual = row.get("predictions"), row.get("actual")
+                identity = row.get("identity")
+                if (
+                    issued is None
+                    or observed is None
+                    or h not in (30, 60, 120)
+                    or not issued + timedelta(minutes=h)
+                    <= observed
+                    <= issued + timedelta(minutes=h + 5)
+                    or observed > now
+                    or not isinstance(pred, list)
+                    or len(pred) != 3
+                    or not isinstance(identity, list)
+                    or len(identity) != 2
+                    or not all(isinstance(x, str) and len(x) <= 2048 for x in identity)
+                    or not all(
+                        isinstance(x, (int, float))
+                        and not isinstance(x, bool)
+                        and math.isfinite(x)
+                        and -100 <= x <= 100
+                        for x in [*pred, actual]
+                    )
+                ):
+                    continue
+                key = (issued, h)
+                if key in seen:
+                    continue
+                seen.add(key)
+                self.fixed_records.append(dict(row))
+            self.fixed_records.sort(key=lambda r: r["issued"])
+            if self.fixed_records:
+                self.fixed_next = max(
+                    _timestamp(r["issued"]) for r in self.fixed_records
+                ) + timedelta(minutes=125)
         count = payload.get("unverifiable", 0)
         pending = payload.get("pending_count", 0)
         if (

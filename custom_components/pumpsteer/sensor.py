@@ -121,7 +121,11 @@ class PumpSteerSensor(RestoreEntity):
     _attr_has_entity_name = True
     _attr_translation_key = "control_temperature"
     _unrecorded_attributes = frozenset(
-        {"thermal_intelligence_plan_detail", "thermal_intelligence_plan_outcomes"}
+        {
+            "thermal_intelligence_plan_detail",
+            "thermal_intelligence_plan_outcomes",
+            "thermal_fixed_horizon_audit",
+        }
     )
 
     def __init__(self, hass: HomeAssistant, config_entry: ConfigEntry):
@@ -993,6 +997,11 @@ class PumpSteerSensor(RestoreEntity):
             "thermal_learning_sessions": self._thermal_model.learning_sessions,
             "thermal_validated_sessions": self._thermal_model.validated_sessions,
             "thermal_validation_basis": VALIDATION_BASIS,
+            "thermal_fixed_horizon_audit": (
+                self._plan_audit.fixed_summary(self._fixed_audit_identity(self._cfg()))
+                if self._cfg().get("thermal_intelligence_enabled") is True
+                else None
+            ),
             "thermal_conditional_drop_60m_c": (
                 self._thermal_model.predict_bounded_drop(indoor, outdoor, 60)
                 if self._thermal_learning_active
@@ -1048,6 +1057,16 @@ class PumpSteerSensor(RestoreEntity):
                 self._thermal_model.end_validation_session(now, indoor)
             return
 
+        if not was_active and self._cfg().get("thermal_intelligence_enabled") is True:
+            cfg = self._cfg()
+            if self._thermal_model.is_valid:
+                self._plan_audit.issue_fixed(
+                    now,
+                    indoor,
+                    outdoor,
+                    self._thermal_model.k,
+                    self._fixed_audit_identity(cfg),
+                )
         if not was_active:
             # Never infer the stable brake cooling rate from earlier PI/ramp history.
             self._thermal_model.reset_temp_history(now, indoor)
@@ -1330,6 +1349,20 @@ class PumpSteerSensor(RestoreEntity):
         outdoor = get_temperature(
             self.hass, cfg.get("real_outdoor_entity"), self._temperature_reported_after
         )
+        if cfg.get("thermal_intelligence_enabled") is True:
+            try:
+                if indoor is None or outdoor is None:
+                    self._plan_audit.fixed_pending = None
+                else:
+                    self._plan_audit.observe_fixed(
+                        now,
+                        self.hass.states.get(cfg.get("indoor_temp_entity")),
+                        self._fixed_audit_identity(cfg),
+                    )
+                await self._save_pilot_store()
+            except Exception:
+                self._plan_audit.fixed_pending = None
+                _LOGGER.debug("Passive fixed-horizon audit unavailable", exc_info=True)
         self._input_temperatures = {
             "indoor_temperature": indoor,
             "outdoor_temperature": outdoor,
@@ -2742,6 +2775,7 @@ class PumpSteerSensor(RestoreEntity):
                 plan_data["records"]
                 or plan_data["pending_count"]
                 or plan_data["unverifiable"]
+                or plan_data["fixed_v1"]
             )
         ):
             return
@@ -2772,6 +2806,8 @@ class PumpSteerSensor(RestoreEntity):
             plan_last,
             plan_data["pending_count"],
             plan_data["unverifiable"],
+            len(plan_data["fixed_v1"]),
+            plan_data["fixed_v1"][-1]["observed"] if plan_data["fixed_v1"] else None,
             self._heat_operation_signature if operation_available else None,
             operation.sample_count // 18 if operation_available else None,
         )
@@ -2897,6 +2933,12 @@ class PumpSteerSensor(RestoreEntity):
     def _capture_pilot_weather(self, rows):
         """Capture only the forecast already fetched for the normal outlook."""
         self._pilot_weather_raw = rows
+
+    def _fixed_audit_identity(self, cfg):
+        return (
+            cfg.get("indoor_temp_entity") or "",
+            repr((cfg.get("real_outdoor_entity"), self._plan_source_identity(cfg))),
+        )
 
     def _plan_source_identity(self, cfg):
         """Identify selected HA sources without asserting physical freshness."""

@@ -347,3 +347,20 @@ def test_ha_conditional_projection_is_not_validated_by_old_session_metrics():
         ]
         is None
     )
+
+
+def test_fixed_audit_is_connected_to_learning_entry_and_neutral_when_disabled():
+    for enabled in (False, True):
+        sensor = _sensor()
+        sensor._config_entry.options = {
+            "thermal_intelligence_enabled": enabled,
+            "indoor_temp_entity": "sensor.inside",
+            "real_outdoor_entity": "sensor.outside",
+        }
+        sensor._thermal_model.restore_k(0.03)
+        sensor._update_thermal_learning(
+            active=True, reason="stable_braking", now=_START, indoor=21, outdoor=5
+        )
+        assert (sensor._plan_audit.fixed_pending is not None) is enabled
+        attrs = sensor._base_attrs(21, 21, 5, "expensive", 3)
+        assert (attrs["thermal_fixed_horizon_audit"] is not None) is enabled
