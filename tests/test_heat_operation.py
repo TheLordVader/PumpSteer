@@ -216,3 +216,62 @@ def test_temperature_calibration_rejects_configured_unavailable_compressor():
         return_temp=reading(30, now, "°C"),
     )
     assert model.temperatures == {"supply": [], "return": []}
+
+
+def test_delta_t_is_aligned_report_evidence_not_thermal_power():
+    result = HeatOperation().observe(
+        T,
+        supply=reading(35, T, "°C"),
+        return_temp=reading(30, T - timedelta(seconds=30), "°C"),
+    )
+    assert result["delta_t_c"] == 5
+    assert result["delta_t_status"] == "positive_transfer_indication"
+    assert not result["learning_qualified"]
+
+
+def test_delta_t_rejects_asynchronous_stale_and_restored_reports():
+    for state in (
+        reading(30, T - timedelta(minutes=2), "°C"),
+        reading(30, T - timedelta(minutes=6), "°C"),
+        reading(30, T, "°C", restored=True),
+        reading(30, T, "W"),
+    ):
+        result = HeatOperation().observe(
+            T, supply=reading(35, T, "°C"), return_temp=state
+        )
+        assert result["delta_t_c"] is None
+        assert not result["learning_qualified"]
+
+
+def test_delta_t_never_promotes_hot_water_or_residual_heat_to_verified_heating():
+    for water, compressor in (("on", "on"), ("off", "off")):
+        result = HeatOperation().observe(
+            T,
+            supply=reading(40, T, "°C"),
+            return_temp=reading(30, T, "°C"),
+            water=reading(water, T),
+            compressor=reading(compressor, T),
+            radiator=reading("off" if water == "on" else "on", T),
+            power=reading(1000, T, "W"),
+        )
+        assert result["delta_t_c"] == 10
+        assert not result["learning_qualified"]
+
+
+def test_calibrated_probable_heating_requires_aligned_temperature_reports():
+    model = HeatOperation()
+    model.samples = {"idle": [0.1] * 3, "heating": [1.2] * 3}
+    model.temperatures = {"supply": [35.0] * 3, "return": [30.0] * 3}
+    for skew, expected in ((0, "space_heating"), (120, "unknown")):
+        changed = T - timedelta(minutes=10)
+        result = model.observe(
+            T,
+            compressor=reading("on", T, changed=changed),
+            radiator=reading("on", T, changed=changed),
+            water=reading("off", T, changed=changed),
+            power=reading(1200, T, "W"),
+            supply=reading(35, T, "°C"),
+            return_temp=reading(30, T - timedelta(seconds=skew), "°C"),
+        )
+        assert result["mode"] == expected
+        assert not result["learning_qualified"]

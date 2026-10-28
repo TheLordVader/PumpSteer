@@ -93,6 +93,8 @@ class HeatOperation:
             "learning_qualified": False,
             "calibration": "insufficient_evidence",
             "physical_measurement_time": "unknown",
+            "delta_t_c": None,
+            "delta_t_status": "unavailable",
         }
         if now is None:
             return result
@@ -119,6 +121,21 @@ class HeatOperation:
         ret = PilotPassive._report(
             return_temp, now, temperature=True, reported_after=reported_after
         )
+        # Compare existing Celsius reports only within one controller minute.
+        # This bounds report skew, not unknown physical measurement skew.
+        paired = (
+            f is not None
+            and ret is not None
+            and abs(f[0] - ret[0]) <= timedelta(seconds=60)
+        )
+        if paired:
+            delta = f[1] - ret[1]
+            result["delta_t_c"] = round(delta, 3)
+            result["delta_t_status"] = (
+                "positive_transfer_indication" if delta > 0 else "no_positive_gradient"
+            )
+        elif f is not None and ret is not None:
+            result["delta_t_status"] = "reports_not_time_aligned"
         result["signals"] = [
             name
             for name, value in (
@@ -265,7 +282,7 @@ class HeatOperation:
                     for state in (compressor, radiator, water)
                 )
             ):
-                if c[1] == 1 and p[2] > threshold and f and ret and f[1] > ret[1]:
+                if c[1] == 1 and p[2] > threshold and paired and f[1] > ret[1]:
                     bounds = self.temperatures
                     if (
                         all(
