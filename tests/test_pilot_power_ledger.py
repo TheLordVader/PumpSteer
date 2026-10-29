@@ -590,3 +590,21 @@ def test_counter_expiry_and_unreasonable_jump_restart_anchor():
         ledger.observe_energy(at, {"a": state(value, at, "kWh")}, [])
     assert ledger.energy == 1
     assert ledger.gaps == 2
+
+
+def test_long_counter_interval_rechecks_corrected_price_after_first_five_minutes():
+    ledger = PowerLedger()
+    original = prices()
+    for row in original.attributes["raw_today"]:
+        row["value"] = 2
+    ledger.observe_energy(T, {"a": state(0, T, "kWh")}, [original])
+    corrected = prices()
+    corrected.attributes["raw_today"][0]["value"] = 2
+    corrected.attributes["raw_today"][1]["value"] = 3
+    corrected.last_reported = T + timedelta(minutes=20)
+    ledger.invalidate_energy_prices([corrected], corrected.last_reported)
+    end = T + timedelta(minutes=30)
+    ledger.observe_energy(end, {"a": state(1, end, "kWh")}, [corrected])
+    assert ledger.energy == 1
+    assert ledger.priced_energy == 0
+    assert ledger.summary()["cost_estimate"] is None

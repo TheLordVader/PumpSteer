@@ -374,6 +374,10 @@ class PowerLedger:
                     and (value - old) * 3600 / dt <= 100
                     and self._energy_units.get(meter_id) == unit
                 ):
+                    if not self._same_energy_prices(
+                        price_snapshot, currency, prices, at, start, at - start
+                    ):
+                        price_snapshot = currency = None
                     delta = value - old
                     self._meter_qualified += delta
                     self._meter_totals[meter_id] = (
