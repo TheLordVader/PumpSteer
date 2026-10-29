@@ -90,7 +90,7 @@
           "thermal_detection_method": "Automatisk använder kvalificerade signaler och visar osäkerhet. Manuell behåller tröskeln.",
           "thermal_compressor_entity": "Kompressorstatus ensam bevisar inte radiatorvärme.",
           "thermal_return_temp_entity": "Används endast tillsammans med andra kvalificerade signaler.",
-          "thermal_energy_entities": "Välj en totalmätare eller oberoende mätare som kan summeras. När mätare väljs används de för energidiagnostiken. Pris fördelas tidsviktat mellan rapporter."
+          "thermal_energy_entities": "Välj en totalmätare eller oberoende mätare som kan summeras. När mätare väljs används de för energidiagnostiken. Endast hela räknarintervall med ett entydigt pris prissätts. Rapportluckor över 24 timmar utesluts."
         }
       },
       "notifications": {

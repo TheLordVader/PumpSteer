@@ -279,8 +279,8 @@ def test_accumulated_energy_reset_and_gap_are_not_counted():
     for minute, value in ((0, 10), (1, 11), (2, 1), (10, 5), (11, 6)):
         at = T + timedelta(minutes=minute)
         ledger.observe_energy(at, {"meter": state(value, at, "kWh")}, [])
-    assert ledger.summary()["energy_kwh_estimate"] == 2
-    assert ledger.summary()["gap_count"] == 2
+    assert ledger.summary()["energy_kwh_estimate"] == 6
+    assert ledger.summary()["gap_count"] == 1
 
 
 def test_accumulated_energy_does_not_bridge_unavailable_reading():
@@ -310,9 +310,9 @@ def test_asynchronous_meters_qualify_independently_and_sum_only_common_time():
     report("b", 3, 2)
     result = ledger.summary()
     assert result["qualified_meter_energy_kwh"] == pytest.approx(4)
-    assert result["energy_kwh_estimate"] == pytest.approx(2)
-    assert result["qualified_seconds"] == 60
-    assert result["cost_estimate"] == pytest.approx(2)
+    assert result["energy_kwh_estimate"] == 0
+    assert result["qualified_seconds"] == 0
+    assert result["cost_estimate"] is None
 
 
 def test_energy_meter_price_boundary_is_time_weighted_and_unpriced_if_missing():
@@ -321,9 +321,9 @@ def test_energy_meter_price_boundary_is_time_weighted_and_unpriced_if_missing():
         at = T + timedelta(minutes=minute)
         ledger.observe_energy(at, {"a": state(value, at, "kWh")}, [prices()])
     result = ledger.summary()
-    assert result["cost_estimate"] == pytest.approx(4)
-    assert result["priced_energy_kwh_estimate"] == pytest.approx(2)
-    assert result["method"] == "cumulative_energy_time_weighted"
+    assert result["cost_estimate"] is None
+    assert result["priced_energy_kwh_estimate"] == 0
+    assert result["method"] == "cumulative_energy_counter_deltas"
 
 
 def test_still_meter_reports_are_valid_and_duplicate_reports_are_ignored():
@@ -352,12 +352,12 @@ def test_meter_dropout_keeps_qualified_energy_separate_from_common_coverage():
             at, {name: state(value, at, "kWh")}, [], meter_ids=("a", "b")
         )
     result = ledger.summary()
-    assert result["qualified_meter_energy_kwh"] == 8
-    assert result["energy_kwh_estimate"] == 2
-    assert result["qualified_seconds"] == 60
-    assert result["gap_count"] >= 1
+    assert result["qualified_meter_energy_kwh"] == 14
+    assert result["energy_kwh_estimate"] == 14
+    assert result["qualified_seconds"] == 420
+    assert result["gap_count"] == 0
     assert result["meter_count"] == 2
-    assert result["energy_allocation"] == "uniform_between_reports"
+    assert result["energy_allocation"] == "unknown_within_counter_interval"
 
 
 def test_price_change_event_invalidates_price_but_not_counter_delta():
@@ -419,7 +419,7 @@ def test_unchanged_price_forecast_survives_price_entity_report():
     ledger.invalidate_energy_prices([prices()], change)
     end = T + timedelta(minutes=16)
     ledger.observe_energy(end, {"a": state(2, end, "kWh")}, [prices()])
-    assert ledger.summary()["cost_estimate"] == 4
+    assert ledger.summary()["cost_estimate"] is None
 
 
 def test_changed_price_forecast_invalidates_started_interval():
@@ -450,9 +450,9 @@ def test_partial_price_coverage_prices_only_known_part_of_meter_interval():
     ledger.observe_energy(end, {"a": state(2, end, "kWh")}, [source])
     result = ledger.summary()
     assert result["energy_kwh_estimate"] == 2
-    assert result["priced_energy_kwh_estimate"] == 1
-    assert result["cost_estimate"] == 2
-    assert result["price_coverage"] == "partial"
+    assert result["priced_energy_kwh_estimate"] == 0
+    assert result["cost_estimate"] is None
+    assert result["price_coverage"] == "unavailable"
 
 
 def test_poll_rejects_attribute_change_that_may_have_a_queued_event():
@@ -510,3 +510,83 @@ def test_unchanged_price_report_preserves_pending_async_meter_interval():
     assert ledger.summary()["energy_kwh_estimate"] == 2
     assert ledger.summary()["priced_energy_kwh_estimate"] == 2
     assert ledger.summary()["cost_estimate"] == 2
+
+
+def test_counter_interval_spanning_price_change_is_not_verified_cost():
+    ledger = PowerLedger()
+    for minute, value in ((14, 0), (16, 2)):
+        at = T + timedelta(minutes=minute)
+        ledger.observe_energy(at, {"a": state(value, at, "kWh")}, [prices()])
+    result = ledger.summary()
+    assert result["energy_kwh_estimate"] == 2
+    assert result["priced_energy_kwh_estimate"] == 0
+    assert result["cost_estimate"] is None
+
+
+def test_long_counter_interval_preserves_energy_without_price():
+    ledger = PowerLedger()
+    ledger.observe_energy(T, {"a": state(10, T, "kWh")}, [])
+    at = T + timedelta(hours=2)
+    ledger.observe_energy(at, {"a": state(12, at, "kWh")}, [])
+    assert ledger.summary()["energy_kwh_estimate"] == 2
+    assert ledger.summary()["cost_estimate"] is None
+
+
+def test_async_counter_partial_overlap_is_not_interpolated():
+    ledger = PowerLedger()
+    for name, minute, value in (("a", 0, 0), ("b", 1, 0), ("a", 2, 1), ("b", 3, 1)):
+        at = T + timedelta(minutes=minute)
+        ledger.observe_energy(
+            at, {name: state(value, at, "kWh")}, [], meter_ids=("a", "b")
+        )
+    assert ledger.summary()["qualified_meter_energy_kwh"] == 2
+    assert ledger.summary()["energy_kwh_estimate"] == 0
+
+
+def test_async_shared_window_equals_total_with_stationary_meter():
+    ledger = PowerLedger()
+    for name, minute, value in (
+        ("a", 0, 0),
+        ("b", 0, 10),
+        ("a", 10, 1),
+        ("a", 20, 2),
+        ("b", 20, 10),
+    ):
+        at = T + timedelta(minutes=minute)
+        ledger.observe_energy(
+            at, {name: state(value, at, "kWh")}, [], meter_ids=("a", "b")
+        )
+    total = PowerLedger()
+    for minute, value in ((0, 10), (20, 12)):
+        at = T + timedelta(minutes=minute)
+        total.observe_energy(at, {"total": state(value, at, "kWh")}, [])
+    assert ledger.energy == total.energy == 2
+    assert ledger.seconds == total.seconds == 1200
+
+
+def test_constant_price_long_interval_and_unit_change():
+    ledger = PowerLedger()
+    source = prices()
+    for entry in source.attributes["raw_today"]:
+        entry["value"] = 2
+    for minute, value, unit in (
+        (0, 10, "kWh"),
+        (30, 12, "kWh"),
+        (40, 13000, "Wh"),
+        (50, 14000, "Wh"),
+    ):
+        at = T + timedelta(minutes=minute)
+        ledger.observe_energy(at, {"a": state(value, at, unit)}, [source])
+    assert ledger.energy == 3
+    assert ledger.priced_energy == 3
+    assert ledger.cost == 6
+    assert ledger.gaps == 1
+
+
+def test_counter_expiry_and_unreasonable_jump_restart_anchor():
+    ledger = PowerLedger()
+    for hour, value in ((0, 0), (25, 1), (26, 1000), (27, 1001)):
+        at = T + timedelta(hours=hour)
+        ledger.observe_energy(at, {"a": state(value, at, "kWh")}, [])
+    assert ledger.energy == 1
+    assert ledger.gaps == 2
