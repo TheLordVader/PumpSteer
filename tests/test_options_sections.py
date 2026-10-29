@@ -68,3 +68,18 @@ def test_disabling_thermal_does_not_depend_on_unavailable_indoor_sensor():
         flow.async_step_thermal({"thermal_intelligence_enabled": False})
     )
     assert result["data"]["thermal_intelligence_enabled"] is False
+
+
+def test_energy_meter_selection_is_saved_and_can_be_cleared():
+    flow = PumpSteerOptionsFlowHandler()
+    flow.config_entry = SimpleNamespace(data={}, options={})
+    flow.hass = SimpleNamespace(states=SimpleNamespace(async_all=lambda domain: []))
+    flow._validate_entities = lambda data: {}
+    flow.async_create_entry = lambda **kwargs: kwargs
+    saved = asyncio.run(
+        flow.async_step_telemetry({"thermal_energy_entities": ["sensor.a", "sensor.b"]})
+    )
+    assert saved["data"]["thermal_energy_entities"] == ["sensor.a", "sensor.b"]
+    flow.config_entry.options = saved["data"]
+    cleared = asyncio.run(flow.async_step_telemetry({}))
+    assert cleared["data"]["thermal_energy_entities"] == []

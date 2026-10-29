@@ -87,7 +87,8 @@
           "thermal_hot_water_mode_entity": "Verified hot-water mode (optional)",
           "thermal_detection_method": "Heating detection method",
           "thermal_compressor_entity": "Compressor status (optional)",
-          "thermal_return_temp_entity": "Return temperature (optional)"
+          "thermal_return_temp_entity": "Return temperature (optional)",
+          "thermal_energy_entities": "Cumulative energy meters (optional)"
         },
         "data_description": {
           "thermal_heat_activity_entity": "A binary sensor whose on means measured heat delivery to the home and off means none. Compressor status or hot-water mode alone is insufficient. Report times do not establish physical measurement time.",
@@ -99,7 +100,8 @@
           "thermal_hot_water_mode_entity": "On means verified hot-water operation. Heat learning pauses when on or unknown; unknown periods are not classified.",
           "thermal_detection_method": "Automatic uses qualified signals and reports uncertainty. Manual retains the supply threshold.",
           "thermal_compressor_entity": "Compressor status alone does not prove radiator heating.",
-          "thermal_return_temp_entity": "Used only together with other qualified signals."
+          "thermal_return_temp_entity": "Used only together with other qualified signals.",
+          "thermal_energy_entities": "Select one total meter or independent meters that can be summed. Selected meters take precedence for energy diagnostics. Prices are time-weighted between reports."
         }
       },
       "notifications": {

@@ -599,7 +599,8 @@ class PumpSteerSensor(RestoreEntity):
         self._pilot_forecast_available = False
         self._pilot_price_forecast = False
         self._pilot_grid_marginal = {
-            "status": "unavailable", "reason": "options_changed"
+            "status": "unavailable",
+            "reason": "options_changed",
         }
         self._pilot_plan = self._unavailable_pilot_plan("options_changed")
         self._pilot_plan_next = None
@@ -2541,7 +2542,8 @@ class PumpSteerSensor(RestoreEntity):
                 self._pilot_forecast_available = False
                 self._pilot_price_forecast = False
                 self._pilot_grid_marginal = {
-                    "status": "unavailable", "reason": "learning_error"
+                    "status": "unavailable",
+                    "reason": "learning_error",
                 }
                 self._pilot_plan = {
                     "planning_status": "unavailable",
@@ -2623,6 +2625,37 @@ class PumpSteerSensor(RestoreEntity):
                 "Passive power telemetry failed; standard control continues"
             )
 
+    def _record_energy_report(self, entity_id, state, when, energy_ids):
+        """Process the event's own state, not a later state already in HA."""
+        from .pilot_forecast import _timestamp
+
+        try:
+            cfg = self._cfg()
+            price_ids = (
+                cfg.get("electricity_price_entity"),
+                cfg.get("price_tomorrow_entity"),
+            )
+            prices = tuple(
+                self.hass.states.get(key) if key else None for key in price_ids
+            )
+            clock = _timestamp(when)
+            report = _timestamp(getattr(state, "last_reported", None))
+            if clock is not None:
+                self._power_ledger.sync_energy_prices(prices, clock)
+            if state is None and clock is not None:
+                self._power_ledger.observe_energy(
+                    clock, {entity_id: None}, prices, meter_ids=energy_ids
+                )
+            elif report is not None and clock is not None and report <= clock:
+                self._power_ledger.observe_energy(
+                    report, {entity_id: state}, prices, meter_ids=energy_ids
+                )
+        except Exception:
+            self._power_ledger.reset_anchor(gap=True)
+            _LOGGER.exception(
+                "Passive energy telemetry failed; standard control continues"
+            )
+
     def _consume_power_report(self, now):
         """Catch new HA reports during the existing control cycle, without polling APIs."""
         if (
@@ -2632,6 +2665,20 @@ class PumpSteerSensor(RestoreEntity):
         ):
             return
         from .pilot_forecast import _timestamp
+
+        energy_ids = self._cfg().get("thermal_energy_entities") or []
+        if energy_ids:
+            try:
+                for entity_id in energy_ids:
+                    state = self.hass.states.get(entity_id)
+                    if self._power_ledger.can_poll_energy(entity_id, state):
+                        self._record_energy_report(entity_id, state, now, energy_ids)
+            except Exception:
+                self._power_ledger.reset_anchor(gap=True)
+                _LOGGER.exception(
+                    "Passive energy telemetry failed; standard control continues"
+                )
+            return
 
         state = self.hass.states.get(self._cfg().get("thermal_power_entity"))
         report = _timestamp(getattr(state, "last_reported", None))
@@ -2654,6 +2701,7 @@ class PumpSteerSensor(RestoreEntity):
         """Subscribe only to selected states; the normal cycle catches unchanged reports."""
         cfg = self._cfg()
         power_id = cfg.get("thermal_power_entity")
+        energy_ids = tuple(cfg.get("thermal_energy_entities") or ())
         keys = (
             "thermal_power_entity",
             "thermal_heating_mode_entity",
@@ -2662,7 +2710,10 @@ class PumpSteerSensor(RestoreEntity):
             "price_tomorrow_entity",
         )
         entities = tuple(cfg.get(key) for key in keys)
-        signature = entities + (cfg.get("thermal_heating_mode_inverted") is True,)
+        signature = entities + (
+            energy_ids,
+            cfg.get("thermal_heating_mode_inverted") is True,
+        )
         if (
             cfg.get("thermal_intelligence_enabled") is True
             and self._power_signature == signature
@@ -2673,8 +2724,16 @@ class PumpSteerSensor(RestoreEntity):
         self._power_ledger = None
         if (
             cfg.get("thermal_intelligence_enabled") is not True
-            or not isinstance(power_id, str)
-            or not power_id.startswith("sensor.")
+            or (
+                not energy_ids
+                and (
+                    not isinstance(power_id, str) or not power_id.startswith("sensor.")
+                )
+            )
+            or any(
+                not isinstance(entity, str) or not entity.startswith("sensor.")
+                for entity in energy_ids
+            )
         ):
             return
         from homeassistant.helpers.event import async_track_state_change_event
@@ -2682,7 +2741,9 @@ class PumpSteerSensor(RestoreEntity):
 
         self._power_signature = signature
         self._power_ledger = PowerLedger(started_after=dt_util.now())
-        entity_ids = list(dict.fromkeys(value for value in entities if value))
+        entity_ids = list(
+            dict.fromkeys(value for value in (*entities, *energy_ids) if value)
+        )
 
         @callback
         def changed(event):
@@ -2693,6 +2754,43 @@ class PumpSteerSensor(RestoreEntity):
             ):
                 return
             entity_id = event.data.get("entity_id")
+            if energy_ids:
+                if entity_id in energy_ids:
+                    state = (
+                        event.data.get("new_state")
+                        if "new_state" in event.data
+                        else self.hass.states.get(entity_id)
+                    )
+                    self._record_energy_report(
+                        entity_id, state, event.time_fired, energy_ids
+                    )
+                elif entity_id in (
+                    cfg.get("electricity_price_entity"),
+                    cfg.get("price_tomorrow_entity"),
+                ):
+                    try:
+                        prices = tuple(
+                            (
+                                event.data.get("new_state")
+                                if "new_state" in event.data
+                                else self.hass.states.get(key)
+                            )
+                            if key == entity_id
+                            else self.hass.states.get(key)
+                            if key
+                            else None
+                            for key in (
+                                cfg.get("electricity_price_entity"),
+                                cfg.get("price_tomorrow_entity"),
+                            )
+                        )
+                        self._power_ledger.invalidate_energy_prices(
+                            prices, event.time_fired
+                        )
+                    except Exception:
+                        self._power_ledger.invalidate_energy_prices()
+                        _LOGGER.exception("Passive energy price telemetry failed")
+                return
             if entity_id == power_id:
                 previous_report = self._power_last_report
                 self._consume_power_report(event.time_fired)
@@ -3514,7 +3612,8 @@ class PumpSteerSensor(RestoreEntity):
             or not self._temperature_inputs_match(cfg, expected)
         ):
             self._pilot_grid_marginal = {
-                "status": "unavailable", "reason": "inputs_changed_during_planning"
+                "status": "unavailable",
+                "reason": "inputs_changed_during_planning",
             }
             self._pilot_plan = {
                 "planning_status": "unavailable",
@@ -3525,7 +3624,8 @@ class PumpSteerSensor(RestoreEntity):
         issued_at = dt_util.now()
         if issued_at < now or issued_at - now > timedelta(minutes=1):
             self._pilot_grid_marginal = {
-                "status": "unavailable", "reason": "planning_result_delayed"
+                "status": "unavailable",
+                "reason": "planning_result_delayed",
             }
             self._pilot_plan = {
                 "planning_status": "unavailable",

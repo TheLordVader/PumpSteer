@@ -1520,3 +1520,367 @@ def test_price_change_during_learning_invalidates_grid_forecast(monkeypatch):
     asyncio.run(sensor._do_update())
     assert pilot.reset
     assert sensor._pilot_grid_marginal["status"] == "unavailable"
+
+
+def test_energy_meter_subscription_tracks_asynchronous_reports_and_restarts_on_options_change(
+    monkeypatch,
+):
+    import sys
+    from datetime import datetime, timedelta, timezone
+    from custom_components.pumpsteer import sensor as sensor_module
+
+    sensor, states = _sensor()
+    sensor._config_entry.options.update(
+        thermal_intelligence_enabled=True,
+        thermal_energy_entities=["sensor.a", "sensor.b"],
+    )
+    start = datetime(2026, 10, 11, 8, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        sensor_module.dt_util, "now", lambda: start - timedelta(seconds=1)
+    )
+    callbacks = []
+    monkeypatch.setattr(
+        sys.modules["homeassistant.helpers.event"],
+        "async_track_state_change_event",
+        lambda hass, ids, cb: callbacks.append((ids, cb)) or (lambda: None),
+    )
+    sensor._setup_power_telemetry()
+    ids, callback = callbacks[-1]
+    assert {"sensor.a", "sensor.b"} <= set(ids)
+    for name, minute, value in (("a", 0, 0), ("b", 1, 0), ("a", 2, 2), ("b", 3, 2)):
+        at = start + timedelta(minutes=minute)
+        states["sensor." + name] = SimpleNamespace(
+            state=str(value),
+            last_reported=at,
+            last_changed=at,
+            attributes={"unit_of_measurement": "kWh"},
+        )
+        callback(SimpleNamespace(time_fired=at, data={"entity_id": "sensor." + name}))
+    assert sensor._power_ledger.summary()["energy_kwh_estimate"] == 2
+    old = sensor._power_ledger
+    sensor._config_entry.options["thermal_energy_entities"] = ["sensor.a"]
+    sensor._setup_power_telemetry()
+    assert sensor._power_ledger is not old
+    assert sensor._power_ledger.summary()["energy_kwh_estimate"] == 0
+
+
+def test_energy_telemetry_errors_are_isolated_from_control_cycle(monkeypatch):
+    import sys
+    from datetime import datetime, timedelta, timezone
+    from custom_components.pumpsteer import sensor as sensor_module
+
+    sensor, states = _sensor()
+    sensor._config_entry.options.update(
+        thermal_intelligence_enabled=True, thermal_energy_entities=["sensor.energy"]
+    )
+    at = datetime(2026, 10, 11, 8, tzinfo=timezone.utc)
+    monkeypatch.setattr(sensor_module.dt_util, "now", lambda: at - timedelta(seconds=1))
+    monkeypatch.setattr(
+        sys.modules["homeassistant.helpers.event"],
+        "async_track_state_change_event",
+        lambda hass, ids, cb: lambda: None,
+    )
+    sensor._setup_power_telemetry()
+    states["sensor.energy"] = SimpleNamespace(
+        state="1",
+        last_reported=at,
+        last_changed=at,
+        attributes={"unit_of_measurement": "kWh"},
+    )
+
+    def fail(*args, **kwargs):
+        raise ValueError("invalid telemetry")
+
+    monkeypatch.setattr(sensor._power_ledger, "observe_energy", fail)
+    sensor._consume_power_report(at)
+
+
+def test_queued_energy_events_preserve_reset_even_if_current_state_is_newer(
+    monkeypatch,
+):
+    import sys
+    from datetime import datetime, timedelta, timezone
+    from custom_components.pumpsteer import sensor as sensor_module
+
+    sensor, states = _sensor()
+    sensor._config_entry.options.update(
+        thermal_intelligence_enabled=True, thermal_energy_entities=["sensor.energy"]
+    )
+    start = datetime(2026, 10, 11, 8, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        sensor_module.dt_util, "now", lambda: start - timedelta(seconds=1)
+    )
+    callbacks = []
+    monkeypatch.setattr(
+        sys.modules["homeassistant.helpers.event"],
+        "async_track_state_change_event",
+        lambda hass, ids, cb: callbacks.append(cb) or (lambda: None),
+    )
+    sensor._setup_power_telemetry()
+
+    def report(minute, value):
+        at = start + timedelta(minutes=minute)
+        return SimpleNamespace(
+            state=str(value),
+            last_reported=at,
+            last_changed=at,
+            attributes={"unit_of_measurement": "kWh"},
+        )
+
+    states["sensor.energy"] = report(3, 20)
+    for minute, value in ((0, 0), (1, 10), (2, 0), (3, 20)):
+        at = start + timedelta(minutes=minute)
+        callbacks[0](
+            SimpleNamespace(
+                time_fired=at,
+                data={"entity_id": "sensor.energy", "new_state": report(minute, value)},
+            )
+        )
+    assert sensor._power_ledger.summary()["energy_kwh_estimate"] == 30
+    assert sensor._power_ledger.summary()["gap_count"] == 1
+
+
+def test_price_state_event_preserves_unchanged_forecast_across_boundary(monkeypatch):
+    import sys
+    from datetime import datetime, timedelta, timezone
+    from custom_components.pumpsteer import sensor as sensor_module
+
+    sensor, states = _sensor()
+    sensor._config_entry.options.update(
+        thermal_intelligence_enabled=True, thermal_energy_entities=["sensor.energy"]
+    )
+    start = datetime(2026, 10, 11, 8, 14, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        sensor_module.dt_util, "now", lambda: start - timedelta(seconds=1)
+    )
+    callbacks = []
+    monkeypatch.setattr(
+        sys.modules["homeassistant.helpers.event"],
+        "async_track_state_change_event",
+        lambda hass, ids, cb: callbacks.append(cb) or (lambda: None),
+    )
+    sensor._setup_power_telemetry()
+    price = states["sensor.price"]
+    price.last_reported = start
+    price.attributes.update(
+        unit_of_measurement="SEK/kWh",
+        raw_today=[
+            {
+                "start": start.isoformat(),
+                "end": (start + timedelta(minutes=1)).isoformat(),
+                "value": 1,
+            },
+            {
+                "start": (start + timedelta(minutes=1)).isoformat(),
+                "end": (start + timedelta(minutes=10)).isoformat(),
+                "value": 3,
+            },
+        ],
+    )
+
+    def meter(at, value):
+        return SimpleNamespace(
+            state=str(value),
+            last_reported=at,
+            last_changed=at,
+            attributes={"unit_of_measurement": "kWh"},
+        )
+
+    callback = callbacks[0]
+    callback(
+        SimpleNamespace(
+            time_fired=start,
+            data={"entity_id": "sensor.energy", "new_state": meter(start, 0)},
+        )
+    )
+    boundary = start + timedelta(minutes=1)
+    price.last_reported = boundary
+    callback(
+        SimpleNamespace(
+            time_fired=boundary, data={"entity_id": "sensor.price", "new_state": price}
+        )
+    )
+    end = start + timedelta(minutes=2)
+    callback(
+        SimpleNamespace(
+            time_fired=end,
+            data={"entity_id": "sensor.energy", "new_state": meter(end, 2)},
+        )
+    )
+    assert sensor._power_ledger.summary()["cost_estimate"] == 4
+
+
+def test_energy_poll_does_not_skip_queued_reset_event(monkeypatch):
+    import sys
+    from datetime import datetime, timedelta, timezone
+    from custom_components.pumpsteer import sensor as sensor_module
+
+    sensor, states = _sensor()
+    sensor._config_entry.options.update(
+        thermal_intelligence_enabled=True, thermal_energy_entities=["sensor.energy"]
+    )
+    start = datetime(2026, 10, 11, 8, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        sensor_module.dt_util, "now", lambda: start - timedelta(seconds=1)
+    )
+    callbacks = []
+    monkeypatch.setattr(
+        sys.modules["homeassistant.helpers.event"],
+        "async_track_state_change_event",
+        lambda hass, ids, cb: callbacks.append(cb) or (lambda: None),
+    )
+    sensor._setup_power_telemetry()
+
+    def meter(minute, value):
+        at = start + timedelta(minutes=minute)
+        return SimpleNamespace(
+            state=str(value),
+            last_reported=at,
+            last_changed=at,
+            attributes={"unit_of_measurement": "kWh"},
+        )
+
+    cb = callbacks[0]
+    cb(
+        SimpleNamespace(
+            time_fired=start,
+            data={"entity_id": "sensor.energy", "new_state": meter(0, 0)},
+        )
+    )
+    states["sensor.energy"] = meter(3, 20)
+    sensor._consume_power_report(start + timedelta(minutes=3))
+    for minute, value in ((1, 10), (2, 0), (3, 20)):
+        at = start + timedelta(minutes=minute)
+        cb(
+            SimpleNamespace(
+                time_fired=at,
+                data={"entity_id": "sensor.energy", "new_state": meter(minute, value)},
+            )
+        )
+    assert sensor._power_ledger.summary()["energy_kwh_estimate"] == 30
+    assert sensor._power_ledger.summary()["gap_count"] == 1
+
+
+def test_unchanged_energy_reports_are_polled_after_anchor(monkeypatch):
+    import sys
+    from datetime import datetime, timedelta, timezone
+    from custom_components.pumpsteer import sensor as sensor_module
+
+    sensor, states = _sensor()
+    sensor._config_entry.options.update(
+        thermal_intelligence_enabled=True, thermal_energy_entities=["sensor.energy"]
+    )
+    start = datetime(2026, 10, 11, 8, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        sensor_module.dt_util, "now", lambda: start - timedelta(seconds=1)
+    )
+    callbacks = []
+    monkeypatch.setattr(
+        sys.modules["homeassistant.helpers.event"],
+        "async_track_state_change_event",
+        lambda hass, ids, cb: callbacks.append(cb) or (lambda: None),
+    )
+    sensor._setup_power_telemetry()
+    for minute in (0, 1, 2):
+        at = start + timedelta(minutes=minute)
+        report = SimpleNamespace(
+            state="10",
+            last_reported=at,
+            last_changed=start,
+            last_updated=start,
+            attributes={"unit_of_measurement": "kWh"},
+        )
+        states["sensor.energy"] = report
+        if minute == 0:
+            callbacks[0](
+                SimpleNamespace(
+                    time_fired=at,
+                    data={"entity_id": "sensor.energy", "new_state": report},
+                )
+            )
+        else:
+            sensor._consume_power_report(at)
+    assert sensor._power_ledger.summary()["qualified_seconds"] == 120
+
+
+def test_polled_energy_cannot_overtake_queued_price_correction(monkeypatch):
+    import sys
+    from datetime import datetime, timedelta, timezone
+    from custom_components.pumpsteer import sensor as sensor_module
+
+    sensor, states = _sensor()
+    sensor._config_entry.options.update(
+        thermal_intelligence_enabled=True,
+        thermal_energy_entities=["sensor.a", "sensor.b"],
+    )
+    start = datetime(2026, 10, 11, 8, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        sensor_module.dt_util, "now", lambda: start - timedelta(seconds=1)
+    )
+    callbacks = []
+    monkeypatch.setattr(
+        sys.modules["homeassistant.helpers.event"],
+        "async_track_state_change_event",
+        lambda hass, ids, cb: callbacks.append(cb) or (lambda: None),
+    )
+    sensor._setup_power_telemetry()
+
+    def price(at, value):
+        return SimpleNamespace(
+            state=str(value),
+            last_reported=at,
+            last_updated=at,
+            last_changed=at,
+            attributes={
+                "unit_of_measurement": "SEK/kWh",
+                "raw_today": [
+                    {
+                        "start": start.isoformat(),
+                        "end": (start + timedelta(minutes=10)).isoformat(),
+                        "value": value,
+                    }
+                ],
+            },
+        )
+
+    def meter(at, value, updated):
+        return SimpleNamespace(
+            state=str(value),
+            last_reported=at,
+            last_updated=updated,
+            last_changed=updated,
+            attributes={"unit_of_measurement": "kWh"},
+        )
+
+    states["sensor.price"] = price(start, 1)
+    cb = callbacks[0]
+    for name in ("sensor.a", "sensor.b"):
+        states[name] = meter(start, 0, start)
+        cb(
+            SimpleNamespace(
+                time_fired=start, data={"entity_id": name, "new_state": states[name]}
+            )
+        )
+    first = start + timedelta(minutes=1)
+    states["sensor.a"] = meter(first, 1, first)
+    cb(
+        SimpleNamespace(
+            time_fired=first,
+            data={"entity_id": "sensor.a", "new_state": states["sensor.a"]},
+        )
+    )
+    change = start + timedelta(minutes=1, seconds=30)
+    states["sensor.price"] = price(change, 3)
+    end = start + timedelta(minutes=2)
+    states["sensor.b"] = meter(end, 0, start)
+    sensor._consume_power_report(end)
+    cb(
+        SimpleNamespace(
+            time_fired=change,
+            data={"entity_id": "sensor.price", "new_state": states["sensor.price"]},
+        )
+    )
+    result = sensor._power_ledger.summary()
+    assert result["energy_kwh_estimate"] == 1
+    assert result["priced_energy_kwh_estimate"] == 0
+    assert result["cost_estimate"] is None

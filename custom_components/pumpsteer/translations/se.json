@@ -76,7 +76,8 @@
           "thermal_hot_water_mode_entity": "Verifierat varmvattenläge (valfritt)",
           "thermal_detection_method": "Metod för värmedetektering",
           "thermal_compressor_entity": "Kompressorstatus (valfri)",
-          "thermal_return_temp_entity": "Returtemperatur (valfri)"
+          "thermal_return_temp_entity": "Returtemperatur (valfri)",
+          "thermal_energy_entities": "Ackumulerande energimätare (valfria)"
         },
         "data_description": {
           "thermal_heat_activity_entity": "En binär sensor där på betyder uppmätt värmetillförsel till huset och av betyder ingen. Kompressorstatus eller varmvattenläge räcker inte. Rapporttider bevisar inte fysisk mättid.",
@@ -88,7 +89,8 @@
           "thermal_hot_water_mode_entity": "På betyder verifierad varmvattenproduktion. Värmeinlärning pausas vid på eller okänt läge; okända perioder klassas inte.",
           "thermal_detection_method": "Automatisk använder kvalificerade signaler och visar osäkerhet. Manuell behåller tröskeln.",
           "thermal_compressor_entity": "Kompressorstatus ensam bevisar inte radiatorvärme.",
-          "thermal_return_temp_entity": "Används endast tillsammans med andra kvalificerade signaler."
+          "thermal_return_temp_entity": "Används endast tillsammans med andra kvalificerade signaler.",
+          "thermal_energy_entities": "Välj en totalmätare eller oberoende mätare som kan summeras. När mätare väljs används de för energidiagnostiken. Pris fördelas tidsviktat mellan rapporter."
         }
       },
       "notifications": {

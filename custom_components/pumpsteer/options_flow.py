@@ -28,6 +28,7 @@ _GROUPS = {
         "thermal_heating_mode_inverted",
         "thermal_supply_threshold",
         "thermal_power_entity",
+        "thermal_energy_entities",
         "thermal_hot_water_mode_entity",
     },
     "notifications": {
@@ -59,6 +60,7 @@ _CLEARABLE = {
     "thermal_supply_temp_entity",
     "thermal_heating_mode_entity",
     "thermal_power_entity",
+    "thermal_energy_entities",
     "thermal_hot_water_mode_entity",
     "thermal_compressor_entity",
     "thermal_return_temp_entity",
@@ -106,7 +108,7 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
                 updated = {**entry.options, **user_input}
                 for key in _GROUPS[section] & _CLEARABLE:
                     if key not in user_input and current_data.get(key):
-                        updated[key] = ""
+                        updated[key] = [] if key == "thermal_energy_entities" else ""
                 entity_errors = self._validate_entities({**entry.data, **updated})
                 errors = {
                     k: v
@@ -204,6 +206,20 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
                     "suggested_value": current_data.get("thermal_power_entity")
                 },
             ): selector({"entity": {"domain": "sensor", "device_class": "power"}}),
+            vol.Optional(
+                "thermal_energy_entities",
+                description={
+                    "suggested_value": current_data.get("thermal_energy_entities")
+                },
+            ): selector(
+                {
+                    "entity": {
+                        "domain": "sensor",
+                        "device_class": "energy",
+                        "multiple": True,
+                    }
+                }
+            ),
             vol.Optional(
                 "thermal_hot_water_mode_entity",
                 description={
@@ -427,6 +443,19 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
                 or not self._entity_exists(entity)
             ):
                 errors[key] = "entity_not_found"
+        meters = user_input.get("thermal_energy_entities") or []
+        if (
+            not isinstance(meters, list)
+            or any(not isinstance(entity, str) for entity in meters)
+            or len(meters) != len(set(meters))
+            or any(
+                not isinstance(entity, str)
+                or not entity.startswith("sensor.")
+                or not self._entity_exists(entity)
+                for entity in meters
+            )
+        ):
+            errors["thermal_energy_entities"] = "entity_not_found"
         supply = user_input.get("thermal_supply_temp_entity")
         if supply and not user_input.get("thermal_heating_mode_entity"):
             errors["thermal_heating_mode_entity"] = "entity_not_found"
