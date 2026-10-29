@@ -617,3 +617,83 @@ def test_cost_diagnostics_distinguish_counter_cost_from_power_estimate():
     assert (
         ledger.summary()["cost_verification"] == "counter_intervals_at_constant_price"
     )
+
+
+def test_near_synchronous_counter_intervals_are_separate_from_exact_energy():
+    ledger = PowerLedger()
+    for name, seconds, value in (("a", 0, 0), ("b", 1, 0), ("a", 60, 1), ("b", 61, 1)):
+        at = T + timedelta(seconds=seconds)
+        ledger.observe_energy(
+            at, {name: state(value, at, "kWh")}, [], meter_ids=("a", "b")
+        )
+    result = ledger.summary()
+    assert result["energy_kwh_estimate"] == 0
+    assert result["near_synchronous_energy_kwh"] == 2
+    assert result["near_synchronous_max_endpoint_skew_seconds"] == 1
+    assert result["near_synchronous_cost"] is None
+    assert (
+        result["near_synchronous_quality"] == "estimate_with_unknown_energy_error_bound"
+    )
+
+
+def test_near_intervals_are_counted_once_and_reset_discards_anchors():
+    ledger = PowerLedger()
+    ids = ("a", "b", "c")
+    for minute, vals in ((0, (0, 0, 5)), (1, (1, 1, 5)), (2, (2, 2, 5))):
+        for index, name in enumerate(ids):
+            at = T + timedelta(minutes=minute, milliseconds=200 * index)
+            ledger.observe_energy(
+                at, {name: state(vals[index], at, "kWh")}, [], meter_ids=ids
+            )
+    result = ledger.summary()
+    assert result["near_synchronous_energy_kwh"] == 4
+    assert result["near_synchronous_interval_count"] == 2
+    ledger.reset_anchor(gap=True)
+    for index, name in enumerate(ids):
+        at = T + timedelta(minutes=3, milliseconds=200 * index)
+        ledger.observe_energy(at, {name: state(10, at, "kWh")}, [], meter_ids=ids)
+    assert ledger.summary()["near_synchronous_energy_kwh"] == 4
+
+
+def test_near_intervals_do_not_combine_distant_reports_or_prices():
+    ledger = PowerLedger()
+    for name, sec, value in (("a", 0, 0), ("b", 5, 0), ("a", 60, 1), ("b", 65, 1)):
+        at = T + timedelta(seconds=sec)
+        ledger.observe_energy(
+            at, {name: state(value, at, "kWh")}, [prices()], meter_ids=("a", "b")
+        )
+    result = ledger.summary()
+    assert result["qualified_meter_energy_kwh"] == 2
+    assert result["near_synchronous_energy_kwh"] is None
+    assert result["near_synchronous_cost"] is None
+
+
+def test_near_synchronous_chains_allow_different_report_rates():
+    ledger = PowerLedger()
+    ids = ("a", "b")
+    for name, seconds, value in (
+        ("a", 0, 0),
+        ("b", 1, 0),
+        ("a", 60, 1),
+        ("a", 120, 2),
+        ("b", 121, 2),
+    ):
+        at = T + timedelta(seconds=seconds)
+        ledger.observe_energy(at, {name: state(value, at, "kWh")}, [], meter_ids=ids)
+    result = ledger.summary()
+    assert result["near_synchronous_energy_kwh"] == 4
+    assert result["near_synchronous_common_seconds"] == 119
+    assert result["near_synchronous_total_endpoint_skew_seconds"] == 2
+
+
+def test_queue_overflow_is_distinguished_from_invalid_meter_reports():
+    ledger = PowerLedger()
+    for i in range(1026):
+        at = T + timedelta(minutes=i)
+        ledger.observe_energy(
+            at, {"a": state(i / 1000, at, "kWh")}, [], meter_ids=("a", "b")
+        )
+    result = ledger.summary()
+    assert result["exact_interval_queue_drops"] == 1
+    assert result["near_interval_queue_drops"] == 1
+    assert result["near_pending_intervals"] == 1024

@@ -31,6 +31,16 @@ class PowerLedger:
         self._energy_updated = {}
         self._energy_units = {}
         self._energy_intervals = {}
+        self._near_intervals = {}
+        self._near_energy = 0.0
+        self._near_skew = 0.0
+        self._near_count = 0
+        self._exact_queue_drops = 0
+        self._near_queue_drops = 0
+        self._near_unmatched_drops = 0
+        self._near_common_seconds = 0.0
+        self._near_uncertainty_seconds = 0.0
+        self._near_start = self._near_end = None
         self._meter_ids = None
         self._meter_qualified = 0.0
         self._meter_totals = {}
@@ -75,6 +85,7 @@ class PowerLedger:
         self._energy_anchors.clear()
         self._energy_updated.clear()
         self._energy_intervals = {key: [] for key in self._meter_ids or ()}
+        self._near_intervals = {key: [] for key in self._meter_ids or ()}
 
     def sync_energy_prices(self, prices, when):
         """Prevent a meter report overtaking a queued price change."""
@@ -334,6 +345,7 @@ class PowerLedger:
         if self._meter_ids is None:
             self._meter_ids = ids
             self._energy_intervals = {key: [] for key in ids}
+            self._near_intervals = {key: [] for key in ids}
         if ids != self._meter_ids or now is None:
             self.reset_anchor(gap=True)
             return
@@ -385,8 +397,13 @@ class PowerLedger:
                     )
                     queue = self._energy_intervals[meter_id]
                     queue.append([start, at, delta, price_snapshot, currency])
+                    self._near_intervals[meter_id].append((start, at, delta))
+                    if len(self._near_intervals[meter_id]) > 1024:
+                        self._near_intervals[meter_id].pop(0)
+                        self._near_queue_drops += 1
                     if len(queue) > 1024:
                         queue.pop(0)
+                        self._exact_queue_drops += 1
                         self.gaps += 1
                 elif dt > 0:
                     self.gaps += 1
@@ -427,6 +444,7 @@ class PowerLedger:
                     getattr(state, "last_updated", None)
                 ) or _timestamp(getattr(state, "last_changed", None))
         self._collect_energy_intersections()
+        self._collect_near_intervals()
 
     def _collect_energy_intersections(self):
         # Find shared *actual* endpoints of contiguous per-meter chains.
@@ -483,6 +501,57 @@ class PowerLedger:
                 for queue in queues.values():
                     queue[:] = [item for item in queue if item[1] > end]
 
+    def _collect_near_intervals(self):
+        """Group contiguous counter chains with endpoints within two seconds.
+
+        The result sums separate report windows; it is not an exact total for
+        a shared time window. No energy is interpolated or priced.
+        """
+        queues = self._near_intervals
+        while len(queues) > 1 and all(queues.values()):
+            starts = [queues[key][0][0] for key in self._meter_ids]
+            start_skew = (max(starts) - min(starts)).total_seconds()
+            if start_skew > 2:
+                for key in self._meter_ids:
+                    if queues[key][0][0] == min(starts):
+                        queues[key].pop(0)
+                        self._near_unmatched_drops += 1
+                continue
+            indexes = [0] * len(self._meter_ids)
+            while True:
+                ends = [
+                    queues[key][indexes[i]][1] for i, key in enumerate(self._meter_ids)
+                ]
+                end_skew = (max(ends) - min(ends)).total_seconds()
+                if end_skew <= 2 and max(starts) < min(ends):
+                    self._near_energy += sum(
+                        item[2]
+                        for i, key in enumerate(self._meter_ids)
+                        for item in queues[key][: indexes[i] + 1]
+                    )
+                    self._near_skew = max(self._near_skew, start_skew, end_skew)
+                    self._near_count += 1
+                    self._near_common_seconds += (
+                        min(ends) - max(starts)
+                    ).total_seconds()
+                    self._near_uncertainty_seconds += start_skew + end_skew
+                    if self._near_start is None:
+                        self._near_start = max(starts)
+                    self._near_end = min(ends)
+                    for i, key in enumerate(self._meter_ids):
+                        del queues[key][: indexes[i] + 1]
+                    break
+                i = ends.index(min(ends))
+                queue = queues[self._meter_ids[i]]
+                next_index = indexes[i] + 1
+                if next_index >= len(queue):
+                    return
+                if queue[next_index][0] != ends[i]:
+                    del queue[:next_index]
+                    self._near_unmatched_drops += next_index
+                    break
+                indexes[i] = next_index
+
     def summary(self):
         # Do not treat a partial-price cost as the price of all observed energy.
         priced = (
@@ -519,6 +588,34 @@ class PowerLedger:
                 key: round(value, 4) for key, value in self._meter_totals.items()
             },
             "maximum_counter_interval_seconds": 86400 if self._meter_ids else None,
+            "near_synchronous_energy_kwh": round(self._near_energy, 4)
+            if self._near_count
+            else None,
+            "near_synchronous_max_endpoint_skew_seconds": self._near_skew
+            if self._near_count
+            else None,
+            "near_synchronous_interval_count": self._near_count,
+            "near_synchronous_common_seconds": round(self._near_common_seconds, 3),
+            "near_synchronous_total_endpoint_skew_seconds": round(
+                self._near_uncertainty_seconds, 3
+            ),
+            "near_synchronous_first": self._near_start.isoformat()
+            if self._near_start
+            else None,
+            "near_synchronous_last": self._near_end.isoformat()
+            if self._near_end
+            else None,
+            "near_synchronous_energy_error_bound_kwh": None,
+            "near_synchronous_overlaps_exact_energy": True,
+            "exact_interval_queue_drops": self._exact_queue_drops,
+            "near_interval_queue_drops": self._near_queue_drops,
+            "near_unmatched_interval_drops": self._near_unmatched_drops,
+            "near_pending_intervals": sum(
+                len(q) for q in self._near_intervals.values()
+            ),
+            "near_synchronous_cost": None,
+            "near_synchronous_basis": "sum_of_separate_counter_intervals_not_a_common_window",
+            "near_synchronous_quality": "estimate_with_unknown_energy_error_bound",
             "measurement_time": "HA_report_not_physical",
             "energy_kwh_estimate": round(self.energy, 4),
             "priced_energy_kwh_estimate": round(self.priced_energy, 4),
