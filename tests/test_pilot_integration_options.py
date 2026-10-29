@@ -1556,7 +1556,8 @@ def test_energy_meter_subscription_tracks_asynchronous_reports_and_restarts_on_o
             attributes={"unit_of_measurement": "kWh"},
         )
         callback(SimpleNamespace(time_fired=at, data={"entity_id": "sensor." + name}))
-    assert sensor._power_ledger.summary()["energy_kwh_estimate"] == 2
+    assert sensor._power_ledger.summary()["energy_kwh_estimate"] == 0
+    assert sensor._power_ledger.summary()["qualified_meter_energy_kwh"] == 4
     old = sensor._power_ledger
     sensor._config_entry.options["thermal_energy_entities"] = ["sensor.a"]
     sensor._setup_power_telemetry()
@@ -1621,7 +1622,7 @@ def test_queued_energy_events_preserve_reset_even_if_current_state_is_newer(
     def report(minute, value):
         at = start + timedelta(minutes=minute)
         return SimpleNamespace(
-            state=str(value),
+            state=str(value / 100),
             last_reported=at,
             last_changed=at,
             attributes={"unit_of_measurement": "kWh"},
@@ -1636,7 +1637,7 @@ def test_queued_energy_events_preserve_reset_even_if_current_state_is_newer(
                 data={"entity_id": "sensor.energy", "new_state": report(minute, value)},
             )
         )
-    assert sensor._power_ledger.summary()["energy_kwh_estimate"] == 30
+    assert sensor._power_ledger.summary()["energy_kwh_estimate"] == 0.3
     assert sensor._power_ledger.summary()["gap_count"] == 1
 
 
@@ -1707,7 +1708,7 @@ def test_price_state_event_preserves_unchanged_forecast_across_boundary(monkeypa
             data={"entity_id": "sensor.energy", "new_state": meter(end, 2)},
         )
     )
-    assert sensor._power_ledger.summary()["cost_estimate"] == 4
+    assert sensor._power_ledger.summary()["cost_estimate"] is None
 
 
 def test_energy_poll_does_not_skip_queued_reset_event(monkeypatch):
@@ -1734,7 +1735,7 @@ def test_energy_poll_does_not_skip_queued_reset_event(monkeypatch):
     def meter(minute, value):
         at = start + timedelta(minutes=minute)
         return SimpleNamespace(
-            state=str(value),
+            state=str(value / 100),
             last_reported=at,
             last_changed=at,
             attributes={"unit_of_measurement": "kWh"},
@@ -1757,7 +1758,7 @@ def test_energy_poll_does_not_skip_queued_reset_event(monkeypatch):
                 data={"entity_id": "sensor.energy", "new_state": meter(minute, value)},
             )
         )
-    assert sensor._power_ledger.summary()["energy_kwh_estimate"] == 30
+    assert sensor._power_ledger.summary()["energy_kwh_estimate"] == 0.3
     assert sensor._power_ledger.summary()["gap_count"] == 1
 
 
@@ -1881,7 +1882,8 @@ def test_polled_energy_cannot_overtake_queued_price_correction(monkeypatch):
         )
     )
     result = sensor._power_ledger.summary()
-    assert result["energy_kwh_estimate"] == 1
+    assert result["energy_kwh_estimate"] == 0
+    assert result["qualified_meter_energy_kwh"] == 1
     assert result["priced_energy_kwh_estimate"] == 0
     assert result["cost_estimate"] is None
 

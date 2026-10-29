@@ -7,7 +7,6 @@ zero-order-hold estimate, not an energy meter or a thermal-power calculation.
 import math
 from copy import deepcopy
 from datetime import timedelta
-from itertools import pairwise
 from types import SimpleNamespace
 
 from .pilot_forecast import _timestamp, price_window, source_is_current
@@ -30,9 +29,11 @@ class PowerLedger:
         self._price_cache = None
         self._energy_anchors = {}
         self._energy_updated = {}
+        self._energy_units = {}
         self._energy_intervals = {}
         self._meter_ids = None
         self._meter_qualified = 0.0
+        self._meter_totals = {}
         self._energy_price_version = None
 
     @staticmethod
@@ -321,8 +322,10 @@ class PowerLedger:
     def observe_energy(self, when, meters, prices, *, meter_ids=None):
         """Record each meter independently, then intersect qualified intervals.
 
-        Counter deltas have no intra-interval shape, so their allocation is
-        explicitly time-weighted; it is not an instantaneous measurement.
+        Counter deltas have no intra-interval shape. Only complete intervals
+        with shared endpoints may be summed; no interpolation is performed.
+        Reports must be at most 24 hours apart and imply at most 100 kW,
+        matching the existing power telemetry ceiling. Reload starts anew.
         """
         now = _timestamp(when)
         ids = tuple(sorted(meter_ids if meter_ids is not None else meters))
@@ -365,11 +368,23 @@ class PowerLedger:
             if previous is not None:
                 start, old, price_snapshot, currency = previous
                 dt = (at - start).total_seconds()
-                if 0 < dt <= 300 and value >= old:
+                if (
+                    0 < dt <= 86400
+                    and value >= old
+                    and (value - old) * 3600 / dt <= 100
+                    and self._energy_units.get(meter_id) == unit
+                ):
+                    if not self._same_energy_prices(
+                        price_snapshot, currency, prices, at, start, at - start
+                    ):
+                        price_snapshot = currency = None
                     delta = value - old
                     self._meter_qualified += delta
+                    self._meter_totals[meter_id] = (
+                        self._meter_totals.get(meter_id, 0.0) + delta
+                    )
                     queue = self._energy_intervals[meter_id]
-                    queue.append([start, at, delta / dt, price_snapshot, currency])
+                    queue.append([start, at, delta, price_snapshot, currency])
                     if len(queue) > 1024:
                         queue.pop(0)
                         self.gaps += 1
@@ -407,72 +422,66 @@ class PowerLedger:
                     else None
                 )
                 self._energy_anchors[meter_id] = (at, value, price_snapshot, currency)
+                self._energy_units[meter_id] = unit
                 self._energy_updated[meter_id] = _timestamp(
                     getattr(state, "last_updated", None)
                 ) or _timestamp(getattr(state, "last_changed", None))
         self._collect_energy_intersections()
 
     def _collect_energy_intersections(self):
+        # Find shared *actual* endpoints of contiguous per-meter chains.
+        # Preserve unmatched intervals for later reports, bounded by queue size.
         queues = self._energy_intervals
-        while queues and all(queues[key] for key in self._meter_ids):
-            intervals = [queues[key][0] for key in self._meter_ids]
-            start = max(item[0] for item in intervals)
-            end = min(item[1] for item in intervals)
-            if start < end:
-                seconds = (end - start).total_seconds()
-                rate = sum(item[2] for item in intervals)
-                energy = rate * seconds
+        while queues and all(queues.values()):
+            boundaries = []
+            for queue in queues.values():
+                boundaries.append({point for item in queue for point in item[:2]})
+            common = sorted(set.intersection(*boundaries))
+            if len(common) < 2:
+                return
+            start, end = common[:2]
+            groups = []
+            for queue in queues.values():
+                group = [item for item in queue if start <= item[0] and item[1] <= end]
+                cursor = start
+                for item in group:
+                    if item[0] != cursor:
+                        break
+                    cursor = item[1]
+                if cursor != end:
+                    # A dropout in any meter makes this window incomparable.
+                    for pending in queues.values():
+                        pending[:] = [item for item in pending if item[1] > end]
+                    break
+                groups.append(group)
+            else:
+                items = [item for group in groups for item in group]
+                energy = sum(item[2] for item in items)
                 self.energy += energy
-                self.seconds += seconds
+                self.seconds += (end - start).total_seconds()
                 if self.coverage_start is None:
                     self.coverage_start = start
                 self.coverage_end = end
-                # Split at every available price boundary. Missing or conflicting
-                # prices leave only that part of the common interval unpriced.
-                boundaries = {start, end}
-                for item in intervals:
-                    for source in item[3] or ():
-                        attrs = source.attributes
-                        for name in ("raw_today", "raw_tomorrow", "prices", "forecast"):
-                            entries = attrs.get(name, [])
-                            if not isinstance(entries, list):
-                                continue
-                            for entry in entries:
-                                if not isinstance(entry, dict):
-                                    continue
-                                for field in ("start", "end"):
-                                    point = _timestamp(entry.get(field))
-                                    if point is not None and start < point < end:
-                                        boundaries.add(point)
-                ordered = sorted(boundaries)
-                currencies = {item[4] for item in intervals}
-                for left, right in pairwise(ordered):
-                    if len(currencies) != 1 or None in currencies:
+                # Price each complete counter interval independently. Different
+                # meters can have different reporting cadences without assuming
+                # uniform consumption inside any of their intervals.
+                for item in items:
+                    window = (
+                        price_window(item[3], item[0], item[1] - item[0])
+                        if item[3] and item[4]
+                        else None
+                    )
+                    rates = {segment[2] for segment in window or ()}
+                    if not window or len(rates) != 1:
                         continue
-                    windows = [
-                        price_window(item[3], left, right - left) if item[3] else None
-                        for item in intervals
-                    ]
-                    if any(window is None for window in windows) or any(
-                        window != windows[0] for window in windows[1:]
-                    ):
-                        continue
-                    currency = next(iter(currencies))
-                    if self.currency is not None and self.currency != currency:
+                    if self.currency is not None and self.currency != item[4]:
                         self.mixed_currency = True
                         continue
-                    self.currency = currency
-                    self.priced_energy += rate * (right - left).total_seconds()
-                    self.cost += sum(
-                        rate * (b - a).total_seconds() * price
-                        for a, b, price in windows[0]
-                    )
-            # Consume exactly the common prefix; never count it twice.
-            for key, item in zip(self._meter_ids, intervals):
-                if item[1] <= max(start, end):
-                    queues[key].pop(0)
-                elif start < end:
-                    item[0] = end
+                    self.currency = item[4]
+                    self.priced_energy += item[2]
+                    self.cost += item[2] * next(iter(rates))
+                for queue in queues.values():
+                    queue[:] = [item for item in queue if item[1] > end]
 
     def summary(self):
         # Do not treat a partial-price cost as the price of all observed energy.
@@ -491,11 +500,10 @@ class PowerLedger:
             else None,
             "price_basis": "configured_price_entity_not_verified_full_tariff",
             "price_coverage_scope": "observed_intervals_only",
-            "cost_verification": "estimate_not_verified",
-            "cost_allocation_basis": "uniform_energy_between_meter_reports"
+            "cost_verification": "counter_intervals_at_constant_price"
             if self._meter_ids is not None
-            else "power_held_between_reports",
-            "method": "cumulative_energy_time_weighted"
+            else "power_estimate_not_verified",
+            "method": "cumulative_energy_counter_deltas"
             if self._meter_ids is not None
             else "reported_power_held_between_reports",
             "qualified_meter_energy_kwh": round(self._meter_qualified, 4)
@@ -504,9 +512,13 @@ class PowerLedger:
             "meter_count": len(self._meter_ids)
             if self._meter_ids is not None
             else None,
-            "energy_allocation": "uniform_between_reports"
+            "energy_allocation": "unknown_within_counter_interval"
             if self._meter_ids is not None
             else "power_held_between_reports",
+            "meter_energy_kwh": {
+                key: round(value, 4) for key, value in self._meter_totals.items()
+            },
+            "maximum_counter_interval_seconds": 86400 if self._meter_ids else None,
             "measurement_time": "HA_report_not_physical",
             "energy_kwh_estimate": round(self.energy, 4),
             "priced_energy_kwh_estimate": round(self.priced_energy, 4),

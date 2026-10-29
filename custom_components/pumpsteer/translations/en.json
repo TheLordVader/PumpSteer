@@ -89,7 +89,7 @@
           "thermal_detection_method": "Automatic uses qualified signals and reports uncertainty. Manual retains the supply threshold.",
           "thermal_compressor_entity": "Compressor status alone does not prove radiator heating.",
           "thermal_return_temp_entity": "Used only together with other qualified signals.",
-          "thermal_energy_entities": "Select one total meter or independent meters that can be summed. Energy is assumed to be uniform between reports; the cost is an estimate even when price coverage is complete."
+          "thermal_energy_entities": "Select one total meter or independent meters that can be summed. Selected meters take precedence for energy diagnostics. Only complete counter intervals with one unambiguous price are priced. Report gaps above 24 hours are excluded."
         }
       },
       "notifications": {
