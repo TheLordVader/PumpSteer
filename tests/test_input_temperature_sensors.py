@@ -80,6 +80,7 @@ def test_restore_only_causal_thermal_validation(
             state="-12",
             attributes={
                 "thermal_k": 0.05,
+                "thermal_k_valid": True,
                 "thermal_k_samples": 40,
                 "thermal_validated_sessions": 3,
                 "thermal_prediction_mae_c": 0.1,
@@ -358,3 +359,51 @@ def test_fixed_audit_completes_in_control_cycle_and_uses_existing_store(temperat
     assert len(controller._plan_audit.fixed_records) == 1
     assert controller._plan_audit.fixed_records[0]["horizon"] == 60
     assert saved[-1]["plan_audit"]["fixed_v1"][0]["horizon"] == 60
+
+
+@pytest.mark.parametrize("valid", [False, True, None])
+def test_restart_restores_k_only_when_saved_model_was_valid(
+    temperatures, monkeypatch, valid
+):
+    controller, _, _, _, _ = temperatures
+    controller.hass.is_running = False
+    controller.hass.bus = SimpleNamespace(async_listen_once=lambda *args: lambda: None)
+    controller._config_entry.add_update_listener = lambda callback: lambda: None
+
+    async def last_state():
+        attrs = {"thermal_k": 0.05, "thermal_k_valid": valid}
+        return SimpleNamespace(state="-12", attributes=attrs)
+
+    async def no_extra():
+        return None
+
+    monkeypatch.setattr(controller, "async_get_last_state", last_state)
+    monkeypatch.setattr(
+        controller, "async_get_last_extra_data", no_extra, raising=False
+    )
+    asyncio.run(controller.async_added_to_hass())
+    assert controller._thermal_model.is_valid is (valid is True)
+
+
+def test_low_valid_k_preserves_precision_across_restart(temperatures, monkeypatch):
+    controller, _, _, _, _ = temperatures
+    controller._thermal_model.restore_k(0.00104)
+    attrs = controller._base_attrs(21, 21, 5, "normal", 3)
+    controller._thermal_model = sensor_module.ThermalModel()
+    controller.hass.is_running = False
+    controller.hass.bus = SimpleNamespace(async_listen_once=lambda *args: lambda: None)
+    controller._config_entry.add_update_listener = lambda callback: lambda: None
+
+    async def last_state():
+        return SimpleNamespace(state="-12", attributes=attrs)
+
+    async def no_extra():
+        return None
+
+    monkeypatch.setattr(controller, "async_get_last_state", last_state)
+    monkeypatch.setattr(
+        controller, "async_get_last_extra_data", no_extra, raising=False
+    )
+    asyncio.run(controller.async_added_to_hass())
+    assert controller._thermal_model.is_valid
+    assert controller._thermal_model.k == pytest.approx(0.00104)

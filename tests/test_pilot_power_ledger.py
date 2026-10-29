@@ -510,3 +510,14 @@ def test_unchanged_price_report_preserves_pending_async_meter_interval():
     assert ledger.summary()["energy_kwh_estimate"] == 2
     assert ledger.summary()["priced_energy_kwh_estimate"] == 2
     assert ledger.summary()["cost_estimate"] == 2
+
+
+def test_cost_diagnostics_distinguish_time_weighted_estimate_from_verified_cost():
+    ledger = PowerLedger()
+    for minute, value in ((14, 0), (16, 2)):
+        at = T + timedelta(minutes=minute)
+        ledger.observe_energy(at, {"a": state(value, at, "kWh")}, [prices()])
+    result = ledger.summary()
+    assert result["price_coverage"] == "complete"
+    assert result["cost_verification"] == "estimate_not_verified"
+    assert result["cost_allocation_basis"] == "uniform_energy_between_meter_reports"

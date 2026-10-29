@@ -134,6 +134,7 @@ class PumpSteerSensor(RestoreEntity):
         self._config_entry = config_entry
         self._state: Optional[float] = None
         self._attributes: Dict[str, Any] = {}
+        # Only live, qualified inputs; never populated from restored attributes.
         self._input_temperatures: Dict[str, Optional[float]] = {}
         self._input_temperature_signal = (
             f"{DOMAIN}_{config_entry.entry_id}_input_temperatures"
@@ -235,6 +236,8 @@ class PumpSteerSensor(RestoreEntity):
         self._remove_update_listener = None
 
         self._attr_unique_id = config_entry.entry_id
+        # Keep the legacy default ID used by notifications before registration.
+        # HA still resolves existing (including user-renamed) entities by unique_id.
         self.entity_id = "sensor.pumpsteer"
         self._forecast_available_last: Optional[bool] = None
         self._safe_mode_warned: bool = False
@@ -521,8 +524,10 @@ class PumpSteerSensor(RestoreEntity):
             self._brake_last_expensive_t,
         )
 
-        saved_k = safe_float(self._attributes.get("thermal_k"))
-        if saved_k is not None:
+        saved_k = safe_float(
+            self._attributes.get("thermal_k_restore", self._attributes.get("thermal_k"))
+        )
+        if saved_k is not None and self._attributes.get("thermal_k_valid") is True:
             self._thermal_model.restore_k(saved_k)
             self._thermal_model.restore_diagnostics(
                 sample_count=self._attributes.get("thermal_k_samples", 0),
@@ -533,6 +538,18 @@ class PumpSteerSensor(RestoreEntity):
                 ),
                 prediction_mae=self._attributes.get("thermal_prediction_mae_c"),
                 validation_basis=self._attributes.get("thermal_validation_basis"),
+                last_prediction_error=self._attributes.get(
+                    "thermal_last_prediction_error_c"
+                ),
+                last_session_duration_minutes=self._attributes.get(
+                    "thermal_last_session_duration_minutes"
+                ),
+                last_session_actual_drop=self._attributes.get(
+                    "thermal_last_session_actual_drop_c"
+                ),
+                last_session_predicted_drop=self._attributes.get(
+                    "thermal_last_session_predicted_drop_c"
+                ),
             )
 
         # Wait until Home Assistant is fully started before the first real update.
@@ -992,6 +1009,7 @@ class PumpSteerSensor(RestoreEntity):
                 else None
             ),
             "thermal_k": round(self._thermal_model.k, 4),
+            "thermal_k_restore": self._thermal_model.k,
             "thermal_k_valid": self._thermal_model.is_valid,
             "thermal_k_samples": self._thermal_model.sample_count,
             "thermal_pending_samples": self._thermal_model.pending_samples,
@@ -1752,7 +1770,7 @@ class PumpSteerSensor(RestoreEntity):
                 # Brake phase has ended before this branch. Fit the thermal model only
                 # once, using the samples collected during the completed brake phase.
                 if self._was_braking_last_cycle:
-                    if self._thermal_model.pending_samples >= 20:
+                    if self._thermal_model.should_refit():
                         self._thermal_model.fit()
                     self._was_braking_last_cycle = False
 
@@ -1908,7 +1926,7 @@ class PumpSteerSensor(RestoreEntity):
                 self._brake_last_t = None
                 self._brake_last_expensive_t = None
                 if self._was_braking_last_cycle:
-                    if self._thermal_model.pending_samples >= 20:
+                    if self._thermal_model.should_refit():
                         self._thermal_model.fit()
                     self._was_braking_last_cycle = False
 
@@ -2022,7 +2040,7 @@ class PumpSteerSensor(RestoreEntity):
 
         # Fit the thermal model once after a completed brake phase has fully ramped out.
         if self._was_braking_last_cycle and factor <= 0.0:
-            if self._thermal_model.pending_samples >= 20:
+            if self._thermal_model.should_refit():
                 self._thermal_model.fit()
             self._was_braking_last_cycle = False
 
@@ -2110,6 +2128,12 @@ class PumpSteerSensor(RestoreEntity):
                 fallback_tomorrow_attr, fallback_tomorrow_raw_attr
             )
 
+        # Nord Pool sorts the repeated DST hour by local wall-clock time, which
+        # interleaves +02:00 and +01:00 slots. Order by real (UTC) start so a
+        # correct 25-hour day validates; gaps and duplicates are still rejected.
+        raw_today = self._sort_by_utc_start(raw_today)
+        raw_tomorrow = self._sort_by_utc_start(raw_tomorrow)
+
         prices_raw = [*raw_today, *raw_tomorrow]
 
         if not prices_raw:
@@ -2155,6 +2179,28 @@ class PumpSteerSensor(RestoreEntity):
         # silently move every later price to an earlier time (or even day).
         interval_minutes = detect_price_interval_minutes(raw_today)
         today_prices = self._parse_price_day(raw_today)
+        if (
+            today_prices
+            and self._has_slot_timestamps(raw_today)
+            and self._has_slot_timestamps(raw_tomorrow)
+            and not self._price_day_matches_slots(raw_today, now, interval_minutes)
+        ):
+            # Just after midnight the price sensor may still expose yesterday as
+            # "today" while "tomorrow" already holds today's timestamped slots.
+            # Use those slots instead of entering safe mode until it rolls over.
+            rollover_interval = detect_price_interval_minutes(raw_tomorrow)
+            rollover_prices = self._parse_price_day(raw_tomorrow)
+            if rollover_prices and self._price_day_matches_slots(
+                raw_tomorrow, now, rollover_interval
+            ):
+                _LOGGER.debug(
+                    "Price sensor not rolled over yet; using its 'tomorrow' slots "
+                    "as today (today='%s')",
+                    today_entity_id,
+                )
+                raw_today, raw_tomorrow = raw_tomorrow, []
+                interval_minutes = rollover_interval
+                today_prices = rollover_prices
         if not today_prices or not self._price_day_matches_slots(
             raw_today, now, interval_minutes
         ):
@@ -2273,6 +2319,37 @@ class PumpSteerSensor(RestoreEntity):
             self._current_price_unit = unit.strip()
 
         return prices, categories, interval_minutes, current_slot
+
+    @staticmethod
+    def _sort_by_utc_start(items: List[Any]) -> List[Any]:
+        """Sort fully timestamped, timezone-aware slots by their UTC start.
+
+        Anything else is returned unchanged so the slot validator can reject it.
+        Each price keeps its own timestamp, so sorting never moves a price
+        to another slot.
+        """
+        keyed = []
+        for item in items:
+            if not isinstance(item, dict) or "start" not in item:
+                return items
+            try:
+                start = datetime.fromisoformat(str(item["start"]))
+            except (TypeError, ValueError):
+                return items
+            if start.utcoffset() is None:
+                return items
+            keyed.append((start.astimezone(timezone.utc), item))
+        keyed.sort(key=lambda pair: pair[0])
+        return [item for _, item in keyed]
+
+    @staticmethod
+    def _has_slot_timestamps(items: Any) -> bool:
+        """True when every entry carries an explicit slot start time."""
+        return (
+            isinstance(items, list)
+            and bool(items)
+            and all(isinstance(item, dict) and "start" in item for item in items)
+        )
 
     @staticmethod
     def _prefer_timestamped_prices(values: Any, detailed: Any) -> List[Any]:
@@ -3388,6 +3465,7 @@ class PumpSteerSensor(RestoreEntity):
                 replay_state.prev_aggressiveness,
                 replay_state.bridge_short_dip_active,
                 replay_state.thermal_pending_samples,
+                replay_state.thermal_should_refit,
             )
             if replay_state is not None
             else None
@@ -4168,47 +4246,6 @@ class PumpSteerSensor(RestoreEntity):
             self._pilot_status = "learning_error"
 
 
-class PumpSteerInputTemperatureSensor(SensorEntity):
-    """Expose the qualified control input, without another source read."""
-
-    _attr_has_entity_name = True
-    _attr_should_poll = False
-    _attr_native_unit_of_measurement = "°C"
-    _attr_device_class = "temperature"
-    _attr_state_class = "measurement"
-    _attr_native_value = None
-
-    def __init__(self, controller: PumpSteerSensor, key: str) -> None:
-        self._controller = controller
-        self._key = key
-        self._attr_translation_key = key
-        self._attr_unique_id = f"{controller.unique_id}_{key}"
-        self._attr_device_info = controller._attr_device_info
-
-    @property
-    def available(self) -> bool:
-        return self._attr_native_value is not None
-
-    async def async_added_to_hass(self) -> None:
-        await super().async_added_to_hass()
-        self.async_on_remove(
-            async_dispatcher_connect(
-                self.hass,
-                self._controller._input_temperature_signal,
-                self._async_update_from_controller,
-            )
-        )
-        if not self._controller._update_in_progress:
-            self._async_update_from_controller()
-
-    @callback
-    def _async_update_from_controller(self) -> None:
-        value = self._controller._input_temperatures.get(self._key)
-        if value != self._attr_native_value:
-            self._attr_native_value = value
-            self.async_write_ha_state()
-
-
 class PumpSteerThermalStatusSensor(SensorEntity):
     """Compact passive status, updated only when its summary changes."""
 
@@ -4307,6 +4344,47 @@ class PumpSteerThermalStatusSensor(SensorEntity):
         if state != self._attr_native_value or summary != self._summary:
             self._attr_native_value = state
             self._summary = summary
+            self.async_write_ha_state()
+
+
+class PumpSteerInputTemperatureSensor(SensorEntity):
+    """Expose one qualified control input without reading its source again."""
+
+    _attr_has_entity_name = True
+    _attr_should_poll = False
+    _attr_native_unit_of_measurement = "°C"
+    _attr_device_class = "temperature"
+    _attr_state_class = "measurement"
+    _attr_native_value = None
+
+    def __init__(self, controller: PumpSteerSensor, key: str) -> None:
+        self._controller = controller
+        self._key = key
+        self._attr_translation_key = key
+        self._attr_unique_id = f"{controller.unique_id}_{key}"
+        self._attr_device_info = controller._attr_device_info
+
+    @property
+    def available(self) -> bool:
+        return self._attr_native_value is not None
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        self.async_on_remove(
+            async_dispatcher_connect(
+                self.hass,
+                self._controller._input_temperature_signal,
+                self._async_update_from_controller,
+            )
+        )
+        if not self._controller._update_in_progress:
+            self._async_update_from_controller()
+
+    @callback
+    def _async_update_from_controller(self) -> None:
+        value = self._controller._input_temperatures.get(self._key)
+        if value != self._attr_native_value:
+            self._attr_native_value = value
             self.async_write_ha_state()
 
 

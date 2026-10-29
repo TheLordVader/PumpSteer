@@ -491,6 +491,10 @@ class PowerLedger:
             else None,
             "price_basis": "configured_price_entity_not_verified_full_tariff",
             "price_coverage_scope": "observed_intervals_only",
+            "cost_verification": "estimate_not_verified",
+            "cost_allocation_basis": "uniform_energy_between_meter_reports"
+            if self._meter_ids is not None
+            else "power_held_between_reports",
             "method": "cumulative_energy_time_weighted"
             if self._meter_ids is not None
             else "reported_power_held_between_reports",

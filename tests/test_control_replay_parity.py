@@ -339,3 +339,32 @@ def test_invalid_indata_safe_matches_live_and_does_not_mutate_state(
     assert next_state.brake_ramp == sensor._brake_ramp == 0
     assert next_state.preheat_ramp == sensor._preheat_ramp == 0
     assert next_state.pi._integral == sensor._pi._integral == 0
+
+
+@pytest.mark.parametrize(
+    "fitted,validated,expected",
+    [(False, False, True), (True, False, False), (True, True, True)],
+)
+def test_replay_uses_real_refit_gate_at_brake_end(fitted, validated, expected):
+    from test_thermal_learning_bias_and_refit import _feed_quantized, _run_session
+
+    sensor, _ = _sensor()
+    if fitted:
+        sensor._thermal_model.restore_k(0.02)
+    if validated:
+        for _ in range(3):
+            _run_session(sensor._thermal_model, 270, 21.2, 20.9, 7.0)
+    _feed_quantized(sensor._thermal_model, 30, -0.066)
+    sensor._was_braking_last_cycle = True
+    sensor._brake_ramp = 0.0
+    state = ControlReplayState.from_sensor(sensor)
+    from dataclasses import replace
+
+    inputs = replace(
+        _input(sensor, START, indoor=20.5),
+        categories=("normal",) * 96,
+        preheat_enabled=False,
+    )
+    _, decision = replay_control_step(state, inputs)
+    assert decision.reason is None
+    assert any(kind == "thermal_fit" for kind, _ in decision.intentions) is expected

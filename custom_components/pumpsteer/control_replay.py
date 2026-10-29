@@ -36,6 +36,7 @@ class ControlReplayState:
     prev_aggressiveness: int | None = None
     bridge_short_dip_active: bool = False
     thermal_pending_samples: int = 0
+    thermal_should_refit: bool | None = None
 
     @classmethod
     def from_sensor(cls, sensor):
@@ -52,6 +53,7 @@ class ControlReplayState:
             prev_aggressiveness=sensor._prev_aggressiveness,
             bridge_short_dip_active=sensor._bridge_short_dip_active,
             thermal_pending_samples=sensor._thermal_model.pending_samples,
+            thermal_should_refit=sensor._thermal_model.should_refit(),
         )
 
 
@@ -85,9 +87,17 @@ class ControlReplayDecision:
 
 
 class _ThermalIntent:
-    def __init__(self, samples, intentions):
+    def __init__(self, samples, should_refit, intentions):
         self.pending_samples = samples
+        self._should_refit = should_refit
         self.intentions = intentions
+
+    def should_refit(self):
+        return (
+            self._should_refit
+            if self._should_refit is not None
+            else self.pending_samples >= 20
+        )
 
     def fit(self):
         self.intentions.append(("thermal_fit", {}))
@@ -128,7 +138,7 @@ class _Scratch:
         self._preheat_allowed = inputs.preheat_enabled
         self._intentions = []
         self._thermal_model = _ThermalIntent(
-            state.thermal_pending_samples, self._intentions
+            state.thermal_pending_samples, state.thermal_should_refit, self._intentions
         )
         self._decision = None
 
@@ -185,6 +195,7 @@ class _Scratch:
             prev_aggressiveness=self._prev_aggressiveness,
             bridge_short_dip_active=self._bridge_short_dip_active,
             thermal_pending_samples=self._thermal_model.pending_samples,
+            thermal_should_refit=self._thermal_model._should_refit,
         )
 
 
@@ -276,6 +287,10 @@ def replay_control_step(state, inputs):
         or not valid_temperature(state.pi._last_error)
         or type(state.thermal_pending_samples) is not int
         or state.thermal_pending_samples < 0
+        or (
+            state.thermal_should_refit is not None
+            and type(state.thermal_should_refit) is not bool
+        )
         or (
             inputs.forecast_temps is not None
             and (

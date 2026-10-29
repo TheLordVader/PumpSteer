@@ -1884,3 +1884,17 @@ def test_polled_energy_cannot_overtake_queued_price_correction(monkeypatch):
     assert result["energy_kwh_estimate"] == 1
     assert result["priced_energy_kwh_estimate"] == 0
     assert result["cost_estimate"] is None
+
+
+def test_status_sensor_translations_survive_upstream_integration():
+    root = Path(__file__).parents[1] / "custom_components/pumpsteer"
+    for name in (
+        "strings.json",
+        "translations/en.json",
+        "translations/se.json",
+        "translations/sv.json",
+    ):
+        sensor = json.loads((root / name).read_text())["entity"]["sensor"]
+        assert "thermal_intelligence" in sensor
+        assert "indoor_temperature" in sensor
+        assert "outdoor_temperature" in sensor

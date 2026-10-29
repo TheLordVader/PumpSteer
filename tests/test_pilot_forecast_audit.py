@@ -265,3 +265,10 @@ def test_fixed_pending_is_dropped_by_safe_unload_or_disable():
     audit.cancel_plans("safe_mode")
     assert audit.fixed_pending is None
     assert audit.issue_fixed(T + timedelta(minutes=125), 20.8, 4, 0.03, ("a", "b"))
+
+
+@pytest.mark.parametrize(
+    "k,expected", [(0.001, False), (0.00104, True), (0.004, True), (0.5, False)]
+)
+def test_fixed_forecasts_match_thermal_model_k_limits(k, expected):
+    assert ForecastAudit().issue_fixed(T, 21, 5, k, ("a", "b")) is expected

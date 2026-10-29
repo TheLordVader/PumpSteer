@@ -7,6 +7,7 @@ heat indicator and outside temperature. HA report time is not physical time.
 
 from datetime import timedelta
 import math
+from .thermal_model import _K_MIN, _K_MAX
 
 
 def _plan_context(value):
@@ -150,7 +151,7 @@ class ForecastAudit:
                 and math.isfinite(v)
                 for v in (indoor, outdoor, k)
             )
-            or not 0.005 < k < 0.5
+            or not _K_MIN < k < _K_MAX
         ):
             return False
         delta = max(0.0, indoor - outdoor)
