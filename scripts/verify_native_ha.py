@@ -29,8 +29,27 @@ REPO = Path(__file__).resolve().parents[1]
 logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
 
 
-@pytest.fixture
-def hass_config_dir(tmp_path):
+@pytest.fixture(autouse=True)
+def local_component_namespace(monkeypatch):
+    """Include this checkout when the HA plugin supplies its own test package."""
+    import custom_components
+
+    monkeypatch.setattr(
+        custom_components,
+        "__path__",
+        [str(REPO / "custom_components"), *custom_components.__path__],
+    )
+
+
+@pytest.fixture(autouse=True)
+def hass_config_dir(monkeypatch, tmp_path):
+    # Select the directory before HA/Recorder fixtures run. Depending on hass
+    # here would start HA before recorder_db_url has prepared its database.
+    from pytest_homeassistant_custom_component import common
+
+    monkeypatch.setattr(
+        common, "get_test_config_dir", lambda *parts: str(tmp_path.joinpath(*parts))
+    )
     custom = tmp_path / "custom_components"
     custom.mkdir()
     (custom / "pumpsteer").symlink_to(REPO / "custom_components/pumpsteer")
@@ -1236,3 +1255,55 @@ async def test_native_options_menu_preserves_other_pages(
     assert result["type"] == "create_entry"
     assert entry.options["ohmigo_entity"] == "number.test_output"
     assert entry.options["notification_cooldown_minutes"] == "60"
+
+
+async def test_native_counter_reports_keep_async_deltas_until_shared_window(
+    hass, freezer
+):
+    """Exercise real HA state events, including a stationary third meter."""
+    from custom_components.pumpsteer.sensor import PumpSteerSensor
+
+    freezer.move_to("2026-01-02T00:00:00+00:00")
+    entry = MockConfigEntry(
+        domain="pumpsteer",
+        data={},
+        options={
+            "thermal_intelligence_enabled": True,
+            "thermal_energy_entities": ["sensor.a", "sensor.b", "sensor.c"],
+        },
+    )
+    entry.add_to_hass(hass)
+    controller = PumpSteerSensor(hass, entry)
+    controller._setup_power_telemetry()
+    try:
+
+        async def report(minute, name, value):
+            freezer.move_to(f"2026-01-02T00:{minute:02d}:00+00:00")
+            hass.states.async_set(
+                "sensor." + name,
+                value,
+                {
+                    "device_class": "energy",
+                    "state_class": "total_increasing",
+                    "unit_of_measurement": "kWh",
+                },
+            )
+            await hass.async_block_till_done()
+
+        for name in ("a", "b", "c"):
+            await report(1, name, 10)
+        await report(2, "a", 11)
+        await report(3, "b", 11)
+        assert controller._power_ledger.summary()["qualified_meter_energy_kwh"] == 2
+        assert controller._power_ledger.energy == 0
+        for name, value in (("a", 12), ("b", 12), ("c", 10)):
+            await report(4, name, value)
+        # Unchanged HA reports have no state_changed event: the existing cycle
+        # must consume last_reported for the stationary meter.
+        controller._consume_power_report(dt_util.now())
+        result = controller._power_ledger.summary()
+        assert result["energy_kwh_estimate"] == 4
+        assert result["qualified_seconds"] == 180
+        assert result["cost_estimate"] is None
+    finally:
+        controller._stop_power_telemetry()
