@@ -843,6 +843,68 @@ def test_calibrated_multi_signal_indication_does_not_become_pilot_heat(monkeypat
     assert sensor._pilot is None
 
 
+def test_automatic_collects_indication_but_never_qualifies_pilot_without_heat_label(
+    monkeypatch,
+):
+    from datetime import datetime, timedelta, timezone
+
+    sensor, states = _sensor()
+    sensor._config_entry.options.update(
+        thermal_intelligence_enabled=True,
+        thermal_detection_method="automatic",
+        thermal_compressor_entity="binary_sensor.compressor",
+        thermal_heating_mode_entity="binary_sensor.radiator",
+        thermal_hot_water_mode_entity="binary_sensor.water",
+        thermal_supply_temp_entity="sensor.supply",
+        thermal_return_temp_entity="sensor.return",
+        thermal_power_entity="sensor.power",
+    )
+    start = datetime(2026, 10, 11, 8, tzinfo=timezone.utc)
+    for key in ("sensor.indoor", "sensor.outdoor"):
+        states[key].attributes["unit_of_measurement"] = "°C"
+        states[key].last_changed = start
+    for key, value in (
+        ("binary_sensor.compressor", "on"),
+        ("binary_sensor.radiator", "on"),
+        ("binary_sensor.water", "off"),
+    ):
+        states[key] = SimpleNamespace(
+            state=value,
+            last_reported=start,
+            last_changed=start - timedelta(minutes=2),
+            attributes={},
+        )
+    for key, value, unit in (
+        ("sensor.supply", "35", "°C"),
+        ("sensor.return", "30", "°C"),
+        ("sensor.power", "1200", "W"),
+    ):
+        states[key] = SimpleNamespace(
+            state=value,
+            last_reported=start,
+            last_changed=start,
+            attributes={"unit_of_measurement": unit},
+        )
+
+    attrs = _cycle(sensor, monkeypatch, 0)
+    detail = attrs["thermal_intelligence_operation_detail"]
+    assert detail["mode"] == "indicated_radiator_heating"
+    assert detail["evidence_level"] == "operating_indication"
+    assert detail["evidence_uncertainty"] == "heat_delivery_unverified"
+    assert not detail["learning_qualified"]
+    assert sensor._pilot is None
+
+    states["binary_sensor.water"].state = "unavailable"
+    states["binary_sensor.water"].last_reported = start + timedelta(minutes=1)
+    states["binary_sensor.water"].last_changed = start + timedelta(minutes=1)
+    attrs = _cycle(sensor, monkeypatch, 1)
+    detail = attrs["thermal_intelligence_operation_detail"]
+    assert detail["mode"] == "unknown"
+    assert "hot_water" not in detail["signals"]
+    assert not detail["learning_qualified"]
+    assert sensor._pilot is None
+
+
 def test_options_offer_supply_mode_and_threshold(monkeypatch):
     flow = options_flow.PumpSteerOptionsFlowHandler()
     flow.config_entry = SimpleNamespace(data={}, options={})

@@ -304,4 +304,36 @@ class HeatOperation:
                         result.update(mode="space_heating", quality="probable")
                 elif c[1] == 0 and p[2] < threshold:
                     result.update(mode="idle", quality="probable")
+        # Record an operating indication for diagnostics when the independent
+        # heat label is absent. These coincident signals cannot prove heat
+        # delivery and must never qualify a Pilot interval.
+        if (
+            result["mode"] == "unknown"
+            and result["calibration"] == "insufficient_evidence"
+            and h is None
+            and c is not None
+            and c[1] == 1
+            and r is not None
+            and r[1] == 1
+            and w is not None
+            and w[1] == 0
+            and p is not None
+            and paired
+            and f[1] > ret[1]
+            and all(
+                (changed := _timestamp(getattr(state, "last_changed", None)))
+                is not None
+                and changed
+                <= min(c[0], r[0], w[0], p[0], f[0], ret[0])
+                - timedelta(minutes=1)
+                for state in (compressor, radiator, water)
+            )
+        ):
+            result.update(
+                mode="indicated_radiator_heating",
+                quality="indication_only",
+                evidence_level="operating_indication",
+                evidence_uncertainty="heat_delivery_unverified",
+            )
+
         return result
