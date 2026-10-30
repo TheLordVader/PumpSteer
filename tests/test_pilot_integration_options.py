@@ -847,6 +847,16 @@ def test_automatic_collects_indication_but_never_qualifies_pilot_without_heat_la
     monkeypatch,
 ):
     from datetime import datetime, timedelta, timezone
+    from custom_components.pumpsteer.pilot_passive import PilotPassive
+
+    calls = []
+    observe = PilotPassive.observe_indicated
+
+    def track(self, *args, **kwargs):
+        calls.append(args[3]["mode"])
+        return observe(self, *args, **kwargs)
+
+    monkeypatch.setattr(PilotPassive, "observe_indicated", track)
 
     sensor, states = _sensor()
     sensor._config_entry.options.update(
@@ -892,7 +902,10 @@ def test_automatic_collects_indication_but_never_qualifies_pilot_without_heat_la
     assert detail["evidence_level"] == "operating_indication"
     assert detail["evidence_uncertainty"] == "heat_delivery_unverified"
     assert not detail["learning_qualified"]
-    assert sensor._pilot is None
+    assert calls == ["indicated_radiator_heating"]
+    assert sensor._pilot is not None
+    assert sensor._pilot.manager.model.history == []
+    assert sensor._pilot.validated_house(start.timestamp()) is None
 
     states["binary_sensor.water"].state = "unavailable"
     states["binary_sensor.water"].last_reported = start + timedelta(minutes=1)
@@ -902,7 +915,9 @@ def test_automatic_collects_indication_but_never_qualifies_pilot_without_heat_la
     assert detail["mode"] == "unknown"
     assert "hot_water" not in detail["signals"]
     assert not detail["learning_qualified"]
-    assert sensor._pilot is None
+    assert calls[-1] == "unknown"
+    assert sensor._pilot.indicated_house.start is None
+    assert sensor._pilot.manager.model.history == []
 
 
 def test_options_offer_supply_mode_and_threshold(monkeypatch):
