@@ -32,13 +32,14 @@
       "basic": {
         "title": "Grundinställningar",
         "data": {
+          "outdoor_temperature_report_max_age_minutes": "Högsta rapportålder för utetemperatur (minuter)",
           "indoor_temp_entity_2": "Innegivare 2 (valfri)",
           "indoor_temp_entity_3": "Innegivare 3 (valfri)",
           "outdoor_temp_entity_2": "Reservutegivare (valfri)",
           "indoor_temp_weight_1": "Vikt för innegivare 1",
           "indoor_temp_weight_2": "Vikt för innegivare 2",
           "indoor_temp_weight_3": "Vikt för innegivare 3",
-          "temperature_report_max_age_minutes": "Högsta rapportålder för temperatur (minuter)",
+          "temperature_report_max_age_minutes": "Högsta rapportålder för innetemperatur (minuter)",
           "indoor_temp_entity": "Inomhustemperatursensor",
           "real_outdoor_entity": "Utomhustemperatursensor",
           "electricity_price_entity": "Elprisensor (idag)",
@@ -51,6 +52,7 @@
           "preheat_boost_enabled": "Aktivera förvärmning"
         },
         "data_description": {
+          "outdoor_temperature_report_max_age_minutes": "Standard 120 minuter, baserat på observerade rapportluckor. Anpassa till dina utegivare. HA-rapporttid är inte bevis på fysisk mättid.",
           "temperature_report_max_age_minutes": "Standardvärdet är 360 minuter, baserat på observerade rapportintervall. Anpassa gränsen till dina givares observerade intervall. HA-rapporttid visar inte säkert när en fysisk mätning gjordes.",
           "pid_kp": "Hur kraftigt PumpSteer reagerar på aktuell temperaturdifferens. Typiskt intervall: 2,0 till 5,0.",
           "pid_ki": "Hur mycket PumpSteer korrigerar långsiktig drift. Typiskt intervall: 0,01 till 0,05.",

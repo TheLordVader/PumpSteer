@@ -1359,9 +1359,11 @@ async def test_native_basic_temperature_redundancy_options(
             "electricity_price_entity": "sensor.price",
             "price_tomorrow_entity": "sensor.price",
             "temperature_report_max_age_minutes": 360,
+            "outdoor_temperature_report_max_age_minutes": 75,
         },
     )
     assert saved["type"] == "create_entry", saved
     assert entry.options["indoor_temp_entity_2"] == "sensor.room2"
     assert entry.options["indoor_temp_weight_2"] == 3
     assert entry.options["outdoor_temp_entity_2"] == "sensor.backup"
+    assert entry.options["outdoor_temperature_report_max_age_minutes"] == 75

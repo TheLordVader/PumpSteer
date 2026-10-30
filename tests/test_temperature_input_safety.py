@@ -616,3 +616,55 @@ def test_incompatible_additional_temperature_unit_is_excluded(control):
         sensor.extra_state_attributes["temperature_sources"]["indoor_coverage"]
         == "reduced"
     )
+
+
+def test_start_accepts_one_new_indoor_report_and_excludes_old_peers(control):
+    sensor, states, clock = control
+    sensor._config_entry.options.update(
+        indoor_temp_entity_2="sensor.room2", indoor_temp_entity_3="sensor.room3"
+    )
+    states["sensor.room2"] = SimpleNamespace(
+        state="25", attributes={}, last_reported=clock[0]
+    )
+    states["sensor.room3"] = SimpleNamespace(
+        state="26", attributes={"restored": True}, last_reported=clock[0]
+    )
+    _report(states, clock)
+    asyncio.run(sensor._handle_ha_started(None))
+    assert sensor.extra_state_attributes["mode"] == MODE_SAFE
+    clock[0] += timedelta(seconds=1)
+    states["sensor.indoor"].last_reported = clock[0]
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["mode"] == MODE_SAFE
+    states["sensor.outdoor"].last_reported = clock[0]
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["mode"] == MODE_PI
+    assert sensor.extra_state_attributes["indoor_temperature"] == 21
+    assert (
+        sensor.extra_state_attributes["temperature_sources"]["indoor_coverage"]
+        == "reduced"
+    )
+
+
+def test_outdoor_report_age_switches_to_fresh_backup_before_indoor_expires(control):
+    sensor, states, clock = control
+    sensor._config_entry.options["outdoor_temp_entity_2"] = "sensor.backup"
+    states["sensor.backup"] = SimpleNamespace(state="-4", attributes={})
+    asyncio.run(sensor._handle_ha_started(None))
+    clock[0] += timedelta(seconds=1)
+    _report(states, clock)
+    states["sensor.backup"].last_reported = clock[0]
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["outdoor_temperature"] == -3.3
+    clock[0] += timedelta(minutes=121)
+    states["sensor.backup"].last_reported = clock[0]
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["mode"] == MODE_PI
+    assert sensor.extra_state_attributes["outdoor_temperature"] == -4
+    states["sensor.outdoor"].last_reported = clock[0]
+    clock[0] += timedelta(minutes=1)
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["outdoor_temperature"] == -4
+    clock[0] += timedelta(minutes=1)
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["outdoor_temperature"] == -3.3

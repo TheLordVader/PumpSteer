@@ -6,6 +6,7 @@ from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN
 from homeassistant.helpers.selector import selector
 
 from .const import (
+    DEFAULT_OUTDOOR_REPORT_MAX_AGE_MINUTES,
     DEFAULT_TEMPERATURE_REPORT_MAX_AGE_MINUTES,
     NOTIFICATION_COOLDOWN_CHOICES,
     NOTIFICATION_COOLDOWN_OPTION,
@@ -47,6 +48,7 @@ _GROUPS = {
         "real_outdoor_entity",
         "outdoor_temp_entity_2",
         "temperature_report_max_age_minutes",
+        "outdoor_temperature_report_max_age_minutes",
         "weather_entity",
         "electricity_price_entity",
         "price_tomorrow_entity",
@@ -174,6 +176,23 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
                 default=current_data.get(
                     "temperature_report_max_age_minutes",
                     DEFAULT_TEMPERATURE_REPORT_MAX_AGE_MINUTES,
+                ),
+            ): selector(
+                {
+                    "number": {
+                        "min": 1,
+                        "max": 10080,
+                        "step": 1,
+                        "unit_of_measurement": "min",
+                        "mode": "box",
+                    }
+                }
+            ),
+            vol.Optional(
+                "outdoor_temperature_report_max_age_minutes",
+                default=current_data.get(
+                    "outdoor_temperature_report_max_age_minutes",
+                    DEFAULT_OUTDOOR_REPORT_MAX_AGE_MINUTES,
                 ),
             ): selector(
                 {

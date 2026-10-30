@@ -18,7 +18,10 @@ from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers.typing import StateType
 
 from .thermal_model import VALIDATION_BASIS, ThermalModel
-from .const import DEFAULT_TEMPERATURE_REPORT_MAX_AGE_MINUTES
+from .const import (
+    DEFAULT_OUTDOOR_REPORT_MAX_AGE_MINUTES,
+    DEFAULT_TEMPERATURE_REPORT_MAX_AGE_MINUTES,
+)
 
 from .control import PIController
 from .control_ramps import (
@@ -1180,7 +1183,7 @@ class PumpSteerSensor(RestoreEntity):
             except Exception:
                 _LOGGER.exception("Passive plan audit cleanup failed in safe mode")
 
-    def _temperature_cutoff(self, cfg):
+    def _temperature_cutoff(self, cfg, *, outdoor=False):
         """Use a configured HA-report age, without claiming physical freshness.
 
         The lifecycle startup gate remains in force. The age limit is a bound
@@ -1188,16 +1191,24 @@ class PumpSteerSensor(RestoreEntity):
         """
         # Before HA lifecycle setup, offline callers can lack report timestamps.
         # A running integration always establishes a startup cutoff.
-        default = (
-            DEFAULT_TEMPERATURE_REPORT_MAX_AGE_MINUTES
-            if self._temperature_reported_after is not None
-            else 0
+        configured_default = (
+            DEFAULT_OUTDOOR_REPORT_MAX_AGE_MINUTES
+            if outdoor
+            else DEFAULT_TEMPERATURE_REPORT_MAX_AGE_MINUTES
         )
-        minutes = safe_float(cfg.get("temperature_report_max_age_minutes", default))
+        key = (
+            "outdoor_temperature_report_max_age_minutes"
+            if outdoor
+            else "temperature_report_max_age_minutes"
+        )
+        default = (
+            configured_default if self._temperature_reported_after is not None else 0
+        )
+        minutes = safe_float(cfg.get(key, default))
         if minutes is None or minutes <= 0:
             if self._temperature_reported_after is None:
                 return None
-            minutes = DEFAULT_TEMPERATURE_REPORT_MAX_AGE_MINUTES
+            minutes = configured_default
         cutoff = dt_util.now() - timedelta(minutes=minutes)
         if self._temperature_reported_after is not None:
             cutoff = max(cutoff, self._temperature_reported_after)
@@ -1207,7 +1218,7 @@ class PumpSteerSensor(RestoreEntity):
         """Read the selected control temperatures and their actual HA reports."""
         from types import SimpleNamespace
 
-        cutoff = self._temperature_cutoff(cfg)
+        cutoff = self._temperature_cutoff(cfg, outdoor=key == "real_outdoor_entity")
         if key == "real_outdoor_entity":
             primary, backup = (
                 cfg.get("real_outdoor_entity"),
@@ -1300,7 +1311,7 @@ class PumpSteerSensor(RestoreEntity):
         """Switch immediately on failure; require two good cycles to fail back."""
         primary = cfg.get("real_outdoor_entity")
         backup = cfg.get("outdoor_temp_entity_2")
-        cutoff = self._temperature_cutoff(cfg)
+        cutoff = self._temperature_cutoff(cfg, outdoor=True)
         good_primary = get_temperature(self.hass, primary, cutoff) is not None
         backup_state = self.hass.states.get(backup) if backup else None
         backup_unit = (getattr(backup_state, "attributes", {}) or {}).get(

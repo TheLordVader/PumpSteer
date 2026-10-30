@@ -17,3 +17,6 @@ NOTIFICATION_COOLDOWN_CHOICES = (0, 30, 60, 120)
 # Six hours exceeds the observed 333-minute temperature report gap in the
 # reference Recorder sample. Installations with slower sources must adjust it.
 DEFAULT_TEMPERATURE_REPORT_MAX_AGE_MINUTES = 360
+
+# Reference outdoor reports had a maximum observed gap of 90 minutes.
+DEFAULT_OUTDOOR_REPORT_MAX_AGE_MINUTES = 120
