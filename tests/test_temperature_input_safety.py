@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 from test_safe_mode_output import setup_sensor  # noqa: F401 -- shared HA boundary
 
-from custom_components.pumpsteer.sensor import MODE_PI
+from custom_components.pumpsteer.sensor import MODE_PI, MODE_SAFE
 
 
 @pytest.fixture
@@ -424,3 +424,195 @@ def test_options_during_calculation_rerun_without_stale_dispatch(control, stage)
         assert sensor._ohmigo_last_push is not None
 
     asyncio.run(scenario())
+
+
+def test_running_report_timeout_enters_safe_and_recovers(control):
+    sensor, states, clock = control
+    sensor._config_entry.options["temperature_report_max_age_minutes"] = 60
+    asyncio.run(sensor._handle_ha_started(None))
+    clock[0] += timedelta(seconds=1)
+    _report(states, clock)
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["mode"] == MODE_PI
+    clock[0] += timedelta(minutes=61)
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["mode"] == MODE_SAFE
+    _report(states, clock)
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["mode"] == MODE_PI
+
+
+def test_changed_update_time_does_not_freshen_old_report(control):
+    sensor, states, clock = control
+    sensor._config_entry.options["temperature_report_max_age_minutes"] = 60
+    asyncio.run(sensor._handle_ha_started(None))
+    clock[0] += timedelta(seconds=1)
+    _report(states, clock)
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["mode"] == MODE_PI
+    clock[0] += timedelta(minutes=61)
+    for key in ("sensor.indoor", "sensor.outdoor"):
+        states[key].last_updated = clock[0]
+        states[key].last_changed = clock[0]
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["mode"] == MODE_SAFE
+
+
+def test_new_unchanged_report_after_start_allows_recovery(control):
+    sensor, states, clock = control
+    sensor._config_entry.options["temperature_report_max_age_minutes"] = 60
+    _report(states, clock)
+    unchanged_at = clock[0]
+    asyncio.run(sensor._handle_ha_started(None))
+    assert sensor.extra_state_attributes["mode"] == MODE_SAFE
+    clock[0] += timedelta(minutes=10)
+    for key in ("sensor.indoor", "sensor.outdoor"):
+        states[key].last_reported = clock[0]
+        states[key].last_changed = unchanged_at
+        states[key].last_updated = unchanged_at
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["mode"] == MODE_PI
+
+
+def test_weighted_indoor_sensors_reweight_on_loss_and_return(control):
+    sensor, states, clock = control
+    options = sensor._config_entry.options
+    options.update(
+        indoor_temp_entity_2="sensor.room2",
+        indoor_temp_entity_3="sensor.room3",
+        indoor_temp_weight_1=5,
+        indoor_temp_weight_2=3,
+        indoor_temp_weight_3=2,
+    )
+    states["sensor.indoor"].state = "20"
+    states["sensor.room2"] = SimpleNamespace(state="22", attributes={})
+    states["sensor.room3"] = SimpleNamespace(state="24", attributes={})
+    _report(states, clock)
+    for name in ("sensor.room2", "sensor.room3"):
+        states[name].last_reported = clock[0]
+        states[name].last_changed = clock[0]
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["indoor_temperature"] == pytest.approx(21.4)
+    clock[0] += timedelta(minutes=1)
+    states["sensor.room2"].state = "unavailable"
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["indoor_temperature"] == pytest.approx(148 / 7)
+    assert len(sensor._thermal_model._temp_history) == 1
+    clock[0] += timedelta(minutes=1)
+    states["sensor.room2"].state = "22"
+    states["sensor.room2"].last_reported = clock[0]
+    states["sensor.room2"].last_changed = clock[0]
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["indoor_temperature"] == pytest.approx(21.4)
+    assert len(sensor._thermal_model._temp_history) == 1
+
+
+def test_outdoor_backup_failure_and_delayed_primary_return(control):
+    sensor, states, clock = control
+    sensor._config_entry.options["outdoor_temp_entity_2"] = "sensor.backup"
+    states["sensor.backup"] = SimpleNamespace(
+        state="-4", attributes={}, last_reported=clock[0], last_changed=clock[0]
+    )
+    _report(states, clock)
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["outdoor_temperature"] == -3.3
+    clock[0] += timedelta(minutes=1)
+    states["sensor.outdoor"].state = "unavailable"
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["outdoor_temperature"] == -4
+    clock[0] += timedelta(minutes=1)
+    states["sensor.outdoor"].state = "-3.3"
+    states["sensor.outdoor"].last_reported = clock[0]
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["outdoor_temperature"] == -4
+    clock[0] += timedelta(minutes=1)
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["outdoor_temperature"] == -3.3
+
+
+def test_indoor_loss_all_enters_safe_even_with_configured_backups(control):
+    sensor, states, clock = control
+    sensor._config_entry.options["indoor_temp_entity_2"] = "sensor.room2"
+    states["sensor.room2"] = SimpleNamespace(state="unavailable", attributes={})
+    states["sensor.indoor"].state = "unavailable"
+    _report(states, clock)
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["mode"] == MODE_SAFE
+
+
+def test_expired_indoor_sensor_is_excluded_and_recovers(control):
+    sensor, states, clock = control
+    sensor._config_entry.options.update(
+        indoor_temp_entity_2="sensor.room2",
+        temperature_report_max_age_minutes=60,
+    )
+    states["sensor.room2"] = SimpleNamespace(state="23", attributes={})
+    asyncio.run(sensor._handle_ha_started(None))
+    clock[0] += timedelta(seconds=1)
+    _report(states, clock)
+    states["sensor.room2"].last_reported = clock[0]
+    states["sensor.room2"].last_changed = clock[0]
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["indoor_temperature"] == 22
+    clock[0] += timedelta(minutes=61)
+    _report(states, clock)
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["indoor_temperature"] == 21
+    assert (
+        sensor.extra_state_attributes["temperature_sources"]["indoor_coverage"]
+        == "reduced"
+    )
+    clock[0] += timedelta(seconds=1)
+    _report(states, clock)
+    states["sensor.room2"].last_reported = clock[0]
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["indoor_temperature"] == 22
+    assert (
+        sensor.extra_state_attributes["temperature_sources"]["indoor_coverage"]
+        == "complete"
+    )
+
+
+def test_default_report_age_expires_after_start(control):
+    sensor, states, clock = control
+    asyncio.run(sensor._handle_ha_started(None))
+    clock[0] += timedelta(seconds=1)
+    _report(states, clock)
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["mode"] == MODE_PI
+    clock[0] += timedelta(minutes=361)
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["mode"] == MODE_SAFE
+
+
+def test_changed_weights_invalidate_temperature_rate_history(control):
+    sensor, states, clock = control
+    sensor._config_entry.options.update(indoor_temp_entity_2="sensor.room2")
+    states["sensor.room2"] = SimpleNamespace(state="23", attributes={})
+    _report(states, clock)
+    states["sensor.room2"].last_reported = clock[0]
+    states["sensor.room2"].last_changed = clock[0]
+    asyncio.run(sensor.async_update())
+    clock[0] += timedelta(minutes=1)
+    asyncio.run(sensor.async_update())
+    assert len(sensor._thermal_model._temp_history) == 2
+    sensor._config_entry.options["indoor_temp_weight_2"] = 3
+    clock[0] += timedelta(minutes=1)
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["indoor_temperature"] == 22.5
+    assert len(sensor._thermal_model._temp_history) == 1
+
+
+def test_incompatible_additional_temperature_unit_is_excluded(control):
+    sensor, states, clock = control
+    sensor._config_entry.options.update(indoor_temp_entity_2="sensor.room2")
+    states["sensor.room2"] = SimpleNamespace(
+        state="70", attributes={"unit_of_measurement": "°F"}, last_reported=clock[0]
+    )
+    _report(states, clock)
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["indoor_temperature"] == 21
+    assert (
+        sensor.extra_state_attributes["temperature_sources"]["indoor_coverage"]
+        == "reduced"
+    )

@@ -32,6 +32,13 @@
       "basic": {
         "title": "Grundinställningar",
         "data": {
+          "indoor_temp_entity_2": "Innegivare 2 (valfri)",
+          "indoor_temp_entity_3": "Innegivare 3 (valfri)",
+          "outdoor_temp_entity_2": "Reservutegivare (valfri)",
+          "indoor_temp_weight_1": "Vikt för innegivare 1",
+          "indoor_temp_weight_2": "Vikt för innegivare 2",
+          "indoor_temp_weight_3": "Vikt för innegivare 3",
+          "temperature_report_max_age_minutes": "Högsta rapportålder för temperatur (minuter)",
           "indoor_temp_entity": "Inomhustemperatursensor",
           "real_outdoor_entity": "Utomhustemperatursensor",
           "electricity_price_entity": "Elprisensor (idag)",
@@ -44,6 +51,7 @@
           "preheat_boost_enabled": "Aktivera förvärmning"
         },
         "data_description": {
+          "temperature_report_max_age_minutes": "Standardvärdet är 360 minuter, baserat på observerade rapportintervall. Anpassa gränsen till dina givares observerade intervall. HA-rapporttid visar inte säkert när en fysisk mätning gjordes.",
           "pid_kp": "Hur kraftigt PumpSteer reagerar på aktuell temperaturdifferens. Typiskt intervall: 2,0 till 5,0.",
           "pid_ki": "Hur mycket PumpSteer korrigerar långsiktig drift. Typiskt intervall: 0,01 till 0,05.",
           "pid_kd": "Hur mycket PumpSteer reagerar på snabba temperaturförändringar. Håll på 0,0 om du inte trimmar det medvetet.",
@@ -127,6 +135,7 @@
       }
     },
     "error": {
+      "duplicate_temperature_sensor": "Välj olika temperaturgivare.",
       "required": "Det här fältet är obligatoriskt",
       "entity_not_found": "Entiteten hittades inte",
       "entity_unavailable": "Entiteten är otillgänglig",

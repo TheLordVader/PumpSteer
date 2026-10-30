@@ -13,3 +13,7 @@ NOTIFICATION_LEVELS = frozenset(
     {NOTIFICATION_LEVEL_ALL, NOTIFICATION_LEVEL_BRAKING_ONLY, NOTIFICATION_LEVEL_OFF}
 )
 NOTIFICATION_COOLDOWN_CHOICES = (0, 30, 60, 120)
+
+# Six hours exceeds the observed 333-minute temperature report gap in the
+# reference Recorder sample. Installations with slower sources must adjust it.
+DEFAULT_TEMPERATURE_REPORT_MAX_AGE_MINUTES = 360

@@ -6,6 +6,7 @@ from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN
 from homeassistant.helpers.selector import selector
 
 from .const import (
+    DEFAULT_TEMPERATURE_REPORT_MAX_AGE_MINUTES,
     NOTIFICATION_COOLDOWN_CHOICES,
     NOTIFICATION_COOLDOWN_OPTION,
     NOTIFICATION_LEVEL_OPTION,
@@ -38,7 +39,14 @@ _GROUPS = {
     },
     "basic": {
         "indoor_temp_entity",
+        "indoor_temp_entity_2",
+        "indoor_temp_entity_3",
+        "indoor_temp_weight_1",
+        "indoor_temp_weight_2",
+        "indoor_temp_weight_3",
         "real_outdoor_entity",
+        "outdoor_temp_entity_2",
+        "temperature_report_max_age_minutes",
         "weather_entity",
         "electricity_price_entity",
         "price_tomorrow_entity",
@@ -53,6 +61,9 @@ _GROUPS = {
     },
 }
 _CLEARABLE = {
+    "indoor_temp_entity_2",
+    "indoor_temp_entity_3",
+    "outdoor_temp_entity_2",
     "weather_entity",
     "ohmigo_entity",
     OHMIGO_RELAY_ENTITY,
@@ -135,6 +146,45 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
                 default=current_data.get("real_outdoor_entity"),
             ): selector(
                 {"entity": {"domain": "sensor", "device_class": "temperature"}}
+            ),
+            **{
+                vol.Optional(
+                    key, description={"suggested_value": current_data.get(key)}
+                ): selector(
+                    {"entity": {"domain": "sensor", "device_class": "temperature"}}
+                )
+                for key in (
+                    "indoor_temp_entity_2",
+                    "indoor_temp_entity_3",
+                    "outdoor_temp_entity_2",
+                )
+            },
+            **{
+                vol.Optional(key, default=current_data.get(key, 1)): selector(
+                    {"number": {"min": 0.01, "max": 1000, "step": 0.01, "mode": "box"}}
+                )
+                for key in (
+                    "indoor_temp_weight_1",
+                    "indoor_temp_weight_2",
+                    "indoor_temp_weight_3",
+                )
+            },
+            vol.Optional(
+                "temperature_report_max_age_minutes",
+                default=current_data.get(
+                    "temperature_report_max_age_minutes",
+                    DEFAULT_TEMPERATURE_REPORT_MAX_AGE_MINUTES,
+                ),
+            ): selector(
+                {
+                    "number": {
+                        "min": 1,
+                        "max": 10080,
+                        "step": 1,
+                        "unit_of_measurement": "min",
+                        "mode": "box",
+                    }
+                }
             ),
             vol.Optional(
                 "weather_entity",
@@ -387,6 +437,25 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
             if not self._entity_available(entity_id):
                 _LOGGER.warning("%s unavailable: %s", description, entity_id)
                 errors[field] = "entity_unavailable"
+
+        for keys in (
+            ("indoor_temp_entity", "indoor_temp_entity_2", "indoor_temp_entity_3"),
+            ("real_outdoor_entity", "outdoor_temp_entity_2"),
+        ):
+            seen = set()
+            for key in keys:
+                entity = user_input.get(key)
+                if not entity:
+                    continue
+                if entity in seen:
+                    errors[key] = "duplicate_temperature_sensor"
+                seen.add(entity)
+                if key in {
+                    "indoor_temp_entity_2",
+                    "indoor_temp_entity_3",
+                    "outdoor_temp_entity_2",
+                } and not self._entity_exists(entity):
+                    errors[key] = "entity_not_found"
 
         # Restrict notification preferences to recognized selection values.
         level = user_input.get(NOTIFICATION_LEVEL_OPTION, "all")

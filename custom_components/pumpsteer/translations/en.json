@@ -31,6 +31,13 @@
       "basic": {
         "title": "Basic settings",
         "data": {
+          "indoor_temp_entity_2": "Indoor sensor 2 (optional)",
+          "indoor_temp_entity_3": "Indoor sensor 3 (optional)",
+          "outdoor_temp_entity_2": "Backup outdoor sensor (optional)",
+          "indoor_temp_weight_1": "Indoor sensor 1 weight",
+          "indoor_temp_weight_2": "Indoor sensor 2 weight",
+          "indoor_temp_weight_3": "Indoor sensor 3 weight",
+          "temperature_report_max_age_minutes": "Maximum temperature report age (minutes)",
           "indoor_temp_entity": "Indoor temperature sensor",
           "real_outdoor_entity": "Outdoor temperature sensor",
           "electricity_price_entity": "Electricity price sensor",
@@ -43,6 +50,7 @@
           "preheat_boost_enabled": "Enable preheat boost"
         },
         "data_description": {
+          "temperature_report_max_age_minutes": "The default is 360 minutes, based on observed reporting intervals. Adjust it to your sensors’ observed intervals. HA report time does not establish physical measurement time.",
           "pid_kp": "How strongly PumpSteer reacts to current temperature error. Typical range: 2.0 to 5.0.",
           "pid_ki": "How much PumpSteer corrects long-term drift. Typical range: 0.01 to 0.05.",
           "pid_kd": "How much PumpSteer reacts to fast temperature changes. Keep at 0.0 unless you tune it intentionally.",
@@ -126,6 +134,7 @@
       }
     },
     "error": {
+      "duplicate_temperature_sensor": "Choose distinct temperature sensors.",
       "required": "This field is required",
       "entity_not_found": "Entity not found",
       "entity_unavailable": "Entity unavailable",

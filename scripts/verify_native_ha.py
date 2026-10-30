@@ -1307,3 +1307,61 @@ async def test_native_counter_reports_keep_async_deltas_until_shared_window(
         assert result["cost_estimate"] is None
     finally:
         controller._stop_power_telemetry()
+
+
+async def test_native_basic_temperature_redundancy_options(
+    recorder_mock, hass, enable_custom_integrations, monkeypatch, tmp_path
+):
+    """Real HA options selectors accept and retain optional sensors and weights."""
+    from custom_components.pumpsteer import pump_log
+
+    monkeypatch.setattr(pump_log, "_PUMP_LOG_PATH", str(tmp_path / "pump.log"))
+    await hass.async_start()
+    for entity, value in (
+        ("sensor.room", "20"),
+        ("sensor.room2", "21"),
+        ("sensor.outside", "5"),
+        ("sensor.backup", "4"),
+    ):
+        hass.states.async_set(
+            entity, value, {"unit_of_measurement": "°C", "device_class": "temperature"}
+        )
+    hass.states.async_set("sensor.price", "1", {"unit_of_measurement": "SEK/kWh"})
+    entry = MockConfigEntry(
+        domain="pumpsteer",
+        title="test",
+        data={},
+        options={
+            "indoor_temp_entity": "sensor.room",
+            "real_outdoor_entity": "sensor.outside",
+            "electricity_price_entity": "sensor.price",
+            "price_tomorrow_entity": "sensor.price",
+        },
+    )
+    entry.add_to_hass(hass)
+    assert await async_setup_component(hass, "pumpsteer", {})
+    await hass.async_block_till_done()
+    menu = await hass.config_entries.options.async_init(entry.entry_id)
+    form = await hass.config_entries.options.async_configure(
+        menu["flow_id"], {"next_step_id": "basic"}
+    )
+    assert form["type"] == "form"
+    saved = await hass.config_entries.options.async_configure(
+        form["flow_id"],
+        {
+            "indoor_temp_entity": "sensor.room",
+            "indoor_temp_entity_2": "sensor.room2",
+            "indoor_temp_weight_1": 5,
+            "indoor_temp_weight_2": 3,
+            "indoor_temp_weight_3": 1,
+            "real_outdoor_entity": "sensor.outside",
+            "outdoor_temp_entity_2": "sensor.backup",
+            "electricity_price_entity": "sensor.price",
+            "price_tomorrow_entity": "sensor.price",
+            "temperature_report_max_age_minutes": 360,
+        },
+    )
+    assert saved["type"] == "create_entry", saved
+    assert entry.options["indoor_temp_entity_2"] == "sensor.room2"
+    assert entry.options["indoor_temp_weight_2"] == 3
+    assert entry.options["outdoor_temp_entity_2"] == "sensor.backup"

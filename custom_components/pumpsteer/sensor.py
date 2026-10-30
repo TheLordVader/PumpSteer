@@ -18,6 +18,7 @@ from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers.typing import StateType
 
 from .thermal_model import VALIDATION_BASIS, ThermalModel
+from .const import DEFAULT_TEMPERATURE_REPORT_MAX_AGE_MINUTES
 
 from .control import PIController
 from .control_ramps import (
@@ -270,6 +271,8 @@ class PumpSteerSensor(RestoreEntity):
     @property
     def extra_state_attributes(self) -> dict:
         attrs = {**self._attributes}
+        if hasattr(self, "_temperature_coverage"):
+            attrs["temperature_sources"] = self._temperature_coverage
         for key in (
             "thermal_intelligence_status",
             "thermal_intelligence_reason",
@@ -1177,18 +1180,193 @@ class PumpSteerSensor(RestoreEntity):
             except Exception:
                 _LOGGER.exception("Passive plan audit cleanup failed in safe mode")
 
+    def _temperature_cutoff(self, cfg):
+        """Use a configured HA-report age, without claiming physical freshness.
+
+        The lifecycle startup gate remains in force. The age limit is a bound
+        on HA reports, not a claim about physical sampling.
+        """
+        # Before HA lifecycle setup, offline callers can lack report timestamps.
+        # A running integration always establishes a startup cutoff.
+        default = (
+            DEFAULT_TEMPERATURE_REPORT_MAX_AGE_MINUTES
+            if self._temperature_reported_after is not None
+            else 0
+        )
+        minutes = safe_float(cfg.get("temperature_report_max_age_minutes", default))
+        if minutes is None or minutes <= 0:
+            if self._temperature_reported_after is None:
+                return None
+            minutes = DEFAULT_TEMPERATURE_REPORT_MAX_AGE_MINUTES
+        cutoff = dt_util.now() - timedelta(minutes=minutes)
+        if self._temperature_reported_after is not None:
+            cutoff = max(cutoff, self._temperature_reported_after)
+        return cutoff
+
+    def _temperature_state(self, cfg, key):
+        """Read the selected control temperatures and their actual HA reports."""
+        from types import SimpleNamespace
+
+        cutoff = self._temperature_cutoff(cfg)
+        if key == "real_outdoor_entity":
+            primary, backup = (
+                cfg.get("real_outdoor_entity"),
+                cfg.get("outdoor_temp_entity_2"),
+            )
+            active = getattr(self, "_outdoor_active_entity", None)
+            if (
+                active == backup
+                and backup
+                and get_temperature(self.hass, backup, cutoff) is not None
+                and (getattr(self.hass.states.get(backup), "attributes", {}) or {}).get(
+                    "unit_of_measurement"
+                )
+                in (None, "°C")
+            ):
+                return self.hass.states.get(backup)
+            for entity_id in (primary, backup):
+                state = self.hass.states.get(entity_id) if entity_id else None
+                unit = (getattr(state, "attributes", {}) or {}).get(
+                    "unit_of_measurement"
+                )
+                if get_temperature(self.hass, entity_id, cutoff) is not None and (
+                    entity_id != backup or unit in (None, "°C")
+                ):
+                    return state
+            return None
+        ids = [
+            cfg.get("indoor_temp_entity"),
+            cfg.get("indoor_temp_entity_2"),
+            cfg.get("indoor_temp_entity_3"),
+        ]
+        if not any(ids[1:]):
+            return (
+                self.hass.states.get(ids[0])
+                if get_temperature(self.hass, ids[0], cutoff) is not None
+                else None
+            )
+        rows = []
+        seen = set()
+        for index, entity_id in enumerate(ids, 1):
+            if not entity_id or entity_id in seen:
+                continue
+            seen.add(entity_id)
+            weight = safe_float(cfg.get(f"indoor_temp_weight_{index}", 1))
+            value = get_temperature(self.hass, entity_id, cutoff)
+            state = self.hass.states.get(entity_id)
+            unit = (getattr(state, "attributes", {}) or {}).get("unit_of_measurement")
+            if (
+                value is None
+                or weight is None
+                or weight <= 0
+                or unit not in (None, "°C")
+            ):
+                continue
+            rows.append((entity_id, weight, value, state))
+        if not rows:
+            return None
+        total = sum(row[1] for row in rows)
+        value = sum(row[1] * row[2] for row in rows) / total
+        timestamps = [getattr(row[3], "last_reported", None) for row in rows]
+        changes = [getattr(row[3], "last_changed", None) for row in rows]
+
+        def timestamp(values, operation):
+            try:
+                return (
+                    operation(values)
+                    if all(
+                        isinstance(v, datetime) and v.utcoffset() is not None
+                        for v in values
+                    )
+                    else None
+                )
+            except (TypeError, ValueError):
+                return None
+
+        return SimpleNamespace(
+            state=str(value),
+            attributes={
+                "unit_of_measurement": "°C",
+                "source_temperatures_used": {r[0]: r[2] for r in rows},
+                "source_weights": {r[0]: r[1] for r in rows},
+                "physical_measurement_time": "unknown",
+            },
+            last_reported=timestamp(timestamps, min),
+            last_changed=timestamp(changes, max),
+            last_updated=timestamp(changes, max),
+        )
+
+    def _update_outdoor_selection(self, cfg):
+        """Switch immediately on failure; require two good cycles to fail back."""
+        primary = cfg.get("real_outdoor_entity")
+        backup = cfg.get("outdoor_temp_entity_2")
+        cutoff = self._temperature_cutoff(cfg)
+        good_primary = get_temperature(self.hass, primary, cutoff) is not None
+        backup_state = self.hass.states.get(backup) if backup else None
+        backup_unit = (getattr(backup_state, "attributes", {}) or {}).get(
+            "unit_of_measurement"
+        )
+        good_backup = get_temperature(
+            self.hass, backup, cutoff
+        ) is not None and backup_unit in (None, "°C")
+        active = getattr(self, "_outdoor_active_entity", None)
+        recovery = getattr(self, "_outdoor_primary_recovery", 0)
+        if active == backup and backup and good_backup:
+            recovery = recovery + 1 if good_primary else 0
+            active = primary if recovery >= 2 else backup
+        else:
+            active = primary if good_primary else backup if good_backup else None
+            recovery = 0
+        self._outdoor_active_entity = active
+        self._outdoor_primary_recovery = recovery
+
+    def _temperature_value(self, cfg, key):
+        state = self._temperature_state(cfg, key)
+        return safe_float(getattr(state, "state", None))
+
+    def _temperature_identity(self, cfg):
+        inside = self._temperature_state(cfg, "indoor_temp_entity")
+        outside = self._temperature_state(cfg, "real_outdoor_entity")
+        attrs = getattr(inside, "attributes", {}) or {}
+        weights = attrs.get("source_weights")
+        components = attrs.get("source_temperatures_used")
+        inside_identity = (
+            tuple(sorted(weights.items()))
+            if isinstance(weights, dict)
+            else (cfg.get("indoor_temp_entity"), tuple(sorted(components)))
+            if isinstance(components, dict)
+            and all(isinstance(k, str) for k in components)
+            else cfg.get("indoor_temp_entity")
+        )
+        outside_id = None
+        for key in ("real_outdoor_entity", "outdoor_temp_entity_2"):
+            if outside is not None and self.hass.states.get(cfg.get(key)) is outside:
+                outside_id = cfg.get(key)
+                break
+        outside_attrs = getattr(outside, "attributes", {}) or {}
+        return inside_identity, outside_id, outside_attrs.get("selected_source")
+
     def _temperature_inputs_match(self, cfg, expected) -> bool:
         current_cfg = self._cfg()
         return (
             not self._temperature_unloaded
             and current_cfg == cfg
+            and (
+                not any(
+                    cfg.get(k)
+                    for k in (
+                        "indoor_temp_entity_2",
+                        "indoor_temp_entity_3",
+                        "outdoor_temp_entity_2",
+                    )
+                )
+                or not hasattr(self, "_temperature_cycle_identity")
+                or self._temperature_cycle_identity == self._temperature_identity(cfg)
+            )
             and all(
                 value is not None
                 and current_cfg.get(key) == cfg.get(key)
-                and get_temperature(
-                    self.hass, cfg.get(key), self._temperature_reported_after
-                )
-                == value
+                and self._temperature_value(cfg, key) == value
                 for key, value in expected.items()
             )
         )
@@ -1373,12 +1551,48 @@ class PumpSteerSensor(RestoreEntity):
             self._preheat_last_t = now
         cfg = self._cfg()
 
-        indoor = get_temperature(
-            self.hass, cfg.get("indoor_temp_entity"), self._temperature_reported_after
-        )
-        outdoor = get_temperature(
-            self.hass, cfg.get("real_outdoor_entity"), self._temperature_reported_after
-        )
+        self._update_outdoor_selection(cfg)
+        indoor = self._temperature_value(cfg, "indoor_temp_entity")
+        outdoor = self._temperature_value(cfg, "real_outdoor_entity")
+        identity = self._temperature_identity(cfg)
+        previous = getattr(self, "_temperature_identity_previous", None)
+        if previous is not None and identity != previous:
+            self._thermal_model.cancel_validation_session()
+            if indoor is not None:
+                self._thermal_model.reset_temp_history(now, indoor)
+            self._plan_audit.cancel_plans("temperature_source_changed")
+            self._plan_audit.fixed_pending = None
+            if self._pilot is not None:
+                self._pilot.reset_interval()
+        self._temperature_identity_previous = identity
+        self._temperature_cycle_identity = identity
+        indoor_state = self._temperature_state(cfg, "indoor_temp_entity")
+        indoor_attrs = getattr(indoor_state, "attributes", {}) or {}
+        active = indoor_attrs.get("source_temperatures_used")
+        if not any(
+            cfg.get(key) for key in ("indoor_temp_entity_2", "indoor_temp_entity_3")
+        ) or not isinstance(active, dict):
+            active = (
+                {cfg.get("indoor_temp_entity"): indoor} if indoor is not None else {}
+            )
+        configured = [
+            cfg.get(k)
+            for k in (
+                "indoor_temp_entity",
+                "indoor_temp_entity_2",
+                "indoor_temp_entity_3",
+            )
+            if cfg.get(k)
+        ]
+        self._temperature_coverage = {
+            "indoor_active": list(active),
+            "indoor_configured": len(configured),
+            "indoor_coverage": "complete"
+            if len(active) == len(configured)
+            else "reduced",
+            "outdoor_active": identity[1],
+            "physical_measurement_time": "unknown",
+        }
         if cfg.get("thermal_intelligence_enabled") is True:
             try:
                 if indoor is None or outdoor is None:
@@ -1386,7 +1600,7 @@ class PumpSteerSensor(RestoreEntity):
                 else:
                     self._plan_audit.observe_fixed(
                         now,
-                        self.hass.states.get(cfg.get("indoor_temp_entity")),
+                        self._temperature_state(cfg, "indoor_temp_entity"),
                         self._fixed_audit_identity(cfg),
                     )
                 await self._save_pilot_store()
@@ -2490,9 +2704,7 @@ class PumpSteerSensor(RestoreEntity):
         expected = {
             key: extra.get(
                 attribute,
-                get_temperature(
-                    self.hass, cfg.get(key), self._temperature_reported_after
-                ),
+                self._temperature_value(cfg, key),
             )
             for key, attribute in (
                 ("indoor_temp_entity", "indoor_temperature"),
@@ -2521,7 +2733,10 @@ class PumpSteerSensor(RestoreEntity):
                             cfg.get(key)
                             for key in (
                                 "indoor_temp_entity",
+                                "indoor_temp_entity_2",
+                                "indoor_temp_entity_3",
                                 "real_outdoor_entity",
+                                "outdoor_temp_entity_2",
                                 "electricity_price_entity",
                                 "price_tomorrow_entity",
                                 "thermal_heat_activity_entity",
@@ -3142,8 +3357,8 @@ class PumpSteerSensor(RestoreEntity):
 
     def _plan_source_identity(self, cfg):
         """Identify selected HA sources without asserting physical freshness."""
-        inside = self.hass.states.get(cfg.get("indoor_temp_entity"))
-        outside = self.hass.states.get(cfg.get("real_outdoor_entity"))
+        inside = self._temperature_state(cfg, "indoor_temp_entity")
+        outside = self._temperature_state(cfg, "real_outdoor_entity")
         inside_attrs = getattr(inside, "attributes", {}) or {}
         outside_attrs = getattr(outside, "attributes", {}) or {}
         components = inside_attrs.get("source_temperatures_used")
@@ -3155,14 +3370,22 @@ class PumpSteerSensor(RestoreEntity):
         return (
             components,
             selected if isinstance(selected, str) else None,
-            cfg.get("real_outdoor_entity"),
+            self._temperature_identity(cfg)
+            if any(
+                cfg.get(k)
+                for k in (
+                    "indoor_temp_entity_2",
+                    "indoor_temp_entity_3",
+                    "outdoor_temp_entity_2",
+                )
+            )
+            else cfg.get("real_outdoor_entity"),
         )
 
     def _plan_current_identity(self, cfg):
         """Do not label restored or absent sources as the current identity."""
         if any(
-            get_temperature(self.hass, cfg.get(key), self._temperature_reported_after)
-            is None
+            self._temperature_value(cfg, key) is None
             for key in ("indoor_temp_entity", "real_outdoor_entity")
         ):
             return None
@@ -3178,7 +3401,7 @@ class PumpSteerSensor(RestoreEntity):
         source = cfg.get("indoor_temp_entity")
         self._plan_audit.observe_plan(
             now,
-            self.hass.states.get(source),
+            self._temperature_state(cfg, "indoor_temp_entity"),
             source,
             identity,
             reported_after=self._temperature_reported_after,
@@ -3239,7 +3462,7 @@ class PumpSteerSensor(RestoreEntity):
 
         qualified = True
         for key in ("indoor_temp_entity", "real_outdoor_entity"):
-            source = self.hass.states.get(cfg.get(key))
+            source = self._temperature_state(cfg, key)
             report = PilotPassive._report(
                 source,
                 now,
@@ -3400,8 +3623,8 @@ class PumpSteerSensor(RestoreEntity):
         def replay_signature():
             if replay_context is None:
                 return None
-            inside = self.hass.states.get(cfg.get("indoor_temp_entity"))
-            outside = self.hass.states.get(cfg.get("real_outdoor_entity"))
+            inside = self._temperature_state(cfg, "indoor_temp_entity")
+            outside = self._temperature_state(cfg, "real_outdoor_entity")
             inside_attrs = getattr(inside, "attributes", {}) or {}
             outside_attrs = getattr(outside, "attributes", {}) or {}
             components = inside_attrs.get("source_temperatures_used")
@@ -3593,7 +3816,10 @@ class PumpSteerSensor(RestoreEntity):
             cfg.get(key)
             for key in (
                 "indoor_temp_entity",
+                "indoor_temp_entity_2",
+                "indoor_temp_entity_3",
                 "real_outdoor_entity",
+                "outdoor_temp_entity_2",
                 "electricity_price_entity",
                 "price_tomorrow_entity",
                 "weather_entity",
@@ -3783,7 +4009,7 @@ class PumpSteerSensor(RestoreEntity):
 
             source = cfg.get("indoor_temp_entity")
             report = PilotPassive._report(
-                self.hass.states.get(source),
+                self._temperature_state(cfg, "indoor_temp_entity"),
                 issued_at,
                 temperature=True,
                 reported_after=self._temperature_reported_after,
@@ -3939,6 +4165,15 @@ class PumpSteerSensor(RestoreEntity):
             cfg.get("ohmigo_relay_entity"),
             safe_float(cfg.get("pid_output_clamp", PID_OUTPUT_CLAMP)),
         )
+        if any(
+            cfg.get(k)
+            for k in (
+                "indoor_temp_entity_2",
+                "indoor_temp_entity_3",
+                "outdoor_temp_entity_2",
+            )
+        ):
+            signature += (repr(self._temperature_identity(cfg)),)
         if signature != self._pilot_sources:
             self._pilot = None
             self._pilot_detector = None
@@ -4062,8 +4297,8 @@ class PumpSteerSensor(RestoreEntity):
                     self._pilot = PilotPassive()
                 self._pilot.observe_indicated(
                     now,
-                    self.hass.states.get(signature[0]),
-                    self.hass.states.get(signature[1]),
+                    self._temperature_state(cfg, "indoor_temp_entity"),
+                    self._temperature_state(cfg, "real_outdoor_entity"),
                     operation,
                     reported_after=self._temperature_reported_after,
                 )
@@ -4205,8 +4440,8 @@ class PumpSteerSensor(RestoreEntity):
             if operation is not None:
                 self._pilot.observe_indicated(
                     now,
-                    self.hass.states.get(signature[0]),
-                    self.hass.states.get(signature[1]),
+                    self._temperature_state(cfg, "indoor_temp_entity"),
+                    self._temperature_state(cfg, "real_outdoor_entity"),
                     operation,
                     reported_after=self._temperature_reported_after,
                 )
@@ -4224,8 +4459,8 @@ class PumpSteerSensor(RestoreEntity):
             if mode in {"normal", "preheating", "pre_braking", "braking", "brake_hold"}:
                 paired = self._pilot.audit.observe(
                     now,
-                    self.hass.states.get(signature[0]),
-                    self.hass.states.get(signature[1]),
+                    self._temperature_state(cfg, "indoor_temp_entity"),
+                    self._temperature_state(cfg, "real_outdoor_entity"),
                     heat_state,
                 )
                 if paired:
@@ -4242,8 +4477,8 @@ class PumpSteerSensor(RestoreEntity):
                 self._pilot.audit.pending = None
             self._pilot.observe(
                 now,
-                self.hass.states.get(signature[0]),
-                self.hass.states.get(signature[1]),
+                self._temperature_state(cfg, "indoor_temp_entity"),
+                self._temperature_state(cfg, "real_outdoor_entity"),
                 heat_state,
                 mode,
                 reported_after=self._temperature_reported_after,
@@ -4266,7 +4501,7 @@ class PumpSteerSensor(RestoreEntity):
             ) == (getattr(relay_state, "last_reported", None), 1.0)
             sample = self._pilot.observe_response(
                 now,
-                self.hass.states.get(signature[1]),
+                self._temperature_state(cfg, "real_outdoor_entity"),
                 heat_state,
                 self.hass.states.get(command_entity)
                 if command_entity and command_allowed

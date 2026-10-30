@@ -2011,3 +2011,50 @@ def test_status_sensor_translations_survive_upstream_integration():
         assert "thermal_intelligence" in sensor
         assert "indoor_temperature" in sensor
         assert "outdoor_temperature" in sensor
+
+
+def test_weighted_temperature_used_by_pilot_and_source_loss_resets_interval(
+    monkeypatch,
+):
+    from datetime import datetime, timedelta, timezone
+    from custom_components.pumpsteer.pilot_passive import PilotPassive
+
+    captured = []
+    original = PilotPassive.observe_indicated
+
+    def track(self, now, indoor, outdoor, operation, **kwargs):
+        captured.append((float(indoor.state), float(outdoor.state)))
+        return original(self, now, indoor, outdoor, operation, **kwargs)
+
+    monkeypatch.setattr(PilotPassive, "observe_indicated", track)
+    sensor, states = _sensor()
+    sensor._config_entry.options.update(
+        thermal_intelligence_enabled=True,
+        thermal_detection_method="automatic",
+        indoor_temp_entity_2="sensor.room2",
+        indoor_temp_weight_1=1,
+        indoor_temp_weight_2=3,
+    )
+    start = datetime(2026, 10, 11, 8, tzinfo=timezone.utc)
+    for key in ("sensor.indoor", "sensor.outdoor"):
+        states[key].attributes["unit_of_measurement"] = "°C"
+        states[key].last_changed = start - timedelta(minutes=1)
+    states["sensor.room2"] = SimpleNamespace(
+        state="22.5",
+        attributes={"unit_of_measurement": "°C"},
+        last_reported=start,
+        last_changed=start - timedelta(minutes=1),
+    )
+    attrs = _cycle(sensor, monkeypatch, 0)
+    assert attrs["indoor_temperature"] == pytest.approx(22.0)
+    assert captured[-1] == (22.0, 5.0)
+    previous = sensor._pilot
+    assert previous is not None
+    states["sensor.room2"].state = "unavailable"
+    attrs = _cycle(sensor, monkeypatch, 1)
+    assert attrs["indoor_temperature"] == 20.5
+    assert attrs["temperature_sources"]["indoor_coverage"] == "reduced"
+    assert captured[-1] == (20.5, 5.0)
+    assert sensor._pilot is not previous
+    assert previous.indicated_house.last is None
+    assert sensor._pilot.manager.model.history == []

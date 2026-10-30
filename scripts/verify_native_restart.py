@@ -23,6 +23,17 @@ ID = "01H00000000000000000000000"
 OFF_ID = "01H00000000000000000000001"
 
 
+@pytest.fixture(autouse=True)
+def local_component_namespace(monkeypatch):
+    """Point the HA test plugin's component namespace at this checkout."""
+    import custom_components
+
+    source = str(Path(__file__).resolve().parents[1] / "custom_components")
+    monkeypatch.setattr(
+        custom_components, "__path__", [source, *custom_components.__path__]
+    )
+
+
 @pytest.fixture
 def hass_storage():
     # Use actual Store files, not the HA pytest plugin's in-memory replacement.
@@ -44,7 +55,11 @@ def hass_config_dir():
     return str(DIR)
 
 
-async def test_restart(recorder_mock, hass, enable_custom_integrations, monkeypatch):
+async def test_restart(
+    recorder_mock, hass, hass_config_dir, enable_custom_integrations, monkeypatch
+):
+    # The installed HA pytest plugin does not consume hass_config_dir itself.
+    hass.config.config_dir = hass_config_dir
     from custom_components.pumpsteer import pump_log
     from custom_components.pumpsteer.pilot_vendor.learning_interval import (
         LearningInterval,

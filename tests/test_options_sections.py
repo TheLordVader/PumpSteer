@@ -83,3 +83,42 @@ def test_energy_meter_selection_is_saved_and_can_be_cleared():
     flow.config_entry.options = saved["data"]
     cleared = asyncio.run(flow.async_step_telemetry({}))
     assert cleared["data"]["thermal_energy_entities"] == []
+
+
+def test_basic_options_save_report_age_without_changing_other_sections():
+    flow = PumpSteerOptionsFlowHandler()
+    flow.config_entry = SimpleNamespace(
+        data={}, options={"thermal_intelligence_enabled": True}
+    )
+    flow.hass = SimpleNamespace(states=SimpleNamespace(async_all=lambda domain: []))
+    flow._validate_entities = lambda data: {}
+    flow.async_create_entry = lambda **kwargs: kwargs
+    result = asyncio.run(
+        flow.async_step_basic({"temperature_report_max_age_minutes": 90})
+    )
+    assert result["data"]["temperature_report_max_age_minutes"] == 90
+    assert result["data"]["thermal_intelligence_enabled"] is True
+
+
+def test_basic_options_save_and_clear_optional_temperature_sources():
+    flow = PumpSteerOptionsFlowHandler()
+    flow.config_entry = SimpleNamespace(data={}, options={})
+    flow.hass = SimpleNamespace(states=SimpleNamespace(async_all=lambda domain: []))
+    flow._validate_entities = lambda data: {}
+    flow.async_create_entry = lambda **kwargs: kwargs
+    saved = asyncio.run(
+        flow.async_step_basic(
+            {
+                "indoor_temp_entity_2": "sensor.room2",
+                "indoor_temp_weight_1": 5,
+                "indoor_temp_weight_2": 3,
+                "outdoor_temp_entity_2": "sensor.backup",
+            }
+        )
+    )["data"]
+    assert saved["indoor_temp_weight_2"] == 3
+    flow.config_entry.options = saved
+    cleared = asyncio.run(flow.async_step_basic({"indoor_temp_weight_1": 5}))
+    assert cleared["data"]["indoor_temp_entity_2"] == ""
+    assert cleared["data"]["outdoor_temp_entity_2"] == ""
+    assert cleared["data"]["indoor_temp_weight_2"] == 3
