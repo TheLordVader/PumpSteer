@@ -683,7 +683,7 @@ def test_automatic_mode_rejects_heat_signal_aliasing_compressor(monkeypatch):
     attrs = _cycle(sensor, monkeypatch, 0)
     assert attrs["thermal_intelligence_operating_mode"] == "unknown"
     assert not attrs["thermal_intelligence_operation_detail"]["learning_qualified"]
-    assert sensor._pilot is None
+    assert sensor._pilot.manager.model.history == []
 
 
 def test_automatic_mode_requires_a_configured_missing_radiator_sensor(monkeypatch):
@@ -840,7 +840,7 @@ def test_calibrated_multi_signal_indication_does_not_become_pilot_heat(monkeypat
     assert attrs["thermal_intelligence_operating_mode"] == "space_heating"
     assert attrs["thermal_intelligence_operating_quality"] == "probable"
     assert not attrs["thermal_intelligence_operation_detail"]["learning_qualified"]
-    assert sensor._pilot is None
+    assert sensor._pilot.manager.model.history == []
 
 
 def test_automatic_collects_indication_but_never_qualifies_pilot_without_heat_label(
@@ -905,6 +905,7 @@ def test_automatic_collects_indication_but_never_qualifies_pilot_without_heat_la
     assert calls == ["indicated_radiator_heating"]
     assert sensor._pilot is not None
     assert sensor._pilot.manager.model.history == []
+
     assert sensor._pilot.validated_house(start.timestamp()) is None
 
     states["binary_sensor.water"].state = "unavailable"
@@ -916,8 +917,41 @@ def test_automatic_collects_indication_but_never_qualifies_pilot_without_heat_la
     assert "hot_water" not in detail["signals"]
     assert not detail["learning_qualified"]
     assert calls[-1] == "unknown"
-    assert sensor._pilot.indicated_house.start is None
+    assert sensor._pilot._observation_evidence == "unknown_heating_mode"
     assert sensor._pilot.manager.model.history == []
+
+
+def test_automatic_collects_temperature_interval_with_stale_operation(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    sensor, states = _sensor()
+    sensor._config_entry.options.update(
+        thermal_intelligence_enabled=True,
+        thermal_detection_method="automatic",
+        thermal_compressor_entity="binary_sensor.compressor",
+        thermal_hot_water_mode_entity="binary_sensor.water",
+    )
+    start = datetime(2026, 10, 11, 8, tzinfo=timezone.utc)
+    for key in ("sensor.indoor", "sensor.outdoor"):
+        states[key].attributes["unit_of_measurement"] = "°C"
+        states[key].last_changed = start - timedelta(minutes=2)
+    for key in ("binary_sensor.compressor", "binary_sensor.water"):
+        states[key] = SimpleNamespace(
+            state="on",
+            last_reported=start - timedelta(hours=2),
+            last_changed=start - timedelta(hours=2),
+            attributes={},
+        )
+    for minute in range(61):
+        states["sensor.indoor"].state = str(20.5 + minute / 600)
+        attrs = _cycle(sensor, monkeypatch, minute)
+    detail = attrs["thermal_intelligence_operation_detail"]
+    assert detail["indicated_observation_intervals"] >= 1
+    assert (
+        detail["latest_indicated_interval"]["evidence_level"] == "unknown_heating_mode"
+    )
+    assert sensor._pilot.manager.model.history == []
+    assert sensor._pilot.validated_house(start.timestamp() + 3600) is None
 
 
 def test_options_offer_supply_mode_and_threshold(monkeypatch):

@@ -4055,10 +4055,7 @@ class PumpSteerSensor(RestoreEntity):
         if not use_supply and (
             not isinstance(source, str) or not source.startswith("binary_sensor.")
         ):
-            if operation is not None and (
-                self._pilot is not None
-                or operation.get("evidence_level") == "operating_indication"
-            ):
+            if operation is not None:
                 if self._pilot is None:
                     from .pilot_passive import PilotPassive
 
@@ -4069,6 +4066,9 @@ class PumpSteerSensor(RestoreEntity):
                     self.hass.states.get(signature[1]),
                     operation,
                     reported_after=self._temperature_reported_after,
+                )
+                operation["temperature_observation_status"] = (
+                    self._pilot.indicated_house.last_status
                 )
                 operation["indicated_observation_intervals"] = len(
                     self._pilot.indicated_observations
@@ -4209,6 +4209,9 @@ class PumpSteerSensor(RestoreEntity):
                     self.hass.states.get(signature[1]),
                     operation,
                     reported_after=self._temperature_reported_after,
+                )
+                operation["temperature_observation_status"] = (
+                    self._pilot.indicated_house.last_status
                 )
                 operation["indicated_observation_intervals"] = len(
                     self._pilot.indicated_observations

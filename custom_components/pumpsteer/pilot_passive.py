@@ -29,14 +29,21 @@ class PilotPassive:
         # the fitted/validated Pilot model.
         self.indicated_house = IntervalCollector(60)
         self.indicated_observations = deque(maxlen=72)
+        self._observation_evidence = None
+        self._observation_first_indoor_report = None
+        self._observation_reports = None
+        self._observation_report_counts = [0, 0]
+        self._observation_max_age_seconds = [0.0, 0.0]
 
     def observe_indicated(
         self, now, indoor, outdoor, operation, *, reported_after=None
     ):
-        """Collect an apparent indoor response under indicated operation only.
+        """Collect temperature intervals with indicated or unknown operation.
 
         This is not measured heat delivery and is deliberately isolated from
-        ``manager.model`` and all validated predictions.
+        ``manager.model`` and all validated predictions. Temperatures can be
+        held for at most 15 minutes; coverage describes that bounded hold,
+        not independent physical samples.
         """
         required = {"compressor", "radiator", "hot_water", "power", "supply", "return"}
         signals = (
@@ -44,7 +51,13 @@ class PilotPassive:
         )
         states = (indoor, outdoor)
         reports = tuple(
-            self._report(source, now, temperature=True, reported_after=reported_after)
+            self._report(
+                source,
+                now,
+                temperature=True,
+                reported_after=reported_after,
+                max_age=timedelta(minutes=15),
+            )
             for source in states
         )
         stable = bool(
@@ -54,37 +67,105 @@ class PilotPassive:
             and operation.get("evidence_uncertainty") == "heat_delivery_unverified"
             and required <= signals
         )
-        if not stable or any(report is None for report in reports):
+        evidence = "operating_indication" if stable else "unknown_heating_mode"
+        previous_tick = self.indicated_house.last
+        if (
+            previous_tick is not None
+            and not 0 <= now.timestamp() - previous_tick <= 300
+        ):
             self.indicated_house.reset()
-            self.indicated_house.last_status = "indication_unavailable"
+            self._observation_first_indoor_report = None
+            self._observation_reports = None
+            self._observation_report_counts = [0, 0]
+            self._observation_max_age_seconds = [0.0, 0.0]
+        if evidence != self._observation_evidence:
+            self.indicated_house.reset()
+            self._observation_first_indoor_report = None
+            self._observation_reports = None
+            self._observation_report_counts = [0, 0]
+            self._observation_max_age_seconds = [0.0, 0.0]
+            self._observation_evidence = evidence
+        if any(report is None for report in reports):
+            self.indicated_house.reset()
+            self._observation_first_indoor_report = None
+            self._observation_reports = None
+            self._observation_report_counts = [0, 0]
+            self._observation_max_age_seconds = [0.0, 0.0]
+            self.indicated_house.last_status = "temperature_report_unavailable"
             return None
         for source, report in zip(states, reports):
             changed = getattr(source, "last_changed", None)
-            if (
-                changed is None
-                or changed.tzinfo is None
-                or changed > report[0]
-                or now - changed < timedelta(minutes=1)
-            ):
+            if changed is None or changed.tzinfo is None or changed > report[0]:
                 self.indicated_house.reset()
+                self._observation_first_indoor_report = None
+                self._observation_reports = None
+                self._observation_report_counts = [0, 0]
+                self._observation_max_age_seconds = [0.0, 0.0]
                 self.indicated_house.last_status = "temperature_context_transition"
                 return None
+        previous = self._observation_reports
+        if previous is not None and any(
+            current[0] < old[0] or (current[0] == old[0] and current[1] != old[1])
+            for current, old in zip(reports, previous)
+        ):
+            self.indicated_house.reset()
+            self._observation_first_indoor_report = None
+            self._observation_reports = None
+            self._observation_report_counts = [0, 0]
+            self._observation_max_age_seconds = [0.0, 0.0]
+            self.indicated_house.last_status = "temperature_report_inconsistent"
+            return None
+        for index, report in enumerate(reports):
+            if previous is None or report[0] > previous[index][0]:
+                self._observation_report_counts[index] += 1
+            self._observation_max_age_seconds[index] = max(
+                self._observation_max_age_seconds[index],
+                (now - report[0]).total_seconds(),
+            )
+        self._observation_reports = reports
+        if self._observation_first_indoor_report is None:
+            self._observation_first_indoor_report = reports[0][0]
+        self.indicated_house.last_status = "waiting_for_interval"
+        # The collector needs a numeric input for its coverage accounting;
+        # zero here is a placeholder when the mode is unknown, not zero heat.
         sample = self.indicated_house.observe(
-            now.timestamp(), reports[0][1], reports[1][1], 1.0
+            now.timestamp(), reports[0][1], reports[1][1], 1.0 if stable else 0.0
         )
-        if sample is not None:
+        if sample is not None and reports[0][0] > self._observation_first_indoor_report:
             row = {
-                "evidence_level": "operating_indication",
+                "evidence_level": evidence,
                 "interpretation": "apparent_indoor_response_not_heat_delivery",
                 "end": sample.end,
                 "hours": sample.hours,
                 "start_indoor": sample.start_temp,
                 "end_indoor": sample.end_temp,
                 "mean_outdoor": sample.outdoor,
-                "indicated_fraction": sample.heat,
+                "indicated_fraction": sample.heat if stable else None,
                 "coverage": sample.coverage,
+                "coverage_basis": "reported_temperature_held_at_most_15_minutes",
+                "indoor_report_count": self._observation_report_counts[0],
+                "outdoor_report_count": self._observation_report_counts[1],
+                "maximum_indoor_report_age_seconds": self._observation_max_age_seconds[
+                    0
+                ],
+                "maximum_outdoor_report_age_seconds": self._observation_max_age_seconds[
+                    1
+                ],
             }
             self.indicated_observations.append(row)
+            self._observation_first_indoor_report = reports[0][0]
+            self._observation_report_counts = [1, 1]
+            self._observation_max_age_seconds = [
+                (now - r[0]).total_seconds() for r in reports
+            ]
+        elif sample is not None:
+            self._observation_first_indoor_report = reports[0][0]
+            self._observation_report_counts = [1, 1]
+            self._observation_max_age_seconds = [
+                (now - r[0]).total_seconds() for r in reports
+            ]
+            self.indicated_house.last_status = "insufficient_indoor_reports"
+            return None
         return sample
 
     def reset_interval(self, *, invalidate_validation=True, reset_pump=True):

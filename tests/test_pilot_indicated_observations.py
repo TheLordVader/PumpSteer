@@ -78,7 +78,8 @@ def test_indicated_observation_resets_on_missing_or_transitioning_context():
         )
         is None
     )
-    assert pilot.indicated_house.start is None
+    assert pilot.indicated_house.start == now.timestamp()
+    assert pilot._observation_evidence == "unknown_heating_mode"
     stale = START
     assert (
         pilot.observe_indicated(
@@ -90,7 +91,7 @@ def test_indicated_observation_resets_on_missing_or_transitioning_context():
         is None
     )
     assert pilot.indicated_house.start is None
-    transitioning = state(20, now, unit="°C", changed=now)
+    transitioning = state(20, now, unit="°C", changed=now + timedelta(seconds=1))
     assert (
         pilot.observe_indicated(
             now, transitioning, state(5, now, unit="°C"), indicated()
@@ -98,3 +99,24 @@ def test_indicated_observation_resets_on_missing_or_transitioning_context():
         is None
     )
     assert pilot.indicated_house.start is None
+
+
+def test_unknown_mode_collects_temperature_only_without_validating_model():
+    pilot = PilotPassive()
+    for minute in range(0, 61, 5):
+        now = START + timedelta(minutes=minute)
+        pilot.observe_indicated(
+            now,
+            state(20 + minute / 600, now, unit="°C"),
+            state(5, now, unit="°C"),
+            {"mode": "unknown"},
+        )
+        if minute == 5:
+            assert pilot.indicated_house.last_status == "waiting_for_interval"
+    row = pilot.indicated_observations[-1]
+    assert row["evidence_level"] == "unknown_heating_mode"
+    assert row["indicated_fraction"] is None
+    assert row["coverage_basis"] == "reported_temperature_held_at_most_15_minutes"
+    assert row["coverage"] == 1.0
+    assert pilot.manager.model.history == []
+    assert pilot.validated_house(START.timestamp() + 3600) is None
