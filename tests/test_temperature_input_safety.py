@@ -158,6 +158,27 @@ def test_reload_waits_for_new_reports(control, monkeypatch):
     assert len(sensor.hass.services.calls) == 2
 
 
+def test_start_with_recent_preexisting_reports_waits_for_each_new_source(control):
+    sensor, states, clock = control
+    for key in ("sensor.indoor", "sensor.outdoor"):
+        states[key].last_reported = clock[0] - timedelta(seconds=30)
+    event = SimpleNamespace(time_fired=clock[0])
+    asyncio.run(sensor._handle_ha_started(event))
+    assert sensor.hass.services.calls == []
+
+    clock[0] += timedelta(minutes=1)
+    states["sensor.outdoor"].last_reported = clock[0]
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["mode"] == "safe_mode"
+    assert "indoor" in sensor.extra_state_attributes["status"]
+
+    clock[0] += timedelta(seconds=1)
+    states["sensor.indoor"].last_reported = clock[0]
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["mode"] == MODE_PI
+    assert sensor.extra_state_attributes["status"] == "ok"
+
+
 def test_before_ha_start_sends_nothing(control):
     sensor, _, _ = control
     sensor.hass.is_running = False
