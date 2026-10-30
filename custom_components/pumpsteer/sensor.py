@@ -4179,6 +4179,22 @@ class PumpSteerSensor(RestoreEntity):
 
                 self._pilot = PilotPassive()
                 self._restore_pilot_history(self._pilot, signature, now)
+            if operation is not None:
+                self._pilot.observe_indicated(
+                    now,
+                    self.hass.states.get(signature[0]),
+                    self.hass.states.get(signature[1]),
+                    operation,
+                    reported_after=self._temperature_reported_after,
+                )
+                operation["indicated_observation_intervals"] = len(
+                    self._pilot.indicated_observations
+                )
+                operation["latest_indicated_interval"] = (
+                    self._pilot.indicated_observations[-1]
+                    if self._pilot.indicated_observations
+                    else None
+                )
             if mode in {"normal", "preheating", "pre_braking", "braking", "brake_hold"}:
                 paired = self._pilot.audit.observe(
                     now,

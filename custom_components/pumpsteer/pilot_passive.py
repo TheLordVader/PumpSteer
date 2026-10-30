@@ -4,9 +4,11 @@ HA report time is not evidence of physical measurement time. Never writes a
 command and never turns inferred electrical power or compressor status into heat.
 """
 
+from collections import deque
 from datetime import timedelta
 import math
 from .pilot_vendor.adaptive_model import AdaptiveThermalModel
+from .pilot_vendor.learning_interval import IntervalCollector
 from .pilot_vendor.learning_manager import LearningManager
 
 
@@ -23,6 +25,67 @@ class PilotPassive:
         self._context_reports = None
         self.status = "waiting_for_heat_signal"
         self.validation_after = None
+        # Lower-evidence, diagnostic-only intervals. Never feed these rows to
+        # the fitted/validated Pilot model.
+        self.indicated_house = IntervalCollector(60)
+        self.indicated_observations = deque(maxlen=72)
+
+    def observe_indicated(
+        self, now, indoor, outdoor, operation, *, reported_after=None
+    ):
+        """Collect an apparent indoor response under indicated operation only.
+
+        This is not measured heat delivery and is deliberately isolated from
+        ``manager.model`` and all validated predictions.
+        """
+        required = {"compressor", "radiator", "hot_water", "power", "supply", "return"}
+        signals = (
+            set(operation.get("signals", ())) if isinstance(operation, dict) else set()
+        )
+        states = (indoor, outdoor)
+        reports = tuple(
+            self._report(source, now, temperature=True, reported_after=reported_after)
+            for source in states
+        )
+        stable = bool(
+            isinstance(operation, dict)
+            and operation.get("mode") == "indicated_radiator_heating"
+            and operation.get("evidence_level") == "operating_indication"
+            and operation.get("evidence_uncertainty") == "heat_delivery_unverified"
+            and required <= signals
+        )
+        if not stable or any(report is None for report in reports):
+            self.indicated_house.reset()
+            self.indicated_house.last_status = "indication_unavailable"
+            return None
+        for source, report in zip(states, reports):
+            changed = getattr(source, "last_changed", None)
+            if (
+                changed is None
+                or changed.tzinfo is None
+                or changed > report[0]
+                or now - changed < timedelta(minutes=1)
+            ):
+                self.indicated_house.reset()
+                self.indicated_house.last_status = "temperature_context_transition"
+                return None
+        sample = self.indicated_house.observe(
+            now.timestamp(), reports[0][1], reports[1][1], 1.0
+        )
+        if sample is not None:
+            row = {
+                "evidence_level": "operating_indication",
+                "interpretation": "apparent_indoor_response_not_heat_delivery",
+                "end": sample.end,
+                "hours": sample.hours,
+                "start_indoor": sample.start_temp,
+                "end_indoor": sample.end_temp,
+                "mean_outdoor": sample.outdoor,
+                "indicated_fraction": sample.heat,
+                "coverage": sample.coverage,
+            }
+            self.indicated_observations.append(row)
+        return sample
 
     def reset_interval(self, *, invalidate_validation=True, reset_pump=True):
         self.manager.house.reset()
