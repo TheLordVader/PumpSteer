@@ -1196,6 +1196,10 @@ class PumpSteerSensor(RestoreEntity):
             if outdoor
             else DEFAULT_TEMPERATURE_REPORT_MAX_AGE_MINUTES
         )
+        if outdoor:
+            legacy_limit = safe_float(cfg.get("temperature_report_max_age_minutes"))
+            if legacy_limit is not None and legacy_limit > 0:
+                configured_default = min(configured_default, legacy_limit)
         key = (
             "outdoor_temperature_report_max_age_minutes"
             if outdoor

@@ -668,3 +668,21 @@ def test_outdoor_report_age_switches_to_fresh_backup_before_indoor_expires(contr
     clock[0] += timedelta(minutes=1)
     asyncio.run(sensor.async_update())
     assert sensor.extra_state_attributes["outdoor_temperature"] == -3.3
+
+
+def test_existing_stricter_shared_age_remains_in_force_for_outdoor(control):
+    sensor, states, clock = control
+    sensor._config_entry.options.update(
+        temperature_report_max_age_minutes=30, outdoor_temp_entity_2="sensor.backup"
+    )
+    states["sensor.backup"] = SimpleNamespace(state="-4", attributes={})
+    asyncio.run(sensor._handle_ha_started(None))
+    clock[0] += timedelta(seconds=1)
+    _report(states, clock)
+    states["sensor.backup"].last_reported = clock[0]
+    asyncio.run(sensor.async_update())
+    clock[0] += timedelta(minutes=31)
+    states["sensor.indoor"].last_reported = clock[0]
+    states["sensor.backup"].last_reported = clock[0]
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["outdoor_temperature"] == -4

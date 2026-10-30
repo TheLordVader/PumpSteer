@@ -15,6 +15,8 @@ from .const import (
     OHMIGO_RELAY_ENTITY,
 )
 
+from .utils import safe_float
+
 _LOGGER = logging.getLogger(__name__)
 
 DOMAIN = "pumpsteer"
@@ -110,6 +112,12 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
 
         entry = self.config_entry
         current_data = {**entry.data, **entry.options}
+        legacy_age = safe_float(current_data.get("temperature_report_max_age_minutes"))
+        outdoor_default_age = (
+            min(DEFAULT_OUTDOOR_REPORT_MAX_AGE_MINUTES, legacy_age)
+            if legacy_age is not None and legacy_age > 0
+            else DEFAULT_OUTDOOR_REPORT_MAX_AGE_MINUTES
+        )
 
         # Build list of number entities for the Ohmigo dropdown.
         number_entities = sorted(
@@ -192,7 +200,7 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
                 "outdoor_temperature_report_max_age_minutes",
                 default=current_data.get(
                     "outdoor_temperature_report_max_age_minutes",
-                    DEFAULT_OUTDOOR_REPORT_MAX_AGE_MINUTES,
+                    outdoor_default_age,
                 ),
             ): selector(
                 {
