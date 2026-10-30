@@ -120,3 +120,22 @@ def test_unknown_mode_collects_temperature_only_without_validating_model():
     assert row["coverage"] == 1.0
     assert pilot.manager.model.history == []
     assert pilot.validated_house(START.timestamp() + 3600) is None
+
+
+def test_control_interruption_discards_partial_temperature_observation():
+    pilot = PilotPassive()
+    for minute in range(0, 31, 5):
+        now = START + timedelta(minutes=minute)
+        pilot.observe_indicated(
+            now, state(20, now, unit="°C"), state(5, now, unit="°C"), None
+        )
+    assert pilot.indicated_house.start is not None
+    pilot.reset_interval()
+    assert pilot.indicated_house.start is None
+    assert pilot.indicated_house.last_status == "control_interrupted"
+    for minute in range(31, 61, 5):
+        now = START + timedelta(minutes=minute)
+        pilot.observe_indicated(
+            now, state(20, now, unit="°C"), state(5, now, unit="°C"), None
+        )
+    assert not pilot.indicated_observations

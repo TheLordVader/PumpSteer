@@ -170,6 +170,12 @@ class PilotPassive:
 
     def reset_interval(self, *, invalidate_validation=True, reset_pump=True):
         self.manager.house.reset()
+        self.indicated_house.reset()
+        self.indicated_house.last_status = "control_interrupted"
+        self._observation_first_indoor_report = None
+        self._observation_reports = None
+        self._observation_report_counts = [0, 0]
+        self._observation_max_age_seconds = [0.0, 0.0]
         self.audit.pending = None
         if reset_pump:
             self.manager.pump_intervals.reset()
