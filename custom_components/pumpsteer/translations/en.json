@@ -176,7 +176,7 @@
           "zone_3_alarm_delay_minutes": "Zone 3 – Alarm delay (minutes)",
           "zone_4_alarm_delay_minutes": "Zone 4 – Alarm delay (minutes)"
         },
-        "description": "Passive monitoring. Choose the alarm delay per zone. Forecasts require at least 30 minutes of continuous HA reports and a clear trend. Report time is not physical measurement time."
+        "description": "Passive monitoring. Alarms require at least two low reports. Forecasts require sufficient report history. HA report time is not physical measurement time."
       }
     },
     "error": {

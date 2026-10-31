@@ -47,7 +47,7 @@ def test_missing_reports_do_not_prove_low_temperature():
     )
     monitor.observe(now, cfg, {"sensor.garage": state})
     result, alerts = monitor.observe(
-        now + timedelta(minutes=16), cfg, {"sensor.garage": state}
+        now + timedelta(minutes=61), cfg, {"sensor.garage": state}
     )
     assert result["1"]["status"] == "unavailable"
     assert [a["event"] for a in alerts] == ["sensor_fault"]
@@ -106,7 +106,7 @@ def test_trend_needs_real_reports_across_half_an_hour_and_drops_on_gap():
     assert result["1"]["trend_c_per_hour"] == pytest.approx(-2)
     assert result["1"]["estimated_hours_to_threshold"] == pytest.approx(2)
     result, _ = monitor.observe(
-        now + timedelta(minutes=6), cfg, {"sensor.garage": state}
+        now + timedelta(minutes=36), cfg, {"sensor.garage": state}
     )
     assert result["1"]["trend_quality"] == "insufficient_data"
 
@@ -168,12 +168,13 @@ def test_separate_forecast_fault_recovery_and_restart_deduplication():
     saved, alerts = monitor.observe(state.last_reported, cfg, {"sensor.zone": state})
     assert not alerts
     resumed = ExtraZones(saved)
+    resumed.observe(state.last_reported, cfg, {})
     result, alerts = resumed.observe(
-        state.last_reported + timedelta(minutes=6), cfg, {}
+        state.last_reported + timedelta(minutes=61), cfg, {}
     )
     assert [a["event"] for a in alerts] == ["sensor_fault"]
     resumed.mark_sent(1, "sensor_fault")
-    state.last_reported += timedelta(minutes=7)
+    state.last_reported += timedelta(minutes=62)
     state.state = "8"
     result, alerts = resumed.observe(state.last_reported, cfg, {"sensor.zone": state})
     assert [a["event"] for a in alerts] == ["recovery"]
@@ -336,6 +337,7 @@ def test_independent_zones_rearm_after_recovery_and_reset_after_source_change():
     assert [(v["slot"], v["event"]) for v in alerts] == [(1, "temperature")]
     monitor.mark_sent(1)
     a.state = "6"
+    a.last_reported += timedelta(seconds=1)
     _, alerts = monitor.observe(a.last_reported, cfg, {"sensor.a": a, "sensor.b": b})
     assert [v["event"] for v in alerts] == ["recovery"]
     monitor.mark_sent(1, "recovery")
@@ -374,7 +376,7 @@ def test_unqualified_temperature_is_a_fault_not_temperature_evidence(
         {"sensor.zone": reading},
     )
     assert result["1"]["temperature"] is None
-    assert [v["event"] for v in alerts] == ["sensor_fault"]
+    assert not alerts
 
 
 def test_sparse_climate_reports_do_not_prove_continuous_heat_demand():
@@ -422,6 +424,7 @@ def test_failed_recovery_is_cancelled_when_temperature_falls_again():
     monitor.observe(room.last_reported, cfg, {"sensor.zone": room})
     monitor.mark_sent(1)
     room.state = "5.5"
+    room.last_reported += timedelta(seconds=1)
     saved, alerts = monitor.observe(room.last_reported, cfg, {"sensor.zone": room})
     assert [a["event"] for a in alerts] == ["recovery"]
     for current in (monitor, ExtraZones(saved)):
@@ -442,3 +445,161 @@ def test_disabling_alarms_keeps_passive_temperature_trend_available():
         assert not alerts
     assert result["1"]["trend_c_per_hour"] == pytest.approx(-2)
     assert not any(result["1"]["events"].values())
+
+
+@pytest.mark.parametrize("interval", [10, 15, 30])
+def test_sparse_reports_confirm_alarm_without_reusing_old_report(interval):
+    start = datetime(2026, 10, 31, tzinfo=timezone.utc)
+    monitor = ExtraZones()
+    cfg = [{"entity": "sensor.z", "threshold": 5, "enabled": True}]
+    state = SimpleNamespace(
+        state="4", attributes={"unit_of_measurement": "°C"}, last_reported=start
+    )
+    monitor.observe(start, cfg, {"sensor.z": state})
+    result, alerts = monitor.observe(
+        start + timedelta(minutes=interval), cfg, {"sensor.z": state}
+    )
+    assert not result["1"]["alarm_active"] and not alerts
+    state.last_reported = start + timedelta(minutes=interval)
+    result, _ = monitor.observe(state.last_reported, cfg, {"sensor.z": state})
+    if interval < 15:
+        state.last_reported += timedelta(minutes=interval)
+        result, _ = monitor.observe(state.last_reported, cfg, {"sensor.z": state})
+    assert result["1"]["alarm_active"]
+
+
+def test_startup_grace_then_sensor_fault():
+    start = datetime(2026, 10, 31, tzinfo=timezone.utc)
+    monitor = ExtraZones()
+    cfg = [{"entity": "sensor.z", "threshold": 5, "enabled": True}]
+    assert not monitor.observe(start, cfg, {})[1]
+    assert [
+        a["event"] for a in monitor.observe(start + timedelta(minutes=61), cfg, {})[1]
+    ] == ["sensor_fault"]
+
+
+def test_forecast_does_not_recover_from_an_old_report_after_gap():
+    start = datetime(2026, 10, 31, tzinfo=timezone.utc)
+    monitor = ExtraZones()
+    cfg = [{"entity": "sensor.z", "threshold": 5, "enabled": True}]
+    state = SimpleNamespace(attributes={"unit_of_measurement": "°C"})
+    for minute in range(31):
+        state.state = str(7 - minute / 30)
+        state.last_reported = start + timedelta(minutes=minute)
+        result, alerts = monitor.observe(state.last_reported, cfg, {"sensor.z": state})
+    assert result["1"]["events"]["forecast"]
+    monitor.mark_sent(1, "forecast")
+    result, alerts = monitor.observe(
+        state.last_reported + timedelta(minutes=36), cfg, {"sensor.z": state}
+    )
+    assert not result["1"]["events"]["forecast"]
+    assert not alerts
+
+
+@pytest.mark.parametrize("interval,forecast", [(10, True), (15, True), (30, False)])
+def test_forecast_degrades_with_sparse_reports(interval, forecast):
+    start = datetime(2026, 10, 31, tzinfo=timezone.utc)
+    monitor = ExtraZones()
+    cfg = [{"entity": "sensor.z", "threshold": 5, "enabled": True}]
+    state = SimpleNamespace(attributes={"unit_of_measurement": "°C"})
+    for n in range(7):
+        state.last_reported = start + timedelta(minutes=n * interval)
+        state.state = str(7 - n * interval / 60)
+        result, _ = monitor.observe(state.last_reported, cfg, {"sensor.z": state})
+    assert result["1"]["events"]["forecast"] is forecast
+
+
+def test_sample_history_is_bounded_under_rapid_reports():
+    start = datetime(2026, 10, 31, tzinfo=timezone.utc)
+    monitor = ExtraZones()
+    cfg = [{"entity": "sensor.z", "threshold": 5, "enabled": True}]
+    state = SimpleNamespace(state="10", attributes={"unit_of_measurement": "°C"})
+    for n in range(1000):
+        state.last_reported = start + timedelta(seconds=n)
+        monitor.observe(state.last_reported, cfg, {"sensor.z": state})
+    assert len(monitor._zones[1]["samples"]) <= 128
+
+
+def test_relative_trend_requires_new_outdoor_reports():
+    start = datetime(2026, 10, 31, tzinfo=timezone.utc)
+    cfg = [{"entity": "sensor.z", "threshold": 5, "enabled": True}]
+    room = SimpleNamespace(attributes={"unit_of_measurement": "°C"})
+    outdoor = SimpleNamespace(
+        state="0", attributes={"unit_of_measurement": "°C"}, last_reported=start
+    )
+    monitor = ExtraZones()
+    for minute in range(31):
+        room.last_reported = start + timedelta(minutes=minute)
+        room.state = str(10 - minute / 30)
+        result, _ = monitor.observe(
+            room.last_reported,
+            cfg,
+            {"sensor.z": room},
+            outdoor=outdoor,
+            outdoor_max_age_minutes=120,
+        )
+    assert result["1"]["trend_c_per_hour"] == pytest.approx(-2)
+    assert result["1"]["relative_trend_c_per_hour"] is None
+
+
+def test_restart_does_not_clear_alarm_from_pre_restart_report():
+    start = datetime(2026, 10, 31, tzinfo=timezone.utc)
+    cfg = [
+        {
+            "entity": "sensor.z",
+            "threshold": 5,
+            "enabled": True,
+            "alarm_delay_minutes": 1,
+        }
+    ]
+    state = SimpleNamespace(
+        state="4", attributes={"unit_of_measurement": "°C"}, last_reported=start
+    )
+    monitor = ExtraZones()
+    monitor.observe(start, cfg, {"sensor.z": state})
+    state.last_reported += timedelta(minutes=1)
+    monitor.observe(state.last_reported, cfg, {"sensor.z": state})
+    monitor.mark_sent(1)
+    saved, _ = monitor.observe(state.last_reported, cfg, {"sensor.z": state})
+    # HA retained this old healthy state through the controller reload.
+    state.state = "6"
+    resumed = ExtraZones(saved, started_at=state.last_reported + timedelta(minutes=1))
+    result, alerts = resumed.observe(
+        state.last_reported + timedelta(minutes=1), cfg, {"sensor.z": state}
+    )
+    assert result["1"]["alarm_active"] and not alerts
+    state.last_reported += timedelta(minutes=2)
+    result, alerts = resumed.observe(state.last_reported, cfg, {"sensor.z": state})
+    assert not result["1"]["alarm_active"]
+    assert [a["event"] for a in alerts] == ["recovery"]
+
+
+def test_rapid_real_reports_preserve_sufficient_trend_span():
+    start = datetime(2026, 10, 31, tzinfo=timezone.utc)
+    monitor = ExtraZones()
+    cfg = [{"entity": "sensor.z", "threshold": 5, "enabled": True}]
+    room = SimpleNamespace(attributes={"unit_of_measurement": "°C"})
+    for seconds in range(3601):
+        room.last_reported = start + timedelta(seconds=seconds)
+        room.state = str(7 - seconds / 3600)
+        result, _ = monitor.observe(room.last_reported, cfg, {"sensor.z": room})
+    assert result["1"]["trend_c_per_hour"] == pytest.approx(-1)
+    assert result["1"]["events"]["forecast"]
+    assert len(monitor._zones[1]["samples"]) <= 128
+
+
+def test_relative_trend_accepts_slightly_asynchronous_observed_reports():
+    start = datetime(2026, 10, 31, tzinfo=timezone.utc)
+    cfg = [{"entity": "sensor.z", "threshold": 5, "enabled": True}]
+    room = SimpleNamespace(attributes={"unit_of_measurement": "°C"})
+    outdoor = SimpleNamespace(attributes={"unit_of_measurement": "°C"})
+    monitor = ExtraZones()
+    for minute in range(31):
+        room.last_reported = start + timedelta(minutes=minute)
+        room.state = str(10 - minute / 30)
+        outdoor.last_reported = room.last_reported + timedelta(seconds=30)
+        outdoor.state = str(-minute / 30)
+        result, _ = monitor.observe(
+            outdoor.last_reported, cfg, {"sensor.z": room}, outdoor=outdoor
+        )
+    assert result["1"]["relative_trend_c_per_hour"] == pytest.approx(0)

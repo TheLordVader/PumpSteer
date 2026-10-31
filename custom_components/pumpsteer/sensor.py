@@ -128,6 +128,7 @@ class PumpSteerSensor(RestoreEntity):
         {
             "thermal_intelligence_plan_detail",
             "thermal_intelligence_plan_outcomes",
+            "extra_temperature_zones",
             "thermal_fixed_horizon_audit",
             "thermal_intelligence_grid_marginal",
         }
@@ -1665,7 +1666,8 @@ class PumpSteerSensor(RestoreEntity):
                 if not hasattr(self, "_extra_zones"):
                     self._extra_zones = ExtraZones(
                         getattr(self, "_zone_restore", None)
-                        or self._attributes.get("extra_temperature_zones")
+                        or self._attributes.get("extra_temperature_zones"),
+                        started_at=self._temperature_reported_after,
                     )
                     self._zone_restore = {}
                     self._attributes.pop("extra_temperature_zones", None)
@@ -1691,6 +1693,15 @@ class PumpSteerSensor(RestoreEntity):
                     zones,
                     self.hass.states,
                     outdoor=self._temperature_state(cfg, "real_outdoor_entity"),
+                    outdoor_max_age_minutes=max(
+                        0,
+                        (
+                            now - self._temperature_cutoff(cfg, outdoor=True)
+                        ).total_seconds()
+                        / 60,
+                    )
+                    if self._temperature_cutoff(cfg, outdoor=True) is not None
+                    else 0,
                 )
                 for alert in alerts:
                     slot = alert["slot"]
@@ -4691,6 +4702,7 @@ class PumpSteerThermalStatusSensor(SensorEntity):
 
     _attr_has_entity_name = True
     _attr_should_poll = False
+    _unrecorded_attributes = frozenset({"extra_temperature_zones"})
     _attr_translation_key = "thermal_intelligence"
     _attr_icon = "mdi:brain"
     _attr_device_class = "enum"

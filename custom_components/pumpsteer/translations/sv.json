@@ -177,7 +177,7 @@
           "zone_3_alarm_delay_minutes": "Zon 3 – Larmfördröjning (minuter)",
           "zone_4_alarm_delay_minutes": "Zon 4 – Larmfördröjning (minuter)"
         },
-        "description": "Passiv övervakning. Larmfördröjning kan väljas per zon. Prognos kräver minst 30 minuters sammanhängande HA-rapporter och en tydlig trend. Rapporttid är inte fysisk mättid."
+        "description": "Passiv övervakning. Larm kräver minst två låga rapporter. Prognoser kräver tillräcklig rapporthistorik. HA-rapporttid är inte fysisk mättid."
       }
     },
     "error": {

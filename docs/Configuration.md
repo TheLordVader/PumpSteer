@@ -504,10 +504,13 @@ notification state over restarts; pending
 measurement intervals and trends start afresh. Delivery confirmation is the
 notification service completing, not confirmation from the recipient's phone.
 
-Zone reports older than five minutes, future reports, restored values and
-non-Celsius readings cannot establish temperature evidence. Trend analysis uses
-up to an hour of continuous HA reports, with at least seven reports spanning
-30 minutes and no report gap exceeding five minutes. Forecast warnings require
+Zone reports older than 60 minutes, future reports, restored values and
+non-Celsius readings cannot establish temperature evidence. Startup allows 60
+minutes for sensors to appear. A low-temperature alarm requires at least two
+distinct low reports spanning the configured delay, with no gap over 35 minutes.
+Trend analysis uses up to two hours of HA reports (at most one actual report
+per minute and 128 samples), with
+at least seven reports spanning 30 minutes and no gap exceeding 35 minutes. Forecast warnings require
 a clear falling linear trend (fit at least 0.8, cooling faster than 0.1 °C/hour)
 a latest reading within 0.3 °C of the fitted trend, and an estimated threshold
 crossing within two hours. They clear above a

@@ -5,10 +5,12 @@ from datetime import datetime, timedelta
 from .utils import safe_float
 
 _EVENTS = ("temperature", "forecast", "heat_shortage", "sensor_fault")
-_GAP = timedelta(minutes=5)
+_GAP = timedelta(minutes=35)
+_MAX_AGE = timedelta(minutes=60)
+_CLIMATE_GAP = timedelta(minutes=5)
 
 
-def _fresh(state, now, max_age=_GAP):
+def _fresh(state, now, max_age=_MAX_AGE):
     attrs = getattr(state, "attributes", {}) or {}
     try:
         return (
@@ -21,7 +23,7 @@ def _fresh(state, now, max_age=_GAP):
         return False
 
 
-def _temperature(state, now, max_age=_GAP):
+def _temperature(state, now, max_age=_MAX_AGE):
     if (
         _fresh(state, now, max_age)
         and (getattr(state, "attributes", {}) or {}).get("unit_of_measurement") == "°C"
@@ -46,7 +48,8 @@ def _trend(samples):
 
 
 class ExtraZones:
-    def __init__(self, restored=None):
+    def __init__(self, restored=None, started_at=None):
+        self._started_at = started_at
         self._zones = {}
         self._restored = restored if isinstance(restored, dict) else {}
 
@@ -122,6 +125,16 @@ class ExtraZones:
                     "signature": signature,
                     "generation": object(),
                     "since": None,
+                    "started": now,
+                    "restored_active": bool(
+                        same
+                        and (
+                            any(events.values())
+                            or saved.get("episode_active")
+                            or saved.get("recovery_pending")
+                        )
+                    ),
+                    "seen": False,
                     "last": None,
                     "report": None,
                     "samples": [],
@@ -140,8 +153,13 @@ class ExtraZones:
             value = _temperature(state, now)
             valid = value is not None and threshold is not None
             report = getattr(state, "last_reported", None)
+            if valid and zone["restored_active"] and self._started_at is not None:
+                if report <= self._started_at:
+                    valid = False
+                else:
+                    zone["restored_active"] = False
             climate = states.get(cfg.get("climate")) if cfg.get("climate") else None
-            climate_fresh = _fresh(climate, now)
+            climate_fresh = _fresh(climate, now, _CLIMATE_GAP)
             climate_attrs = getattr(climate, "attributes", {}) or {}
             demand, valve = None, None
             if climate_fresh:
@@ -159,7 +177,11 @@ class ExtraZones:
                     demand = valve > 0
             climate_report = getattr(climate, "last_reported", None)
             if demand is True and zone["climate_report"] is not None:
-                if not timedelta(0) <= climate_report - zone["climate_report"] <= _GAP:
+                if (
+                    not timedelta(0)
+                    <= climate_report - zone["climate_report"]
+                    <= _CLIMATE_GAP
+                ):
                     zone["heat_since"] = None
             zone["climate_report"] = climate_report if climate_fresh else None
             previous = zone["events"].copy()
@@ -170,6 +192,7 @@ class ExtraZones:
                     and timedelta(0) <= now - zone["last"] <= _GAP
                     and zone["report"] is not None
                     and isinstance(report, datetime)
+                    and now - report <= _GAP
                     and timedelta(0) <= report - zone["report"] <= _GAP
                 )
                 if valid
@@ -179,17 +202,31 @@ class ExtraZones:
                 zone["since"] = None
                 zone["heat_since"] = None
                 zone["samples"].clear()
+            new_report = valid and report != zone["report"]
             if valid:
-                if report != zone["report"]:
-                    zone["samples"].append((report, value, outdoor_value))
+                zone["seen"] = True
+                if new_report and (
+                    not zone["samples"]
+                    or report - zone["samples"][-1][0] >= timedelta(minutes=1)
+                ):
+                    zone["samples"].append(
+                        (
+                            report,
+                            value,
+                            outdoor_value,
+                            getattr(outdoor, "last_reported", None),
+                        )
+                    )
                 zone["samples"] = [
-                    s for s in zone["samples"] if now - s[0] <= timedelta(hours=1)
-                ]
+                    s for s in zone["samples"] if now - s[0] <= timedelta(hours=2)
+                ][-128:]
             if valid and enabled:
                 if value < threshold:
                     if zone["since"] is None:
-                        zone["since"] = now
-                    if now - zone["since"] >= timedelta(minutes=delay):
+                        zone["since"] = report
+                    if new_report and report - zone["since"] >= timedelta(
+                        minutes=delay
+                    ):
                         zone["events"]["temperature"] = True
                 else:
                     zone["since"] = None
@@ -207,12 +244,16 @@ class ExtraZones:
             relative_samples = [
                 (s[0], s[1] - s[2]) for s in samples if s[2] is not None
             ]
-            # Missing outdoor reports must not masquerade as continuous coverage.
-            relative, _ = (
-                _trend(relative_samples)
-                if len(relative_samples) == len(samples)
-                else (None, None)
+            # Reusing one outdoor reading does not establish outdoor coverage.
+            outdoor_reports = {s[3] for s in samples if s[3] is not None}
+            outdoor_covered = (
+                len(relative_samples) == len(samples)
+                and len(outdoor_reports) >= 7
+                and all(
+                    s[3] is not None and -_GAP <= s[0] - s[3] <= _GAP for s in samples
+                )
             )
+            relative, _ = _trend(relative_samples) if outdoor_covered else (None, None)
             eta = None
             if (
                 valid
@@ -236,7 +277,11 @@ class ExtraZones:
                     eta = None
             events = zone["events"]
             if enabled:
-                events["sensor_fault"] = not valid
+                events["sensor_fault"] = not valid and (
+                    previous["sensor_fault"]
+                    or zone["seen"]
+                    or now - zone["started"] >= _MAX_AGE
+                )
                 if valid:
                     if eta is not None and eta <= 2:
                         events["forecast"] = True
@@ -284,6 +329,7 @@ class ExtraZones:
             recovered = (
                 enabled
                 and valid
+                and new_report
                 and value >= threshold + 0.5
                 and not current
                 and zone["episode"]

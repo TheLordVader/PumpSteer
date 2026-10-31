@@ -1473,7 +1473,7 @@ async def test_native_zone_options_and_passive_notifications(
     await resumed.async_update()
     await hass.async_block_till_done()
     assert len(received) == 1
-    freezer.move_to("2026-10-31T00:10:00+00:00")
+    freezer.move_to("2026-10-31T01:10:00+00:00")
     await resumed.async_update()
     await hass.async_block_till_done()
     assert len(received) == 2
@@ -1482,6 +1482,7 @@ async def test_native_zone_options_and_passive_notifications(
     await resumed.async_update()
     await hass.async_block_till_done()
     assert len(received) == 2  # Hysteresis: the temperature alarm still holds.
+    freezer.tick(timedelta(seconds=1))
     hass.states.async_set("sensor.zone", "5.5", {"unit_of_measurement": "°C"})
     await resumed.async_update()
     await hass.async_block_till_done()
@@ -1549,6 +1550,7 @@ async def test_native_zone_forecast_and_heat_response(hass, freezer):
     assert zone["temperature"] == pytest.approx(4.4666666667)
     assert zone["heat_response"] == "suspected_insufficient"
     assert zone["heat_response_c_per_hour"] == pytest.approx(-2)
+    freezer.tick(timedelta(seconds=1))
     hass.states.async_set("sensor.zone", "8", {"unit_of_measurement": "°C"})
     await controller.async_update()
     await hass.async_block_till_done()
@@ -1556,4 +1558,32 @@ async def test_native_zone_forecast_and_heat_response(hass, freezer):
     await hass.async_block_till_done()
     assert len(received) == 4
     assert "Återhämtning" in received[-1]
+    assert controller._pilot is None
+
+
+@pytest.mark.parametrize("interval", [10, 15, 30])
+async def test_native_sparse_zone_reports(hass, freezer, interval):
+    """Real HA last_reported timestamps qualify separate low readings."""
+    from custom_components.pumpsteer.sensor import PumpSteerSensor
+
+    freezer.move_to("2026-10-31T00:00:00+00:00")
+    await hass.async_start()
+    entry = MockConfigEntry(
+        domain="pumpsteer",
+        data={},
+        options={
+            "zone_1_entity": "sensor.zone",
+            "zone_1_enabled": True,
+            "zone_1_threshold": 5,
+        },
+    )
+    entry.add_to_hass(hass)
+    controller = PumpSteerSensor(hass, entry)
+    start = dt_util.utcnow()
+    for minute in range(0, 31, interval):
+        freezer.move_to(start + timedelta(minutes=minute))
+        hass.states.async_set("sensor.zone", "4", {"unit_of_measurement": "°C"})
+        await controller.async_update()
+    zone = controller.extra_state_attributes["extra_temperature_zones"]["1"]
+    assert zone["alarm_active"]
     assert controller._pilot is None
