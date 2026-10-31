@@ -1,4 +1,5 @@
 import logging
+import re
 
 import voluptuous as vol
 from homeassistant import config_entries
@@ -21,6 +22,24 @@ _LOGGER = logging.getLogger(__name__)
 
 DOMAIN = "pumpsteer"
 _GROUPS = {
+    "zones": {
+        "zone_notify_service",
+        *[
+            f"zone_{i}_{field}"
+            for i in range(1, 5)
+            for field in (
+                "name",
+                "entity",
+                "threshold",
+                "enabled",
+                "climate",
+                "profile",
+                "comfort_threshold",
+                "notify_service",
+                "alarm_delay_minutes",
+            )
+        ],
+    },
     "thermal": {"thermal_intelligence_enabled", "external_heat_sources"},
     "telemetry": {
         "thermal_detection_method",
@@ -65,6 +84,7 @@ _GROUPS = {
     },
 }
 _CLEARABLE = {
+    *[f"zone_{i}_{field}" for i in range(1, 5) for field in ("entity", "climate")],
     "indoor_temp_entity_2",
     "indoor_temp_entity_3",
     "outdoor_temp_entity_2",
@@ -88,11 +108,21 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
     async def async_step_init(self, user_input=None):
         return self.async_show_menu(
             step_id="init",
-            menu_options=["basic", "thermal", "telemetry", "notifications", "ohmigo"],
+            menu_options=[
+                "basic",
+                "thermal",
+                "telemetry",
+                "zones",
+                "notifications",
+                "ohmigo",
+            ],
         )
 
     async def async_step_basic(self, user_input=None):
         return await self._section("basic", user_input)
+
+    async def async_step_zones(self, user_input=None):
+        return await self._section("zones", user_input)
 
     async def async_step_thermal(self, user_input=None):
         return await self._section("thermal", user_input)
@@ -431,6 +461,92 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
                 }
             ),
         }
+        fields[
+            vol.Optional(
+                "zone_notify_service",
+                default=current_data.get("zone_notify_service", ""),
+            )
+        ] = selector({"text": {}})
+        for i in range(1, 5):
+            for suffix in (
+                "name",
+                "entity",
+                "threshold",
+                "enabled",
+                "climate",
+                "profile",
+                "comfort_threshold",
+                "notify_service",
+                "alarm_delay_minutes",
+            ):
+                key = f"zone_{i}_{suffix}"
+                if suffix == "entity":
+                    fields[
+                        vol.Optional(
+                            key, description={"suggested_value": current_data.get(key)}
+                        )
+                    ] = selector(
+                        {"entity": {"domain": "sensor", "device_class": "temperature"}}
+                    )
+                elif suffix == "climate":
+                    fields[
+                        vol.Optional(
+                            key, description={"suggested_value": current_data.get(key)}
+                        )
+                    ] = selector({"entity": {"domain": "climate"}})
+                elif suffix == "profile":
+                    fields[
+                        vol.Optional(key, default=current_data.get(key, "maintenance"))
+                    ] = selector(
+                        {
+                            "select": {
+                                "options": ["maintenance", "comfort"],
+                                "mode": "dropdown",
+                                "translation_key": "zone_profile",
+                            }
+                        }
+                    )
+                elif suffix in ("name", "notify_service"):
+                    fields[vol.Optional(key, default=current_data.get(key, ""))] = (
+                        selector({"text": {}})
+                    )
+                elif suffix == "enabled":
+                    fields[vol.Optional(key, default=current_data.get(key, False))] = (
+                        selector({"boolean": {}})
+                    )
+                elif suffix == "alarm_delay_minutes":
+                    fields[vol.Optional(key, default=current_data.get(key, 15))] = (
+                        selector(
+                            {
+                                "number": {
+                                    "min": 1,
+                                    "max": 240,
+                                    "step": 1,
+                                    "unit_of_measurement": "min",
+                                    "mode": "box",
+                                }
+                            }
+                        )
+                    )
+                else:
+                    fields[
+                        vol.Optional(
+                            key,
+                            default=current_data.get(
+                                key, 18 if suffix == "comfort_threshold" else 5
+                            ),
+                        )
+                    ] = selector(
+                        {
+                            "number": {
+                                "min": -30,
+                                "max": 40,
+                                "step": 0.5,
+                                "unit_of_measurement": "°C",
+                                "mode": "box",
+                            }
+                        }
+                    )
         selected = {
             k: v
             for k, v in fields.items()
@@ -483,6 +599,34 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
                     "outdoor_temp_entity_2",
                 } and not self._entity_exists(entity):
                     errors[key] = "entity_not_found"
+
+        for i in range(1, 5):
+            sensor_key = f"zone_{i}_entity"
+            entity = user_input.get(sensor_key)
+            if not entity and (
+                user_input.get(f"zone_{i}_enabled")
+                or user_input.get(f"zone_{i}_climate")
+            ):
+                errors[sensor_key] = "required"
+            for suffix, domain in (("entity", "sensor."), ("climate", "climate.")):
+                key = f"zone_{i}_{suffix}"
+                selected = user_input.get(key)
+                if selected and (
+                    not isinstance(selected, str)
+                    or not selected.startswith(domain)
+                    or not self._entity_exists(selected)
+                ):
+                    errors[key] = "entity_not_found"
+        for key in (
+            "zone_notify_service",
+            *[f"zone_{i}_notify_service" for i in range(1, 5)],
+        ):
+            service = user_input.get(key)
+            if service and (
+                not isinstance(service, str)
+                or not re.fullmatch(r"notify\.[a-z0-9_]+", service)
+            ):
+                errors[key] = "invalid_notification_setting"
 
         # Restrict notification preferences to recognized selection values.
         level = user_input.get(NOTIFICATION_LEVEL_OPTION, "all")

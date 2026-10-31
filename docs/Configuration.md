@@ -480,3 +480,51 @@ Controls what happens when forecast data is unavailable:
 
 The default `False` is safer: it avoids unnecessary preheating if the weather entity
 is misconfigured or temporarily unavailable.
+
+### Thermal Zone Intelligence (extra temperature zones)
+
+The **Extra temperature zones** options page supports up to four optional zones.
+Choose a Celsius room sensor, a name and whether alarms are enabled. Select
+**Maintenance heat** or **Comfort** manually; each profile has its own minimum
+temperature. Disabling alarms keeps passive temperature trends available.
+The low-temperature delay is configurable from 1 to 240 minutes
+(default 15). Recovery uses a 0.5 °C margin. Leave unused zones empty.
+
+These observations never control thermostats or alter the main building's
+weighted temperature, PI, prices, Ohmigo, relay protection or verified learning.
+A zone-only options change preserves the controller's learning state.
+
+Each zone reports separate low-temperature, forecast, suspected heat-shortage
+and sensor-fault states. A recovery notification follows a return to normal.
+Specify `notify.your_service` globally or override it per zone. Events are
+notified once per episode; failed service calls are retried on the next cycle.
+Delivery runs in cancellable background tasks with a 30-second timeout, so a slow
+notification service cannot block regulation. HA's existing restore data preserves
+notification state over restarts; pending
+measurement intervals and trends start afresh. Delivery confirmation is the
+notification service completing, not confirmation from the recipient's phone.
+
+Zone reports older than five minutes, future reports, restored values and
+non-Celsius readings cannot establish temperature evidence. Trend analysis uses
+up to an hour of continuous HA reports, with at least seven reports spanning
+30 minutes and no report gap exceeding five minutes. Forecast warnings require
+a clear falling linear trend (fit at least 0.8, cooling faster than 0.1 °C/hour)
+a latest reading within 0.3 °C of the fitted trend, and an estimated threshold
+crossing within two hours. They clear above a
+three-hour horizon or when cooling stops. Estimates are observational linear
+extrapolations, not verified thermal predictions. HA report time does not prove
+physical measurement time.
+
+An optional climate entity supplies its actual setpoint, `hvac_action` and,
+when exposed, numeric `pi_heating_demand`, `valve_position` or `heating_demand`
+(percent). An existing HA climate group can represent multiple radiators.
+The climate temperature never replaces the chosen room sensor. A continuous
+observed heating request with a flat or falling room temperature below the
+selected threshold for at least 30 minutes raises **suspected** heat shortage.
+Missing telemetry does not establish heating, heat output or recovery. The
+outdoor-relative trend is shown only with matching qualified outdoor coverage.
+
+Compact diagnostics, event reasons and forecast uncertainty are available in
+`extra_temperature_zones` on the controller and the existing Thermal Intelligence
+status sensor. The latter remains accessible when the main controller temperature
+is unavailable. No extra database or monitoring service is required.

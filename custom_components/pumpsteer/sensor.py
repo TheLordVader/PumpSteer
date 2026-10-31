@@ -136,6 +136,9 @@ class PumpSteerSensor(RestoreEntity):
     def __init__(self, hass: HomeAssistant, config_entry: ConfigEntry):
         self.hass = hass
         self._config_entry = config_entry
+        self._control_config = {
+            k: v for k, v in self._cfg().items() if not k.startswith("zone_")
+        }
         self._state: Optional[float] = None
         self._attributes: Dict[str, Any] = {}
         # Only live, qualified inputs; never populated from restored attributes.
@@ -274,6 +277,9 @@ class PumpSteerSensor(RestoreEntity):
     @property
     def extra_state_attributes(self) -> dict:
         attrs = {**self._attributes}
+        attrs.pop("extra_temperature_zones", None)
+        if getattr(self, "_zone_diagnostics", None):
+            attrs["extra_temperature_zones"] = self._zone_diagnostics
         if hasattr(self, "_temperature_coverage"):
             attrs["temperature_sources"] = self._temperature_coverage
         for key in (
@@ -449,8 +455,14 @@ class PumpSteerSensor(RestoreEntity):
 
         class _BrakeData(ExtraStoredData):
             def __init__(
-                self, brake_ramp, brake_last_t, brake_last_expensive_t, was_braking
+                self,
+                brake_ramp,
+                brake_last_t,
+                brake_last_expensive_t,
+                was_braking,
+                zones,
             ):
+                self.zones = zones
                 self.brake_ramp = brake_ramp
                 self.brake_last_t = brake_last_t
                 self.brake_last_expensive_t = brake_last_expensive_t
@@ -458,6 +470,7 @@ class PumpSteerSensor(RestoreEntity):
 
             def as_dict(self):
                 return {
+                    "extra_temperature_zones": self.zones,
                     _RESTORE_WAS_BRAKING: self.was_braking,
                     _RESTORE_BRAKE_RAMP: self.brake_ramp,
                     _RESTORE_BRAKE_LAST_T: (
@@ -475,6 +488,7 @@ class PumpSteerSensor(RestoreEntity):
             self._brake_last_t,
             self._brake_last_expensive_t,
             self._was_braking_last_cycle,
+            getattr(self, "_zone_diagnostics", getattr(self, "_zone_restore", {})),
         )
 
     async def async_added_to_hass(self) -> None:
@@ -505,6 +519,7 @@ class PumpSteerSensor(RestoreEntity):
         extra = await self.async_get_last_extra_data()
         if extra is not None:
             data = extra.as_dict()
+            self._zone_restore = data.get("extra_temperature_zones", {})
             # Older timestamps also record pre-brake/precool requests, so they
             # cannot prove that an expensive braking phase actually occurred.
             self._was_braking_last_cycle = data.get(_RESTORE_WAS_BRAKING) is True
@@ -571,6 +586,11 @@ class PumpSteerSensor(RestoreEntity):
     async def async_will_remove_from_hass(self) -> None:
         """Cancel options update listener on unload."""
         self._temperature_unloaded = True
+        pending = list(getattr(self, "_zone_notify_tasks", {}).values())
+        for _, task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*(task for _, task in pending), return_exceptions=True)
         self._input_temperatures = {}
         async_dispatcher_send(self.hass, self._input_temperature_signal)
         if self._cfg().get("thermal_intelligence_enabled") is True:
@@ -594,6 +614,16 @@ class PumpSteerSensor(RestoreEntity):
     ) -> None:
         """Handle updated options."""
         self._config_entry = entry
+        control_config = {
+            k: v for k, v in self._cfg().items() if not k.startswith("zone_")
+        }
+        if control_config == self._control_config:
+            if self._update_in_progress:
+                self._options_update_pending = True
+            else:
+                await self.async_update()
+            return
+        self._control_config = control_config
         if (
             self._heat_operation is not None
             and self._cfg().get("thermal_intelligence_enabled") is True
@@ -1551,6 +1581,66 @@ class PumpSteerSensor(RestoreEntity):
             self._update_in_progress = False
             async_dispatcher_send(self.hass, self._input_temperature_signal)
 
+    def _queue_zone_notification(self, monitor, alert, service):
+        """Deliver outside the control task; acknowledge only a current event."""
+        if not hasattr(self, "_zone_notify_tasks"):
+            self._zone_notify_tasks = {}
+        key = (alert["slot"], alert["event"])
+        pending = self._zone_notify_tasks.get(key)
+        if pending is not None:
+            if pending[0]["generation"] is alert["generation"]:
+                return
+            pending[1].cancel()
+        create_task = getattr(self.hass, "async_create_task", asyncio.create_task)
+        task = create_task(self._send_zone_notification(monitor, alert, service))
+        self._zone_notify_tasks[key] = (alert, task)
+
+        def done(finished):
+            if self._zone_notify_tasks.get(key, (None, None))[1] is finished:
+                self._zone_notify_tasks.pop(key, None)
+
+        task.add_done_callback(done)
+
+    async def _send_zone_notification(self, monitor, alert, service):
+        try:
+            if self._temperature_unloaded or not monitor.notification_current(alert):
+                return
+            event, slot = alert["event"], alert["slot"]
+            reasons = {
+                "temperature": "Temperaturlarm",
+                "forecast": "Förvarning: temperaturgränsen kan nås inom två timmar",
+                "heat_shortage": "Misstänkt värmebrist: värmebegäran utan temperaturåterhämtning",
+                "sensor_fault": "Givarfel: temperaturdata saknas eller är för gamla",
+                "recovery": "Återhämtning: zonen är normal igen",
+            }
+            value = alert["temperature"]
+            detail = f" ({value:.1f} °C)" if value is not None else ""
+            async with asyncio.timeout(30):
+                await self.hass.services.async_call(
+                    "notify",
+                    service[7:],
+                    {"message": f"{alert['name']}: {reasons[event]}{detail}"},
+                    blocking=True,
+                )
+            if getattr(
+                self, "_extra_zones", None
+            ) is not monitor or not monitor.notification_current(alert):
+                return
+            monitor.mark_sent(slot, event)
+            diagnostic = self._zone_diagnostics[str(slot)]
+            diagnostic["notifications_sent"][event] = True
+            if event == "temperature":
+                diagnostic["notification_sent"] = True
+            if event == "recovery":
+                diagnostic["recovery_pending"] = False
+            async_dispatcher_send(self.hass, self._input_temperature_signal)
+            if getattr(self, "platform", None) is not None:
+                self.async_write_ha_state()
+        except Exception:
+            _LOGGER.warning(
+                "Zone notification failed for slot %s", alert["slot"], exc_info=True
+            )
+
     async def _do_update(self) -> None:
         """Run the main control state machine."""
         now = dt_util.now()
@@ -1567,6 +1657,64 @@ class PumpSteerSensor(RestoreEntity):
         cfg = self._cfg()
 
         self._update_outdoor_selection(cfg)
+
+        if any(cfg.get(f"zone_{i}_entity") for i in range(1, 5)):
+            try:
+                from .extra_zones import ExtraZones
+
+                if not hasattr(self, "_extra_zones"):
+                    self._extra_zones = ExtraZones(
+                        getattr(self, "_zone_restore", None)
+                        or self._attributes.get("extra_temperature_zones")
+                    )
+                    self._zone_restore = {}
+                    self._attributes.pop("extra_temperature_zones", None)
+                zones = [
+                    {
+                        field: cfg.get(f"zone_{i}_{field}")
+                        for field in (
+                            "name",
+                            "entity",
+                            "threshold",
+                            "enabled",
+                            "climate",
+                            "profile",
+                            "comfort_threshold",
+                            "notify_service",
+                            "alarm_delay_minutes",
+                        )
+                    }
+                    for i in range(1, 5)
+                ]
+                self._zone_diagnostics, alerts = self._extra_zones.observe(
+                    now,
+                    zones,
+                    self.hass.states,
+                    outdoor=self._temperature_state(cfg, "real_outdoor_entity"),
+                )
+                for alert in alerts:
+                    slot = alert["slot"]
+                    service = zones[slot - 1].get("notify_service") or cfg.get(
+                        "zone_notify_service", ""
+                    )
+                    if isinstance(service, str) and service.startswith("notify."):
+                        self._queue_zone_notification(self._extra_zones, alert, service)
+                for pending_alert, task in list(
+                    getattr(self, "_zone_notify_tasks", {}).values()
+                ):
+                    if not self._extra_zones.notification_current(pending_alert):
+                        task.cancel()
+            except Exception:
+                _LOGGER.exception("Passive extra zone monitoring failed")
+        else:
+            for _, task in list(getattr(self, "_zone_notify_tasks", {}).values()):
+                task.cancel()
+            self._zone_diagnostics = {}
+            self._zone_restore = {}
+            self._attributes.pop("extra_temperature_zones", None)
+            if hasattr(self, "_extra_zones"):
+                del self._extra_zones
+
         indoor = self._temperature_value(cfg, "indoor_temp_entity")
         outdoor = self._temperature_value(cfg, "real_outdoor_entity")
         identity = self._temperature_identity(cfg)
@@ -4633,6 +4781,8 @@ class PumpSteerThermalStatusSensor(SensorEntity):
             ),
             "model": attrs.get("thermal_intelligence_model"),
         }
+        if getattr(controller, "_zone_diagnostics", None):
+            summary["extra_temperature_zones"] = controller._zone_diagnostics
         if state != self._attr_native_value or summary != self._summary:
             self._attr_native_value = state
             self._summary = summary

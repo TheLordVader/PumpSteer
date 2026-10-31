@@ -13,6 +13,7 @@ def test_menu_includes_separate_ohmigo_safety_page():
         "basic",
         "thermal",
         "telemetry",
+        "zones",
         "notifications",
         "ohmigo",
     ]
@@ -122,3 +123,38 @@ def test_basic_options_save_and_clear_optional_temperature_sources():
     assert cleared["data"]["indoor_temp_entity_2"] == ""
     assert cleared["data"]["outdoor_temp_entity_2"] == ""
     assert cleared["data"]["indoor_temp_weight_2"] == 3
+
+
+def test_zone_page_saves_configuration_and_preserves_existing_options():
+    flow = PumpSteerOptionsFlowHandler()
+    flow.config_entry = SimpleNamespace(
+        data={}, options={"thermal_intelligence_enabled": True}
+    )
+    flow.hass = SimpleNamespace(states=SimpleNamespace(async_all=lambda domain: []))
+    flow._validate_entities = lambda data: {}
+    flow.async_create_entry = lambda **kwargs: kwargs
+    result = asyncio.run(
+        flow.async_step_zones(
+            {
+                "zone_1_name": "Garage",
+                "zone_1_entity": "sensor.garage",
+                "zone_1_threshold": 5,
+                "zone_1_enabled": True,
+                "zone_notify_service": "notify.family",
+            }
+        )
+    )
+    assert result["data"]["zone_1_entity"] == "sensor.garage"
+    assert result["data"]["thermal_intelligence_enabled"] is True
+
+
+def test_zone_validation_requires_sensor_and_valid_notify_service():
+    flow = PumpSteerOptionsFlowHandler()
+    flow.hass = SimpleNamespace(
+        states=SimpleNamespace(get=lambda entity: SimpleNamespace(state="10"))
+    )
+    errors = flow._validate_entities(
+        {"zone_1_enabled": True, "zone_1_notify_service": "light.turn_on"}
+    )
+    assert errors["zone_1_entity"] == "required"
+    assert errors["zone_1_notify_service"] == "invalid_notification_setting"

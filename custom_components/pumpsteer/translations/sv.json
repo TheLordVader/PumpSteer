@@ -26,7 +26,8 @@
           "thermal": "Thermal Intelligence",
           "telemetry": "Avancerade givare",
           "notifications": "Notiser",
-          "ohmigo": "Ohmigo och säkerhet"
+          "ohmigo": "Ohmigo och säkerhet",
+          "zones": "Extra temperaturzoner"
         }
       },
       "basic": {
@@ -134,6 +135,49 @@
           "modbus_interval_minutes": "Minsta tid mellan anrop från Generic Output System.",
           "ohmigo_relay_entity": "Valfri switch-entitet för Ohmigos Active/Bypass-relä. När den är konfigurerad skapar PumpSteer en separat Relay Guard-brytare. Skyddet återställer bara ett uttryckligt OFF-läge när Ohmigo Push är på; unknown eller unavailable skickar aldrig något reläkommando."
         }
+      },
+      "zones": {
+        "title": "Extra temperaturzoner",
+        "data": {
+          "zone_notify_service": "Notifikationstjänst (notify.namn)",
+          "zone_1_name": "Zon 1 – namn",
+          "zone_1_entity": "Zon 1 – temperaturgivare",
+          "zone_1_threshold": "Zon 1 – Gräns för underhållsvärme",
+          "zone_1_enabled": "Zon 1 – larm aktiverat",
+          "zone_2_name": "Zon 2 – namn",
+          "zone_2_entity": "Zon 2 – temperaturgivare",
+          "zone_2_threshold": "Zon 2 – Gräns för underhållsvärme",
+          "zone_2_enabled": "Zon 2 – larm aktiverat",
+          "zone_3_name": "Zon 3 – namn",
+          "zone_3_entity": "Zon 3 – temperaturgivare",
+          "zone_3_threshold": "Zon 3 – Gräns för underhållsvärme",
+          "zone_3_enabled": "Zon 3 – larm aktiverat",
+          "zone_4_name": "Zon 4 – namn",
+          "zone_4_entity": "Zon 4 – temperaturgivare",
+          "zone_4_threshold": "Zon 4 – Gräns för underhållsvärme",
+          "zone_4_enabled": "Zon 4 – larm aktiverat",
+          "zone_1_climate": "Zon 1 – Termostat (valfri)",
+          "zone_1_profile": "Zon 1 – Driftprofil",
+          "zone_1_comfort_threshold": "Zon 1 – Komfortgräns",
+          "zone_1_notify_service": "Zon 1 – Notifikationstjänst",
+          "zone_2_climate": "Zon 2 – Termostat (valfri)",
+          "zone_2_profile": "Zon 2 – Driftprofil",
+          "zone_2_comfort_threshold": "Zon 2 – Komfortgräns",
+          "zone_2_notify_service": "Zon 2 – Notifikationstjänst",
+          "zone_3_climate": "Zon 3 – Termostat (valfri)",
+          "zone_3_profile": "Zon 3 – Driftprofil",
+          "zone_3_comfort_threshold": "Zon 3 – Komfortgräns",
+          "zone_3_notify_service": "Zon 3 – Notifikationstjänst",
+          "zone_4_climate": "Zon 4 – Termostat (valfri)",
+          "zone_4_profile": "Zon 4 – Driftprofil",
+          "zone_4_comfort_threshold": "Zon 4 – Komfortgräns",
+          "zone_4_notify_service": "Zon 4 – Notifikationstjänst",
+          "zone_1_alarm_delay_minutes": "Zon 1 – Larmfördröjning (minuter)",
+          "zone_2_alarm_delay_minutes": "Zon 2 – Larmfördröjning (minuter)",
+          "zone_3_alarm_delay_minutes": "Zon 3 – Larmfördröjning (minuter)",
+          "zone_4_alarm_delay_minutes": "Zon 4 – Larmfördröjning (minuter)"
+        },
+        "description": "Passiv övervakning. Larmfördröjning kan väljas per zon. Prognos kräver minst 30 minuters sammanhängande HA-rapporter och en tydlig trend. Rapporttid är inte fysisk mättid."
       }
     },
     "error": {
@@ -144,6 +188,14 @@
       "invalid_notification_setting": "Ogiltig notisinställning",
       "invalid_detection_method": "Ogiltig metod för värmedetektering.",
       "heat_signal_alias": "Värmesignalen måste vara en separat indikator för radiatorvärme."
+    },
+    "selector": {
+      "zone_profile": {
+        "options": {
+          "maintenance": "Underhållsvärme",
+          "comfort": "Komfort"
+        }
+      }
     }
   },
   "entity": {

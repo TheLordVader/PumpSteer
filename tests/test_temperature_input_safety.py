@@ -686,3 +686,96 @@ def test_existing_stricter_shared_age_remains_in_force_for_outdoor(control):
     states["sensor.backup"].last_reported = clock[0]
     asyncio.run(sensor.async_update())
     assert sensor.extra_state_attributes["outdoor_temperature"] == -4
+
+
+def test_extra_zone_alert_is_passive_and_not_repeated(control):
+    sensor, states, clock = control
+    sensor._config_entry.options.update(
+        zone_1_entity="sensor.garage",
+        zone_1_name="Garage",
+        zone_1_enabled=True,
+        zone_1_threshold=5,
+        zone_notify_service="notify.family",
+    )
+    states["sensor.garage"] = SimpleNamespace(
+        state="4", attributes={"unit_of_measurement": "°C"}, last_reported=clock[0]
+    )
+    for minute in range(17):
+        _report(states, clock)
+        states["sensor.garage"].last_reported = clock[0]
+        asyncio.run(sensor.async_update())
+        assert sensor.extra_state_attributes["mode"] == MODE_PI
+        assert sensor.extra_state_attributes["indoor_temperature"] == 21
+        clock[0] += timedelta(minutes=1)
+    sent = [call for call in sensor.hass.services.calls if call[0] == "notify"]
+    assert len(sent) == 1
+    assert (
+        sensor.extra_state_attributes["extra_temperature_zones"]["1"]["status"]
+        == "alarm"
+    )
+
+
+def test_zone_only_options_do_not_reset_control_learning(control, monkeypatch):
+    sensor, states, clock = control
+
+    async def update():
+        pass
+
+    monkeypatch.setattr(sensor, "async_update", update)
+    asyncio.run(sensor.async_options_update_listener(sensor.hass, sensor._config_entry))
+    pilot = object()
+    sensor._pilot = pilot
+    sensor._config_entry.options["zone_1_entity"] = "sensor.garage"
+    asyncio.run(sensor.async_options_update_listener(sensor.hass, sensor._config_entry))
+    assert sensor._pilot is pilot
+
+
+def test_removed_zones_do_not_keep_restored_diagnostics(control):
+    sensor, states, clock = control
+    sensor._attributes["extra_temperature_zones"] = {"1": {"alarm_active": True}}
+    asyncio.run(sensor.async_update())
+    assert "extra_temperature_zones" not in sensor.extra_state_attributes
+
+
+def test_slow_zone_notification_does_not_block_main_control(control, monkeypatch):
+    sensor, states, clock = control
+    sensor._config_entry.options.update(
+        zone_1_entity="sensor.garage",
+        zone_1_threshold=5,
+        zone_1_enabled=True,
+        zone_1_alarm_delay_minutes=1,
+        zone_notify_service="notify.family",
+    )
+    room = SimpleNamespace(
+        state="4", attributes={"unit_of_measurement": "°C"}, last_reported=clock[0]
+    )
+    states["sensor.garage"] = room
+
+    async def scenario():
+        release = asyncio.Event()
+        entered = asyncio.Event()
+        original = sensor.hass.services.async_call
+
+        async def slow(domain, service, data, **kwargs):
+            if domain == "notify":
+                entered.set()
+                await release.wait()
+            else:
+                await original(domain, service, data, **kwargs)
+
+        monkeypatch.setattr(sensor.hass.services, "async_call", slow)
+        _report(states, clock)
+        await sensor.async_update()
+        clock[0] += timedelta(minutes=1)
+        room.last_reported = clock[0]
+        _report(states, clock)
+        try:
+            await asyncio.wait_for(sensor.async_update(), timeout=0.1)
+            await asyncio.wait_for(entered.wait(), timeout=0.1)
+            assert sensor.extra_state_attributes["mode"] == MODE_PI
+            assert not sensor._update_in_progress
+        finally:
+            release.set()
+            await asyncio.sleep(0)
+
+    asyncio.run(scenario())

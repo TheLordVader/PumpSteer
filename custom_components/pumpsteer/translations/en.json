@@ -25,7 +25,8 @@
           "thermal": "Thermal Intelligence",
           "telemetry": "Advanced sensors",
           "notifications": "Notifications",
-          "ohmigo": "Ohmigo and safety"
+          "ohmigo": "Ohmigo and safety",
+          "zones": "Extra temperature zones"
         }
       },
       "basic": {
@@ -133,6 +134,49 @@
           "modbus_interval_minutes": "Minimum time between Generic Output System service calls.",
           "ohmigo_relay_entity": "Optional switch entity for the Ohmigo Active/Bypass relay. When configured, PumpSteer exposes a separate Relay Guard switch. The guard only recovers an explicit OFF state while Ohmigo Push is ON; unknown or unavailable states never cause a relay command."
         }
+      },
+      "zones": {
+        "title": "Extra temperature zones",
+        "data": {
+          "zone_notify_service": "Notification service (notify.name)",
+          "zone_1_name": "Zone 1 – name",
+          "zone_1_entity": "Zone 1 – temperature sensor",
+          "zone_1_threshold": "Zone 1 – Maintenance threshold",
+          "zone_1_enabled": "Zone 1 – alarm enabled",
+          "zone_2_name": "Zone 2 – name",
+          "zone_2_entity": "Zone 2 – temperature sensor",
+          "zone_2_threshold": "Zone 2 – Maintenance threshold",
+          "zone_2_enabled": "Zone 2 – alarm enabled",
+          "zone_3_name": "Zone 3 – name",
+          "zone_3_entity": "Zone 3 – temperature sensor",
+          "zone_3_threshold": "Zone 3 – Maintenance threshold",
+          "zone_3_enabled": "Zone 3 – alarm enabled",
+          "zone_4_name": "Zone 4 – name",
+          "zone_4_entity": "Zone 4 – temperature sensor",
+          "zone_4_threshold": "Zone 4 – Maintenance threshold",
+          "zone_4_enabled": "Zone 4 – alarm enabled",
+          "zone_1_climate": "Zone 1 – Thermostat (optional)",
+          "zone_1_profile": "Zone 1 – Profile",
+          "zone_1_comfort_threshold": "Zone 1 – Comfort minimum",
+          "zone_1_notify_service": "Zone 1 – Notification service",
+          "zone_2_climate": "Zone 2 – Thermostat (optional)",
+          "zone_2_profile": "Zone 2 – Profile",
+          "zone_2_comfort_threshold": "Zone 2 – Comfort minimum",
+          "zone_2_notify_service": "Zone 2 – Notification service",
+          "zone_3_climate": "Zone 3 – Thermostat (optional)",
+          "zone_3_profile": "Zone 3 – Profile",
+          "zone_3_comfort_threshold": "Zone 3 – Comfort minimum",
+          "zone_3_notify_service": "Zone 3 – Notification service",
+          "zone_4_climate": "Zone 4 – Thermostat (optional)",
+          "zone_4_profile": "Zone 4 – Profile",
+          "zone_4_comfort_threshold": "Zone 4 – Comfort minimum",
+          "zone_4_notify_service": "Zone 4 – Notification service",
+          "zone_1_alarm_delay_minutes": "Zone 1 – Alarm delay (minutes)",
+          "zone_2_alarm_delay_minutes": "Zone 2 – Alarm delay (minutes)",
+          "zone_3_alarm_delay_minutes": "Zone 3 – Alarm delay (minutes)",
+          "zone_4_alarm_delay_minutes": "Zone 4 – Alarm delay (minutes)"
+        },
+        "description": "Passive monitoring. Choose the alarm delay per zone. Forecasts require at least 30 minutes of continuous HA reports and a clear trend. Report time is not physical measurement time."
       }
     },
     "error": {
@@ -143,6 +187,14 @@
       "invalid_notification_setting": "Invalid notification setting",
       "invalid_detection_method": "Invalid heating detection method.",
       "heat_signal_alias": "The heat signal must be a separate radiator heat indicator."
+    },
+    "selector": {
+      "zone_profile": {
+        "options": {
+          "maintenance": "Maintenance heat",
+          "comfort": "Comfort"
+        }
+      }
     }
   },
   "entity": {

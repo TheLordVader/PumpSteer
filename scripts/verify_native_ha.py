@@ -1242,6 +1242,7 @@ async def test_native_options_menu_preserves_other_pages(
         "basic",
         "thermal",
         "telemetry",
+        "zones",
         "notifications",
         "ohmigo",
     ]
@@ -1367,3 +1368,192 @@ async def test_native_basic_temperature_redundancy_options(
     assert entry.options["indoor_temp_weight_2"] == 3
     assert entry.options["outdoor_temp_entity_2"] == "sensor.backup"
     assert entry.options["outdoor_temperature_report_max_age_minutes"] == 75
+
+
+async def test_native_zone_options_and_passive_notifications(
+    recorder_mock, hass, enable_custom_integrations, monkeypatch, tmp_path, freezer
+):
+    """Real options flow, last_reported, service dispatch and RestoreEntity data."""
+    from custom_components.pumpsteer import pump_log
+
+    monkeypatch.setattr(pump_log, "_PUMP_LOG_PATH", str(tmp_path / "pump.log"))
+    freezer.move_to("2026-10-31T00:00:00+00:00")
+    await hass.async_start()
+    for name, value in (("room", "21"), ("outdoor", "0"), ("zone", "4")):
+        hass.states.async_set(
+            "sensor." + name,
+            value,
+            {"unit_of_measurement": "°C", "device_class": "temperature"},
+        )
+    hass.states.async_set("sensor.price", "1", {"unit_of_measurement": "SEK/kWh"})
+    hass.states.async_set(
+        "climate.zone", "heat", {"temperature": 12, "hvac_action": "heating"}
+    )
+    received = []
+    attempts = []
+
+    async def notify(call):
+        attempts.append(call.data["message"])
+        if len(attempts) == 1:
+            raise RuntimeError("Temporary notification failure")
+        received.append(call.data["message"])
+
+    hass.services.async_register("notify", "zone_test", notify)
+    entry = MockConfigEntry(
+        domain="pumpsteer",
+        data={},
+        options={
+            "indoor_temp_entity": "sensor.room",
+            "real_outdoor_entity": "sensor.outdoor",
+            "electricity_price_entity": "sensor.price",
+            "price_tomorrow_entity": "sensor.price",
+        },
+    )
+    entry.add_to_hass(hass)
+    assert await async_setup_component(hass, "pumpsteer", {})
+    await hass.async_block_till_done()
+    form = await hass.config_entries.options.async_init(entry.entry_id)
+    form = await hass.config_entries.options.async_configure(
+        form["flow_id"], {"next_step_id": "zones"}
+    )
+    saved = await hass.config_entries.options.async_configure(
+        form["flow_id"],
+        {
+            "zone_1_entity": "sensor.zone",
+            "zone_1_name": "Garage",
+            "zone_1_enabled": True,
+            "zone_1_threshold": 5,
+            "zone_1_profile": "maintenance",
+            "zone_1_comfort_threshold": 18,
+            "zone_1_climate": "climate.zone",
+            "zone_1_alarm_delay_minutes": 2,
+            "zone_1_notify_service": "notify.zone_test",
+        },
+    )
+    assert saved["type"] == "create_entry", saved
+    await hass.async_block_till_done()
+    assert entry.options["zone_1_alarm_delay_minutes"] == 2
+    assert entry.options["indoor_temp_entity"] == "sensor.room"
+    controller = next(
+        e for e in hass.data[SENSOR].entities if e.unique_id == entry.entry_id
+    )
+    service_calls = []
+    hass.bus.async_listen(
+        "call_service", lambda event: service_calls.append(event.data["domain"])
+    )
+    for minute in range(4):
+        freezer.move_to(f"2026-10-31T00:0{minute}:00+00:00")
+        hass.states.async_set("sensor.zone", "4", {"unit_of_measurement": "°C"})
+        await controller.async_update()
+        await hass.async_block_till_done()
+    assert len(attempts) == 2
+    assert len(received) == 1
+    assert "Temperaturlarm" in received[0]
+    controller.async_write_ha_state()
+    await hass.async_block_till_done()
+    status = next(
+        e
+        for e in hass.data[SENSOR].entities
+        if e.unique_id == f"{entry.entry_id}_thermal_intelligence"
+    )
+    assert hass.states.get(status.entity_id).attributes["extra_temperature_zones"]["1"][
+        "events"
+    ]["temperature"]
+    persisted = controller.extra_restore_state_data.as_dict()
+    assert persisted["extra_temperature_zones"]["1"]["notifications_sent"][
+        "temperature"
+    ]
+    # Full reload exercises RestoreEntity's real extra-data cache, even when
+    # the main temperature is unavailable and HA suppresses its attributes.
+    assert await hass.config_entries.async_reload(entry.entry_id)
+    await hass.async_block_till_done()
+    resumed = next(
+        e for e in hass.data[SENSOR].entities if e.unique_id == entry.entry_id
+    )
+    await resumed.async_update()
+    await hass.async_block_till_done()
+    assert len(received) == 1
+    freezer.move_to("2026-10-31T00:10:00+00:00")
+    await resumed.async_update()
+    await hass.async_block_till_done()
+    assert len(received) == 2
+    assert "Givarfel" in received[-1]
+    hass.states.async_set("sensor.zone", "5.2", {"unit_of_measurement": "°C"})
+    await resumed.async_update()
+    await hass.async_block_till_done()
+    assert len(received) == 2  # Hysteresis: the temperature alarm still holds.
+    hass.states.async_set("sensor.zone", "5.5", {"unit_of_measurement": "°C"})
+    await resumed.async_update()
+    await hass.async_block_till_done()
+    await resumed.async_update()
+    await hass.async_block_till_done()
+    assert len(received) == 3
+    assert "Återhämtning" in received[-1]
+    assert (
+        resumed.extra_state_attributes["extra_temperature_zones"]["1"]["temperature"]
+        == 5.5
+    )
+    assert set(service_calls) == {"notify"}
+
+
+async def test_native_zone_forecast_and_heat_response(hass, freezer):
+    """Actual repeated HA reports feed forecast and demand-response events."""
+    from custom_components.pumpsteer.sensor import PumpSteerSensor
+
+    freezer.move_to("2026-10-31T00:00:00+00:00")
+    await hass.async_start()
+    received = []
+
+    async def notify(call):
+        received.append(call.data["message"])
+
+    hass.services.async_register("notify", "zones", notify)
+    entry = MockConfigEntry(
+        domain="pumpsteer",
+        data={},
+        options={
+            "zone_1_entity": "sensor.zone",
+            "zone_1_enabled": True,
+            "zone_1_threshold": 5,
+            "zone_1_climate": "climate.zone",
+            "zone_notify_service": "notify.zones",
+            "real_outdoor_entity": "sensor.outdoor",
+        },
+    )
+    entry.add_to_hass(hass)
+    controller = PumpSteerSensor(hass, entry)
+    start = dt_util.utcnow()
+    for minute in range(77):
+        freezer.move_to(start + timedelta(minutes=minute))
+        hass.states.async_set(
+            "sensor.zone", str(7 - minute / 30), {"unit_of_measurement": "°C"}
+        )
+        hass.states.async_set(
+            "sensor.outdoor", str(-minute / 30), {"unit_of_measurement": "°C"}
+        )
+        # Attributes may include vendor extensions, but no vendor is assumed.
+        hass.states.async_set(
+            "climate.zone", "heat", {"temperature": 12, "valve_position": 60}
+        )
+        await controller.async_update()
+        await hass.async_block_till_done()
+        if minute == 30:
+            zone = controller.extra_state_attributes["extra_temperature_zones"]["1"]
+            assert zone["events"]["forecast"]
+            assert zone["relative_trend_c_per_hour"] == pytest.approx(0)
+    assert len(received) == 3
+    assert "Förvarning" in received[0]
+    assert "Misstänkt värmebrist" in received[1]
+    assert "Temperaturlarm" in received[2]
+    zone = controller.extra_state_attributes["extra_temperature_zones"]["1"]
+    assert zone["temperature"] == pytest.approx(4.4666666667)
+    assert zone["heat_response"] == "suspected_insufficient"
+    assert zone["heat_response_c_per_hour"] == pytest.approx(-2)
+    hass.states.async_set("sensor.zone", "8", {"unit_of_measurement": "°C"})
+    await controller.async_update()
+    await hass.async_block_till_done()
+    await controller.async_update()
+    await hass.async_block_till_done()
+    assert len(received) == 4
+    assert "Återhämtning" in received[-1]
+    assert controller._pilot is None
