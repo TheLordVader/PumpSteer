@@ -30,11 +30,11 @@ _GROUPS = {
             for field in (
                 "name",
                 "entity",
-                "threshold",
                 "enabled",
-                "climate",
                 "profile",
+                "threshold",
                 "comfort_threshold",
+                "climate",
                 "notify_service",
                 "alarm_delay_minutes",
             )
@@ -83,8 +83,48 @@ _GROUPS = {
         "modbus_interval_minutes",
     },
 }
+# Each page owns exactly its fields, including optional values that can be cleared.
+_GROUPS["basic_settings"] = _GROUPS["basic"]
+_GROUPS["heat_sensors"] = _GROUPS["telemetry"]
+_GROUPS["ohmigo_settings"] = _GROUPS["ohmigo"]
+_GROUPS["temperature_sources"] = {
+    "indoor_temp_entity_2",
+    "indoor_temp_entity_3",
+    "indoor_temp_weight_1",
+    "indoor_temp_weight_2",
+    "indoor_temp_weight_3",
+    "outdoor_temp_entity_2",
+}
+_GROUPS["report_age"] = {
+    "temperature_report_max_age_minutes",
+    "outdoor_temperature_report_max_age_minutes",
+}
+_GROUPS["basic_settings"] -= _GROUPS["temperature_sources"] | _GROUPS["report_age"]
+_GROUPS["energy"] = {"thermal_power_entity", "thermal_energy_entities"}
+_GROUPS["heat_sensors"] -= _GROUPS["energy"]
+_GROUPS["heat_details"] = {
+    "thermal_compressor_entity",
+    "thermal_return_temp_entity",
+    "thermal_hot_water_mode_entity",
+}
+_GROUPS["heat_sensors"] -= _GROUPS["heat_details"]
+_GROUPS["generic_output"] = {
+    "modbus_service",
+    "modbus_payload_template",
+    "modbus_interval_minutes",
+}
+_GROUPS["ohmigo_settings"] -= _GROUPS["generic_output"]
+_GROUPS["zone_notifications"] = {"zone_notify_service"}
+for _i in range(1, 5):
+    _GROUPS[f"zone_{_i}"] = {k for k in _GROUPS["zones"] if k.startswith(f"zone_{_i}_")}
+
 _CLEARABLE = {
-    *[f"zone_{i}_{field}" for i in range(1, 5) for field in ("entity", "climate")],
+    *[
+        f"zone_{i}_{field}"
+        for i in range(1, 5)
+        for field in ("name", "entity", "climate", "notify_service")
+    ],
+    "zone_notify_service",
     "indoor_temp_entity_2",
     "indoor_temp_entity_3",
     "outdoor_temp_entity_2",
@@ -119,22 +159,71 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
         )
 
     async def async_step_basic(self, user_input=None):
-        return await self._section("basic", user_input)
+        return self.async_show_menu(
+            step_id="basic",
+            menu_options=["basic_settings", "temperature_sources", "report_age"],
+        )
+
+    async def async_step_basic_settings(self, user_input=None):
+        return await self._section("basic_settings", user_input)
 
     async def async_step_zones(self, user_input=None):
-        return await self._section("zones", user_input)
+        return self.async_show_menu(
+            step_id="zones",
+            menu_options=["zone_1", "zone_2", "zone_3", "zone_4", "zone_notifications"],
+        )
+
+    async def async_step_zone_1(self, user_input=None):
+        return await self._section("zone_1", user_input)
+
+    async def async_step_zone_2(self, user_input=None):
+        return await self._section("zone_2", user_input)
+
+    async def async_step_zone_3(self, user_input=None):
+        return await self._section("zone_3", user_input)
+
+    async def async_step_zone_4(self, user_input=None):
+        return await self._section("zone_4", user_input)
+
+    async def async_step_zone_notifications(self, user_input=None):
+        return await self._section("zone_notifications", user_input)
+
+    async def async_step_temperature_sources(self, user_input=None):
+        return await self._section("temperature_sources", user_input)
+
+    async def async_step_report_age(self, user_input=None):
+        return await self._section("report_age", user_input)
+
+    async def async_step_heat_details(self, user_input=None):
+        return await self._section("heat_details", user_input)
+
+    async def async_step_energy(self, user_input=None):
+        return await self._section("energy", user_input)
+
+    async def async_step_generic_output(self, user_input=None):
+        return await self._section("generic_output", user_input)
 
     async def async_step_thermal(self, user_input=None):
         return await self._section("thermal", user_input)
 
     async def async_step_telemetry(self, user_input=None):
-        return await self._section("telemetry", user_input)
+        return self.async_show_menu(
+            step_id="telemetry", menu_options=["heat_sensors", "heat_details", "energy"]
+        )
+
+    async def async_step_heat_sensors(self, user_input=None):
+        return await self._section("heat_sensors", user_input)
 
     async def async_step_notifications(self, user_input=None):
         return await self._section("notifications", user_input)
 
     async def async_step_ohmigo(self, user_input=None):
-        return await self._section("ohmigo", user_input)
+        return self.async_show_menu(
+            step_id="ohmigo", menu_options=["ohmigo_settings", "generic_output"]
+        )
+
+    async def async_step_ohmigo_settings(self, user_input=None):
+        return await self._section("ohmigo_settings", user_input)
 
     async def _section(self, section, user_input=None):
         """Save only the selected page while preserving all other options."""
@@ -156,7 +245,10 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
 
         if user_input is not None:
             try:
-                updated = {**entry.options, **user_input}
+                updated = {
+                    **entry.options,
+                    **{k: v for k, v in user_input.items() if k in _GROUPS[section]},
+                }
                 for key in _GROUPS[section] & _CLEARABLE:
                     if key not in user_input and current_data.get(key):
                         updated[key] = [] if key == "thermal_energy_entities" else ""
@@ -166,6 +258,32 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
                     for k, v in entity_errors.items()
                     if k in _GROUPS[section] or k == "base"
                 }
+
+                # Cross-page conflicts must be reported on the field being edited.
+                if section == "basic_settings":
+                    for key, primary in (
+                        ("indoor_temp_entity_2", "indoor_temp_entity"),
+                        ("indoor_temp_entity_3", "indoor_temp_entity"),
+                        ("outdoor_temp_entity_2", "real_outdoor_entity"),
+                    ):
+                        if (
+                            entity_errors.get(key) == "duplicate_temperature_sensor"
+                            and primary in user_input
+                        ):
+                            errors[primary] = "duplicate_temperature_sensor"
+                if (
+                    section == "heat_details"
+                    and entity_errors.get("thermal_heat_activity_entity")
+                    == "heat_signal_alias"
+                ):
+                    source = updated.get("thermal_heat_activity_entity")
+                    for key in (
+                        "thermal_compressor_entity",
+                        "thermal_heating_mode_entity",
+                        "thermal_hot_water_mode_entity",
+                    ):
+                        if key in user_input and updated.get(key) == source:
+                            errors[key] = "heat_signal_alias"
 
                 if not errors:
                     return self.async_create_entry(title="", data=updated)
@@ -471,11 +589,11 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
             for suffix in (
                 "name",
                 "entity",
-                "threshold",
                 "enabled",
-                "climate",
                 "profile",
+                "threshold",
                 "comfort_threshold",
+                "climate",
                 "notify_service",
                 "alarm_delay_minutes",
             ):
@@ -553,6 +671,21 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
             if getattr(k, "schema", k[0] if isinstance(k, tuple) else k)
             in _GROUPS[section]
         }
+        if section == "temperature_sources":
+            order = [
+                "indoor_temp_weight_1",
+                "indoor_temp_entity_2",
+                "indoor_temp_weight_2",
+                "indoor_temp_entity_3",
+                "indoor_temp_weight_3",
+                "outdoor_temp_entity_2",
+            ]
+            selected = dict(
+                sorted(
+                    selected.items(),
+                    key=lambda item: order.index(getattr(item[0], "schema", item[0])),
+                )
+            )
         return self.async_show_form(
             step_id=section, data_schema=vol.Schema(selected), errors=errors
         )

@@ -1193,23 +1193,38 @@ async def test_native_options_menu_preserves_other_pages(
         ("binary_sensor.radiator", "on", {}),
     ]:
         hass.states.async_set(entity, value, attrs)
+    details = await hass.config_entries.options.async_init(entry.entry_id)
+    details = await hass.config_entries.options.async_configure(
+        details["flow_id"], {"next_step_id": "telemetry"}
+    )
+    details = await hass.config_entries.options.async_configure(
+        details["flow_id"], {"next_step_id": "heat_details"}
+    )
+    details = await hass.config_entries.options.async_configure(
+        details["flow_id"],
+        {
+            "thermal_compressor_entity": "binary_sensor.compressor",
+            "thermal_return_temp_entity": "sensor.return",
+        },
+    )
+    assert details["type"] == "create_entry", details
     for method in ("automatic", "manual", "verified"):
         result = await hass.config_entries.options.async_init(entry.entry_id)
         result = await hass.config_entries.options.async_configure(
             result["flow_id"], {"next_step_id": "telemetry"}
         )
         result = await hass.config_entries.options.async_configure(
+            result["flow_id"], {"next_step_id": "heat_sensors"}
+        )
+        result = await hass.config_entries.options.async_configure(
             result["flow_id"],
             {
                 "thermal_detection_method": method,
                 "thermal_heat_activity_entity": "binary_sensor.heat",
-                "thermal_compressor_entity": "binary_sensor.compressor",
                 "thermal_supply_temp_entity": "sensor.supply",
-                "thermal_return_temp_entity": "sensor.return",
+                "thermal_supply_threshold": 30,
                 "thermal_heating_mode_entity": "binary_sensor.radiator",
                 "thermal_heating_mode_inverted": False,
-                "thermal_supply_threshold": 30,
-                "thermal_power_entity": "sensor.test_power",
             },
         )
         assert result["type"] == "create_entry", result
@@ -1231,10 +1246,12 @@ async def test_native_options_menu_preserves_other_pages(
         result["flow_id"], {"next_step_id": "telemetry"}
     )
     result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"next_step_id": "heat_sensors"}
+    )
+    result = await hass.config_entries.options.async_configure(
         result["flow_id"], {"thermal_detection_method": "automatic"}
     )
     assert result["type"] == "create_entry"
-    assert entry.options["thermal_power_entity"] == ""
     assert entry.options["notification_cooldown_minutes"] == "60"
     hass.states.async_set("number.test_output", "5")
     result = await hass.config_entries.options.async_init(entry.entry_id)
@@ -1248,6 +1265,9 @@ async def test_native_options_menu_preserves_other_pages(
     ]
     result = await hass.config_entries.options.async_configure(
         result["flow_id"], {"next_step_id": "ohmigo"}
+    )
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"next_step_id": "ohmigo_settings"}
     )
     result = await hass.config_entries.options.async_configure(
         result["flow_id"],
@@ -1343,30 +1363,42 @@ async def test_native_basic_temperature_redundancy_options(
     assert await async_setup_component(hass, "pumpsteer", {})
     await hass.async_block_till_done()
     menu = await hass.config_entries.options.async_init(entry.entry_id)
-    form = await hass.config_entries.options.async_configure(
+    menu = await hass.config_entries.options.async_configure(
         menu["flow_id"], {"next_step_id": "basic"}
+    )
+    form = await hass.config_entries.options.async_configure(
+        menu["flow_id"], {"next_step_id": "temperature_sources"}
     )
     assert form["type"] == "form"
     saved = await hass.config_entries.options.async_configure(
         form["flow_id"],
         {
-            "indoor_temp_entity": "sensor.room",
             "indoor_temp_entity_2": "sensor.room2",
             "indoor_temp_weight_1": 5,
             "indoor_temp_weight_2": 3,
             "indoor_temp_weight_3": 1,
-            "real_outdoor_entity": "sensor.outside",
             "outdoor_temp_entity_2": "sensor.backup",
-            "electricity_price_entity": "sensor.price",
-            "price_tomorrow_entity": "sensor.price",
-            "temperature_report_max_age_minutes": 360,
-            "outdoor_temperature_report_max_age_minutes": 75,
         },
     )
     assert saved["type"] == "create_entry", saved
     assert entry.options["indoor_temp_entity_2"] == "sensor.room2"
     assert entry.options["indoor_temp_weight_2"] == 3
     assert entry.options["outdoor_temp_entity_2"] == "sensor.backup"
+    menu = await hass.config_entries.options.async_init(entry.entry_id)
+    menu = await hass.config_entries.options.async_configure(
+        menu["flow_id"], {"next_step_id": "basic"}
+    )
+    form = await hass.config_entries.options.async_configure(
+        menu["flow_id"], {"next_step_id": "report_age"}
+    )
+    saved = await hass.config_entries.options.async_configure(
+        form["flow_id"],
+        {
+            "temperature_report_max_age_minutes": 360,
+            "outdoor_temperature_report_max_age_minutes": 75,
+        },
+    )
+    assert saved["type"] == "create_entry", saved
     assert entry.options["outdoor_temperature_report_max_age_minutes"] == 75
 
 
@@ -1415,6 +1447,9 @@ async def test_native_zone_options_and_passive_notifications(
     form = await hass.config_entries.options.async_init(entry.entry_id)
     form = await hass.config_entries.options.async_configure(
         form["flow_id"], {"next_step_id": "zones"}
+    )
+    form = await hass.config_entries.options.async_configure(
+        form["flow_id"], {"next_step_id": "zone_1"}
     )
     saved = await hass.config_entries.options.async_configure(
         form["flow_id"],
@@ -1587,3 +1622,63 @@ async def test_native_sparse_zone_reports(hass, freezer, interval):
     zone = controller.extra_state_attributes["extra_temperature_zones"]["1"]
     assert zone["alarm_active"]
     assert controller._pilot is None
+
+
+async def test_native_zone_pages_save_independently(
+    recorder_mock, hass, enable_custom_integrations, monkeypatch, tmp_path
+):
+    """Each zone form saves only its own optional fields in real HA."""
+    from custom_components.pumpsteer import pump_log
+
+    monkeypatch.setattr(pump_log, "_PUMP_LOG_PATH", str(tmp_path / "pump.log"))
+    await hass.async_start()
+    entry = MockConfigEntry(
+        domain="pumpsteer",
+        data={},
+        options={
+            "indoor_temp_entity": "sensor.room",
+            "real_outdoor_entity": "sensor.outside",
+            "electricity_price_entity": "sensor.price",
+            "price_tomorrow_entity": "sensor.price",
+            "zone_notify_service": "notify.shared",
+        },
+    )
+    entry.add_to_hass(hass)
+    for entity in (
+        "sensor.room",
+        "sensor.outside",
+        "sensor.price",
+        "sensor.z1",
+        "sensor.z2",
+        "sensor.z3",
+        "sensor.z4",
+    ):
+        hass.states.async_set(
+            entity, "10", {"unit_of_measurement": "°C", "device_class": "temperature"}
+        )
+    assert await async_setup_component(hass, "pumpsteer", {})
+    for i in range(1, 5):
+        form = await hass.config_entries.options.async_init(entry.entry_id)
+        form = await hass.config_entries.options.async_configure(
+            form["flow_id"], {"next_step_id": "zones"}
+        )
+        form = await hass.config_entries.options.async_configure(
+            form["flow_id"], {"next_step_id": f"zone_{i}"}
+        )
+        result = await hass.config_entries.options.async_configure(
+            form["flow_id"],
+            {
+                f"zone_{i}_entity": f"sensor.z{i}",
+                f"zone_{i}_name": f"Room {i}",
+                f"zone_{i}_enabled": True,
+                f"zone_{i}_profile": "comfort",
+                f"zone_{i}_threshold": 5,
+                f"zone_{i}_comfort_threshold": 18,
+                f"zone_{i}_alarm_delay_minutes": 15,
+                f"zone_{i}_notify_service": "",
+            },
+        )
+        assert result["type"] == "create_entry", result
+        assert entry.options["zone_notify_service"] == "notify.shared"
+        for saved in range(1, i + 1):
+            assert entry.options[f"zone_{saved}_entity"] == f"sensor.z{saved}"

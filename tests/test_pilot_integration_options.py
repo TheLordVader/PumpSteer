@@ -969,7 +969,8 @@ def test_options_offer_supply_mode_and_threshold(monkeypatch):
         lambda name, default=None, **kwargs: (name, default),
     )
     flow.async_show_form = lambda **kwargs: kwargs
-    schema = asyncio.run(flow.async_step_telemetry())["data_schema"]
+    schema = asyncio.run(flow.async_step_heat_sensors())["data_schema"]
+    details = asyncio.run(flow.async_step_heat_details())["data_schema"]
     assert any(
         key[0] == "thermal_supply_temp_entity"
         for key in schema
@@ -986,12 +987,12 @@ def test_options_offer_supply_mode_and_threshold(monkeypatch):
     )
     assert any(
         key[0] == "thermal_compressor_entity"
-        for key in schema
+        for key in details
         if isinstance(key, tuple)
     )
     assert any(
         key[0] == "thermal_return_temp_entity"
-        for key in schema
+        for key in details
         if isinstance(key, tuple)
     )
 
