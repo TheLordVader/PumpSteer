@@ -1702,3 +1702,114 @@ async def test_native_zone_profile_selector_translations(
         translations["component.pumpsteer.selector.zone_profile.options.comfort"]
         == "Komfort"
     )
+
+
+async def test_native_passive_heat_pump_telemetry_and_fault_notifications(
+    recorder_mock, hass, enable_custom_integrations, monkeypatch, tmp_path, freezer
+):
+    """Real HA options and reports feed diagnostics and deduplicated fault alerts."""
+    from custom_components.pumpsteer import pump_log
+
+    monkeypatch.setattr(pump_log, "_PUMP_LOG_PATH", str(tmp_path / "pump.log"))
+    freezer.move_to("2026-10-31T00:00:00+00:00")
+    await hass.async_start()
+    for entity, value in (
+        ("room", "21"),
+        ("outdoor", "0"),
+        ("supply", "30"),
+        ("return", "25"),
+        ("target", "32"),
+    ):
+        hass.states.async_set(f"sensor.{entity}", value, {"unit_of_measurement": "°C"})
+    hass.states.async_set("sensor.price", "1")
+    hass.states.async_set("sensor.balance", "800", {"unit_of_measurement": "GM"})
+    for entity in ("compressor", "brine", "hotwater", "heatpump_alarm"):
+        hass.states.async_set(f"binary_sensor.{entity}", "off")
+    received = []
+
+    async def notify(call):
+        received.append(call.data["message"])
+
+    hass.services.async_register("notify", "pump_test", notify)
+    entry = MockConfigEntry(
+        domain="pumpsteer",
+        data={},
+        options={
+            "indoor_temp_entity": "sensor.room",
+            "real_outdoor_entity": "sensor.outdoor",
+            "electricity_price_entity": "sensor.price",
+            "price_tomorrow_entity": "sensor.price",
+            "notify_service": "notify.pump_test",
+            "thermal_supply_temp_entity": "sensor.supply",
+            "thermal_return_temp_entity": "sensor.return",
+            "thermal_compressor_entity": "binary_sensor.compressor",
+            "thermal_hot_water_mode_entity": "binary_sensor.hotwater",
+        },
+    )
+    entry.add_to_hass(hass)
+    assert await async_setup_component(hass, "pumpsteer", {})
+    await hass.async_block_till_done()
+    flow = await hass.config_entries.options.async_init(entry.entry_id)
+    flow = await hass.config_entries.options.async_configure(
+        flow["flow_id"], {"next_step_id": "telemetry"}
+    )
+    assert "heat_pump_telemetry" in flow["menu_options"]
+    flow = await hass.config_entries.options.async_configure(
+        flow["flow_id"], {"next_step_id": "heat_pump_telemetry"}
+    )
+    assert flow["type"] == "form"
+    saved = await hass.config_entries.options.async_configure(
+        flow["flow_id"],
+        {
+            "thermal_balance_entity": "sensor.balance",
+            "thermal_balance_kind": "raw",
+            "thermal_supply_target_entity": "sensor.target",
+            "thermal_brine_pump_entity": "binary_sensor.brine",
+            "thermal_alarm_entity": "binary_sensor.heatpump_alarm",
+        },
+    )
+    assert saved["type"] == "create_entry", saved
+    assert entry.options["thermal_compressor_entity"] == "binary_sensor.compressor"
+    assert entry.options["notify_service"] == "notify.pump_test"
+    await hass.async_block_till_done()
+    controller = next(
+        e for e in hass.data[SENSOR].entities if e.unique_id == entry.entry_id
+    )
+    calls = []
+    hass.bus.async_listen(
+        "call_service",
+        lambda event: calls.append((event.data["domain"], event.data["service"])),
+    )
+    for minute, value in ((0, 800), (15, 750), (30, 700)):
+        freezer.move_to(f"2026-10-31T00:{minute:02d}:00+00:00")
+        hass.states.async_set(
+            "sensor.balance", str(value), {"unit_of_measurement": "GM"}
+        )
+        await controller.async_update()
+        await hass.async_block_till_done()
+    diag = controller._heatpump_diagnostics
+    assert diag["balance"]["value"] == 700
+    assert diag["balance"]["trend_per_hour"] == pytest.approx(-200)
+    assert diag["physical_heat_delivery"] == "unverified"
+    assert diag["temperatures"]["supply_difference_c"] == pytest.approx(-2)
+    freezer.tick(timedelta(seconds=1))
+    hass.states.async_set("binary_sensor.heatpump_alarm", "on")
+    await controller.async_update()
+    await hass.async_block_till_done()
+    await controller.async_update()
+    await hass.async_block_till_done()
+    assert len(received) == 1
+    freezer.tick(timedelta(seconds=1))
+    hass.states.async_set("binary_sensor.heatpump_alarm", "unavailable")
+    await controller.async_update()
+    await hass.async_block_till_done()
+    assert len(received) == 1
+    freezer.tick(timedelta(seconds=1))
+    hass.states.async_set("binary_sensor.heatpump_alarm", "off")
+    await controller.async_update()
+    await hass.async_block_till_done()
+    await controller.async_update()
+    await hass.async_block_till_done()
+    assert len(received) == 2
+    assert "återgått" in received[-1]
+    assert all(domain == "notify" for domain, service in calls)

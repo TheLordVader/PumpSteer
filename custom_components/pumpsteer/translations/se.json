@@ -56,7 +56,8 @@
         "menu_options": {
           "heat_sensors": "Analysmetod och huvudgivare",
           "energy": "El- och energimätning",
-          "heat_details": "Fler värmepumpsgivare"
+          "heat_details": "Fler värmepumpsgivare",
+          "heat_pump_telemetry": "Passiv värmepumpsdiagnostik"
         },
         "description": "Välj värmepumpsgivare eller frivillig energimätning."
       },
@@ -263,10 +264,10 @@
         },
         "data_description": {
           "thermal_heat_activity_entity": "En binär sensor där på betyder uppmätt värmetillförsel till huset och av betyder ingen. Kompressorstatus eller varmvattenläge räcker inte. Rapporttider bevisar inte fysisk mättid.",
-          "thermal_supply_temp_entity": "Välj en givare för radiatorkretsen. Temperaturen är en indikator, inte uppmätt värmeeffekt.",
+          "thermal_supply_temp_entity": "Välj en givare för radiatorkretsen. Den kan avläsas passivt utan radiatorläge. Temperaturen bevisar inte levererad värme.",
           "thermal_supply_threshold": "Anpassa till värmesystemet. Fel tröskel kan ge felaktig värmeindikation.",
           "thermal_detection_method": "Automatisk använder kvalificerade signaler och visar osäkerhet. Manuell behåller tröskeln.",
-          "thermal_heating_mode_entity": "Välj ett verifierat radiatorläge. Krävs för framledningsindikatorn.",
+          "thermal_heating_mode_entity": "Verifierat radiatorläge krävs för den manuella framledningsindikatorn, men inte för passiv temperaturavläsning.",
           "thermal_heating_mode_inverted": "Aktivera endast om av betyder radiatorläge. Okänd eller gammal status stoppar inlärning."
         },
         "description": "Valfri övervakning. Automatic använder tillgängliga indikationer; Manual använder vald framledningsgivare och tröskel; Verified kräver en tillförlitlig binär värmesignal. Kompressor och elförbrukning bevisar inte radiatorvärme. Valen aktiverar ingen styrning."
@@ -298,6 +299,32 @@
           "thermal_compressor_entity": "Kompressorstatus ensam bevisar inte radiatorvärme.",
           "thermal_return_temp_entity": "Används endast tillsammans med andra kvalificerade signaler."
         }
+      },
+      "heat_pump_telemetry": {
+        "title": "Passiv värmepumpsdiagnostik",
+        "description": "Alla givare är frivilliga. Här visas passiva observationer och eventuella fellarm; ingen värmepumpsstyrning ändras. Kompressor, framledning, retur och varmvatten väljs på de andra givarsidorna.",
+        "data": {
+          "thermal_balance_entity": "Intern värmebalans",
+          "thermal_balance_kind": "Typ av värmebalans",
+          "thermal_supply_target_entity": "Framledningens börvärde",
+          "thermal_brine_pump_entity": "Köldbärarpump",
+          "thermal_circulation_pump_entity": "Radiatorernas cirkulationspump",
+          "thermal_brine_in_entity": "Köldbärare in",
+          "thermal_brine_out_entity": "Köldbärare ut",
+          "thermal_aux_heat_entity": "Eltillskott",
+          "thermal_alarm_entity": "Aktivt värmepumpslarm"
+        },
+        "data_description": {
+          "thermal_balance_entity": "Välj en numerisk givare om värdet finns. Ingen skalning eller teckentolkning antas.",
+          "thermal_balance_kind": "Välj gradminuter eller integral endast när betydelsen är verifierad; annars välj rått värde. Ingen startgräns antas.",
+          "thermal_supply_target_entity": "Värmepumpens begärda framledningstemperatur, inte en rumstemperatur eller larmgräns.",
+          "thermal_brine_pump_entity": "Binär status för köldbärarpumpen. Anger inte ensam värmeleverans.",
+          "thermal_circulation_pump_entity": "Binär status för radiatorernas cirkulationspump. Anger inte ensam värmeleverans.",
+          "thermal_brine_in_entity": "Temperaturgivare för inkommande köldbärare.",
+          "thermal_brine_out_entity": "Temperaturgivare för utgående köldbärare.",
+          "thermal_aux_heat_entity": "Binär signal för aktivt eltillskott.",
+          "thermal_alarm_entity": "Binär signal för aktivt fellarm. Notis använder den ordinarie PumpSteer-mottagaren om den är inställd."
+        }
       }
     },
     "error": {
@@ -307,7 +334,8 @@
       "entity_unavailable": "Entiteten är otillgänglig",
       "invalid_notification_setting": "Ogiltig notisinställning",
       "invalid_detection_method": "Ogiltig metod för värmedetektering.",
-      "heat_signal_alias": "Värmesignalen måste vara en separat indikator för radiatorvärme."
+      "heat_signal_alias": "Värmesignalen måste vara en separat indikator för radiatorvärme.",
+      "invalid_balance_kind": "Välj en giltig typ av värmebalans."
     }
   },
   "entity": {
@@ -346,6 +374,14 @@
       "options": {
         "maintenance": "Underhållsvärme",
         "comfort": "Komfort"
+      }
+    },
+    "thermal_balance_kind": {
+      "options": {
+        "unconfigured": "Inte valt",
+        "raw": "Rått värde (okänd innebörd)",
+        "degree_minutes": "Gradminuter (verifierade)",
+        "integral": "Integral (verifierad)"
       }
     }
   }

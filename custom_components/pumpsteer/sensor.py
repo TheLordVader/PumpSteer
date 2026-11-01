@@ -102,6 +102,20 @@ _RESTORE_BRAKE_LAST_T = "brake_last_t"
 _RESTORE_BRAKE_LAST_EXPENSIVE_T = "brake_last_expensive_t"
 _RESTORE_WAS_BRAKING = "was_braking_last_cycle"
 
+_PASSIVE_HEATPUMP_OPTIONS = frozenset(
+    {
+        "thermal_balance_entity",
+        "thermal_balance_kind",
+        "thermal_supply_target_entity",
+        "thermal_brine_pump_entity",
+        "thermal_circulation_pump_entity",
+        "thermal_brine_in_entity",
+        "thermal_brine_out_entity",
+        "thermal_aux_heat_entity",
+        "thermal_alarm_entity",
+    }
+)
+
 
 class PumpSteerSensor(RestoreEntity):
     """
@@ -129,6 +143,8 @@ class PumpSteerSensor(RestoreEntity):
             "thermal_intelligence_plan_detail",
             "thermal_intelligence_plan_outcomes",
             "extra_temperature_zones",
+            "heat_pump_telemetry",
+            "heat_pump_alarm",
             "thermal_fixed_horizon_audit",
             "thermal_intelligence_grid_marginal",
         }
@@ -138,7 +154,9 @@ class PumpSteerSensor(RestoreEntity):
         self.hass = hass
         self._config_entry = config_entry
         self._control_config = {
-            k: v for k, v in self._cfg().items() if not k.startswith("zone_")
+            k: v
+            for k, v in self._cfg().items()
+            if not k.startswith("zone_") and k not in _PASSIVE_HEATPUMP_OPTIONS
         }
         self._state: Optional[float] = None
         self._attributes: Dict[str, Any] = {}
@@ -279,8 +297,14 @@ class PumpSteerSensor(RestoreEntity):
     def extra_state_attributes(self) -> dict:
         attrs = {**self._attributes}
         attrs.pop("extra_temperature_zones", None)
+        attrs.pop("heat_pump_telemetry", None)
+        attrs.pop("heat_pump_alarm", None)
         if getattr(self, "_zone_diagnostics", None):
             attrs["extra_temperature_zones"] = self._zone_diagnostics
+        if getattr(self, "_heatpump_diagnostics", None) is not None:
+            attrs["heat_pump_telemetry"] = self._heatpump_diagnostics
+        if getattr(self, "_heatpump_alarm_status", None):
+            attrs["heat_pump_alarm"] = self._heatpump_alarm_status
         if hasattr(self, "_temperature_coverage"):
             attrs["temperature_sources"] = self._temperature_coverage
         for key in (
@@ -462,8 +486,10 @@ class PumpSteerSensor(RestoreEntity):
                 brake_last_expensive_t,
                 was_braking,
                 zones,
+                heat_alarm,
             ):
                 self.zones = zones
+                self.heat_alarm = heat_alarm
                 self.brake_ramp = brake_ramp
                 self.brake_last_t = brake_last_t
                 self.brake_last_expensive_t = brake_last_expensive_t
@@ -472,6 +498,7 @@ class PumpSteerSensor(RestoreEntity):
             def as_dict(self):
                 return {
                     "extra_temperature_zones": self.zones,
+                    "heat_pump_alarm": self.heat_alarm,
                     _RESTORE_WAS_BRAKING: self.was_braking,
                     _RESTORE_BRAKE_RAMP: self.brake_ramp,
                     _RESTORE_BRAKE_LAST_T: (
@@ -490,6 +517,11 @@ class PumpSteerSensor(RestoreEntity):
             self._brake_last_expensive_t,
             self._was_braking_last_cycle,
             getattr(self, "_zone_diagnostics", getattr(self, "_zone_restore", {})),
+            getattr(
+                self,
+                "_heatpump_alarm_status",
+                getattr(self, "_heatpump_alarm_restore", {}),
+            ),
         )
 
     async def async_added_to_hass(self) -> None:
@@ -521,6 +553,7 @@ class PumpSteerSensor(RestoreEntity):
         if extra is not None:
             data = extra.as_dict()
             self._zone_restore = data.get("extra_temperature_zones", {})
+            self._heatpump_alarm_restore = data.get("heat_pump_alarm", {})
             # Older timestamps also record pre-brake/precool requests, so they
             # cannot prove that an expensive braking phase actually occurred.
             self._was_braking_last_cycle = data.get(_RESTORE_WAS_BRAKING) is True
@@ -587,6 +620,10 @@ class PumpSteerSensor(RestoreEntity):
     async def async_will_remove_from_hass(self) -> None:
         """Cancel options update listener on unload."""
         self._temperature_unloaded = True
+        alarm_task = getattr(self, "_heatpump_alarm_task", None)
+        if alarm_task is not None:
+            alarm_task.cancel()
+            await asyncio.gather(alarm_task, return_exceptions=True)
         pending = list(getattr(self, "_zone_notify_tasks", {}).values())
         for _, task in pending:
             task.cancel()
@@ -616,7 +653,9 @@ class PumpSteerSensor(RestoreEntity):
         """Handle updated options."""
         self._config_entry = entry
         control_config = {
-            k: v for k, v in self._cfg().items() if not k.startswith("zone_")
+            k: v
+            for k, v in self._cfg().items()
+            if not k.startswith("zone_") and k not in _PASSIVE_HEATPUMP_OPTIONS
         }
         if control_config == self._control_config:
             if self._update_in_progress:
@@ -1659,6 +1698,115 @@ class PumpSteerSensor(RestoreEntity):
                 "Zone notification failed for slot %s", alert["slot"], exc_info=True
             )
 
+    async def _send_heatpump_alarm(self, monitor, event, service, generation):
+        try:
+            if self._temperature_unloaded or not monitor.current(event):
+                return
+            domain, name = (
+                service.split(".", 1) if "." in service else ("notify", service)
+            )
+            async with asyncio.timeout(30):
+                await self.hass.services.async_call(
+                    domain,
+                    name,
+                    {
+                        "title": "PumpSteer",
+                        "message": "Värmepumpen rapporterar ett aktivt fellarm."
+                        if event == "alarm"
+                        else "Värmepumpens fellarm har återgått.",
+                    },
+                    blocking=True,
+                )
+            if getattr(
+                self, "_heatpump_alarm", None
+            ) is monitor and monitor.mark_delivered(event, generation):
+                self._heatpump_alarm_status = {
+                    **self._heatpump_alarm_status,
+                    "sent": monitor.sent,
+                    "recovery_pending": monitor.recovery_pending,
+                }
+                async_dispatcher_send(self.hass, self._input_temperature_signal)
+                if getattr(self, "platform", None) is not None:
+                    self.async_write_ha_state()
+        except Exception:
+            _LOGGER.warning("Heat pump alarm notification failed", exc_info=True)
+
+    def _observe_heatpump(self, now, cfg):
+        """Read optional diagnostics and fault state; never influence control."""
+        alarm_entity = cfg.get("thermal_alarm_entity")
+        if alarm_entity:
+            from .heatpump_alarm import HeatPumpAlarm
+
+            monitor = getattr(self, "_heatpump_alarm", None)
+            if monitor is None or monitor.entity != alarm_entity:
+                task = getattr(self, "_heatpump_alarm_task", None)
+                if task is not None:
+                    task.cancel()
+                monitor = self._heatpump_alarm = HeatPumpAlarm(
+                    alarm_entity,
+                    getattr(self, "_heatpump_alarm_restore", None),
+                    self._temperature_reported_after,
+                )
+                self._heatpump_alarm_restore = {}
+            self._heatpump_alarm_status, event = monitor.observe(
+                now, self.hass.states.get(alarm_entity)
+            )
+            task = getattr(self, "_heatpump_alarm_task", None)
+            service = cfg.get("notify_service")
+            if event and service and (task is None or task.done()):
+                create_task = getattr(
+                    self.hass, "async_create_task", asyncio.create_task
+                )
+                self._heatpump_alarm_event = event
+                self._heatpump_alarm_task = create_task(
+                    self._send_heatpump_alarm(
+                        monitor, event, service, monitor.generation
+                    )
+                )
+        else:
+            task = getattr(self, "_heatpump_alarm_task", None)
+            if task is not None:
+                task.cancel()
+            self._heatpump_alarm = None
+            self._heatpump_alarm_status = {}
+            self._heatpump_alarm_restore = {}
+
+        keys = {
+            "balance": "thermal_balance_entity",
+            "supply_target": "thermal_supply_target_entity",
+            "supply": "thermal_supply_temp_entity",
+            "return": "thermal_return_temp_entity",
+            "compressor": "thermal_compressor_entity",
+            "hot_water": "thermal_hot_water_mode_entity",
+            "brine_pump": "thermal_brine_pump_entity",
+            "circulation_pump": "thermal_circulation_pump_entity",
+            "brine_in": "thermal_brine_in_entity",
+            "brine_out": "thermal_brine_out_entity",
+            "auxiliary": "thermal_aux_heat_entity",
+        }
+        if any(cfg.get(k) for k in keys.values()):
+            from .heatpump_telemetry import HeatPumpTelemetry
+
+            signature = tuple(cfg.get(k) for k in keys.values()) + (
+                cfg.get("thermal_balance_kind"),
+            )
+            if getattr(self, "_heatpump_signature", None) != signature:
+                self._heatpump_telemetry = HeatPumpTelemetry()
+                self._heatpump_signature = signature
+            states = {
+                key: self.hass.states.get(cfg.get(option)) if cfg.get(option) else None
+                for key, option in keys.items()
+            }
+            self._heatpump_diagnostics = self._heatpump_telemetry.observe(
+                now,
+                states,
+                balance_kind=cfg.get("thermal_balance_kind"),
+                configured={key for key, option in keys.items() if cfg.get(option)},
+            )
+        else:
+            self._heatpump_diagnostics = None
+            self._heatpump_signature = None
+
     async def _do_update(self) -> None:
         """Run the main control state machine."""
         now = dt_util.now()
@@ -1673,6 +1821,11 @@ class PumpSteerSensor(RestoreEntity):
         if self._preheat_last_t is None or preheat_dt_seconds > 0.0:
             self._preheat_last_t = now
         cfg = self._cfg()
+
+        try:
+            self._observe_heatpump(now, cfg)
+        except Exception:
+            _LOGGER.exception("Passive heat pump telemetry failed")
 
         self._update_outdoor_selection(cfg)
 
@@ -4719,7 +4872,9 @@ class PumpSteerThermalStatusSensor(SensorEntity):
 
     _attr_has_entity_name = True
     _attr_should_poll = False
-    _unrecorded_attributes = frozenset({"extra_temperature_zones"})
+    _unrecorded_attributes = frozenset(
+        {"extra_temperature_zones", "heat_pump_telemetry", "heat_pump_alarm"}
+    )
     _attr_translation_key = "thermal_intelligence"
     _attr_icon = "mdi:brain"
     _attr_device_class = "enum"
@@ -4812,6 +4967,10 @@ class PumpSteerThermalStatusSensor(SensorEntity):
         }
         if getattr(controller, "_zone_diagnostics", None):
             summary["extra_temperature_zones"] = controller._zone_diagnostics
+        if getattr(controller, "_heatpump_diagnostics", None) is not None:
+            summary["heat_pump_telemetry"] = controller._heatpump_diagnostics
+        if getattr(controller, "_heatpump_alarm_status", None):
+            summary["heat_pump_alarm"] = controller._heatpump_alarm_status
         if state != self._attr_native_value or summary != self._summary:
             self._attr_native_value = state
             self._summary = summary

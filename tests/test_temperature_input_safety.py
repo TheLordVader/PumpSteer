@@ -730,6 +730,49 @@ def test_zone_only_options_do_not_reset_control_learning(control, monkeypatch):
     assert sensor._pilot is pilot
 
 
+def test_passive_heatpump_options_do_not_reset_control_learning(control, monkeypatch):
+    sensor, states, clock = control
+
+    async def update():
+        pass
+
+    monkeypatch.setattr(sensor, "async_update", update)
+    asyncio.run(sensor.async_options_update_listener(sensor.hass, sensor._config_entry))
+    pilot = sensor._pilot = object()
+    sensor._config_entry.options["thermal_balance_entity"] = "sensor.balance"
+    asyncio.run(sensor.async_options_update_listener(sensor.hass, sensor._config_entry))
+    assert sensor._pilot is pilot
+
+
+def test_removed_heatpump_options_do_not_keep_restored_diagnostics(control):
+    sensor, states, clock = control
+    sensor._attributes["heat_pump_telemetry"] = {"operation": "compressor_running"}
+    sensor._attributes["heat_pump_alarm"] = {"active": True}
+    asyncio.run(sensor.async_update())
+    assert "heat_pump_telemetry" not in sensor.extra_state_attributes
+    assert "heat_pump_alarm" not in sensor.extra_state_attributes
+
+
+def test_existing_compressor_and_missing_configured_brine_are_observed(control):
+    sensor, states, clock = control
+    states["binary_sensor.compressor"] = SimpleNamespace(
+        state="on", attributes={}, last_reported=clock[0]
+    )
+    sensor._config_entry.options["thermal_compressor_entity"] = (
+        "binary_sensor.compressor"
+    )
+    asyncio.run(sensor.async_update())
+    assert (
+        sensor.extra_state_attributes["heat_pump_telemetry"]["operation"]
+        == "compressor_running"
+    )
+    sensor._config_entry.options["thermal_brine_pump_entity"] = "binary_sensor.missing"
+    asyncio.run(sensor.async_update())
+    assert (
+        sensor.extra_state_attributes["heat_pump_telemetry"]["operation"] == "unknown"
+    )
+
+
 def test_removed_zones_do_not_keep_restored_diagnostics(control):
     sensor, states, clock = control
     sensor._attributes["extra_temperature_zones"] = {"1": {"alarm_active": True}}
@@ -823,3 +866,75 @@ def test_weighted_temperature_has_consistent_report_and_component_freshness(cont
     states["sensor.indoor"].last_reported = clock[0] - timedelta(minutes=6)
     state = sensor._temperature_state(sensor._cfg(), "indoor_temp_entity")
     assert PilotPassive._report(state, clock[0], temperature=True) is None
+
+
+def test_heat_pump_fault_notifies_once_and_does_not_change_control(control):
+    sensor, states, clock = control
+    sensor._config_entry.options.update(
+        thermal_alarm_entity="binary_sensor.fault", notify_service="notify.family"
+    )
+    states["binary_sensor.fault"] = SimpleNamespace(
+        state="on", attributes={}, last_reported=clock[0]
+    )
+
+    async def scenario():
+        _report(states, clock)
+        await sensor.async_update()
+        await asyncio.sleep(0)
+        assert sensor.extra_state_attributes["mode"] == MODE_PI
+        assert sensor.extra_state_attributes["heat_pump_alarm"]["active"]
+        await sensor.async_update()
+        await asyncio.sleep(0)
+        assert len([c for c in sensor.hass.services.calls if c[0] == "notify"]) == 1
+        clock[0] += timedelta(minutes=1)
+        _report(states, clock)
+        states["binary_sensor.fault"].state = "off"
+        states["binary_sensor.fault"].last_reported = clock[0]
+        await sensor.async_update()
+        await asyncio.sleep(0)
+        assert len([c for c in sensor.hass.services.calls if c[0] == "notify"]) == 2
+
+    asyncio.run(scenario())
+
+
+def test_heat_pump_fault_recovery_waits_for_inflight_alarm(control, monkeypatch):
+    sensor, states, clock = control
+    sensor._config_entry.options.update(
+        thermal_alarm_entity="binary_sensor.fault", notify_service="notify.family"
+    )
+    states["binary_sensor.fault"] = SimpleNamespace(
+        state="on", attributes={}, last_reported=clock[0]
+    )
+
+    async def scenario():
+        delivered = []
+        started = asyncio.Event()
+        release = asyncio.Event()
+        original = sensor.hass.services.async_call
+
+        async def slow_notify(domain, service, data, blocking=False):
+            if domain == "notify":
+                delivered.append(data["message"])
+                if len(delivered) == 1:
+                    started.set()
+                    await release.wait()
+            else:
+                await original(domain, service, data, blocking=blocking)
+
+        monkeypatch.setattr(sensor.hass.services, "async_call", slow_notify)
+        _report(states, clock)
+        await sensor.async_update()
+        await started.wait()
+        clock[0] += timedelta(seconds=1)
+        states["binary_sensor.fault"].state = "off"
+        states["binary_sensor.fault"].last_reported = clock[0]
+        await sensor.async_update()
+        release.set()
+        await sensor._heatpump_alarm_task
+        assert sensor._heatpump_alarm.recovery_pending
+        await sensor.async_update()
+        await sensor._heatpump_alarm_task
+        assert len(delivered) == 2
+        assert "återgått" in delivered[-1]
+
+    asyncio.run(scenario())

@@ -108,6 +108,17 @@ _GROUPS["heat_details"] = {
     "thermal_hot_water_mode_entity",
 }
 _GROUPS["heat_sensors"] -= _GROUPS["heat_details"]
+_GROUPS["heat_pump_telemetry"] = {
+    "thermal_balance_entity",
+    "thermal_balance_kind",
+    "thermal_supply_target_entity",
+    "thermal_brine_pump_entity",
+    "thermal_circulation_pump_entity",
+    "thermal_brine_in_entity",
+    "thermal_brine_out_entity",
+    "thermal_aux_heat_entity",
+    "thermal_alarm_entity",
+}
 _GROUPS["generic_output"] = {
     "modbus_service",
     "modbus_payload_template",
@@ -139,6 +150,7 @@ _CLEARABLE = {
     "thermal_hot_water_mode_entity",
     "thermal_compressor_entity",
     "thermal_return_temp_entity",
+    *(_GROUPS["heat_pump_telemetry"] - {"thermal_balance_kind"}),
 }
 
 
@@ -197,6 +209,9 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
     async def async_step_heat_details(self, user_input=None):
         return await self._section("heat_details", user_input)
 
+    async def async_step_heat_pump_telemetry(self, user_input=None):
+        return await self._section("heat_pump_telemetry", user_input)
+
     async def async_step_energy(self, user_input=None):
         return await self._section("energy", user_input)
 
@@ -208,7 +223,13 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
 
     async def async_step_telemetry(self, user_input=None):
         return self.async_show_menu(
-            step_id="telemetry", menu_options=["heat_sensors", "heat_details", "energy"]
+            step_id="telemetry",
+            menu_options=[
+                "heat_sensors",
+                "heat_details",
+                "heat_pump_telemetry",
+                "energy",
+            ],
         )
 
     async def async_step_heat_sensors(self, user_input=None):
@@ -407,6 +428,37 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
                     }
                 }
             ),
+            vol.Optional(
+                "thermal_balance_kind",
+                default=current_data.get("thermal_balance_kind", "unconfigured"),
+            ): selector(
+                {
+                    "select": {
+                        "options": [
+                            "unconfigured",
+                            "raw",
+                            "degree_minutes",
+                            "integral",
+                        ],
+                        "translation_key": "thermal_balance_kind",
+                    }
+                }
+            ),
+            **{
+                vol.Optional(
+                    key, description={"suggested_value": current_data.get(key)}
+                ): selector({"entity": {"domain": domain}})
+                for key, domain in (
+                    ("thermal_balance_entity", "sensor"),
+                    ("thermal_supply_target_entity", "sensor"),
+                    ("thermal_brine_in_entity", "sensor"),
+                    ("thermal_brine_out_entity", "sensor"),
+                    ("thermal_brine_pump_entity", "binary_sensor"),
+                    ("thermal_circulation_pump_entity", "binary_sensor"),
+                    ("thermal_aux_heat_entity", "binary_sensor"),
+                    ("thermal_alarm_entity", "binary_sensor"),
+                )
+            },
             vol.Optional(
                 "thermal_compressor_entity",
                 description={
@@ -781,6 +833,13 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
         method = user_input.get("thermal_detection_method")
         if method and method not in {"automatic", "manual", "verified"}:
             errors["thermal_detection_method"] = "invalid_detection_method"
+        if user_input.get("thermal_balance_kind", "unconfigured") not in {
+            "unconfigured",
+            "raw",
+            "degree_minutes",
+            "integral",
+        }:
+            errors["thermal_balance_kind"] = "invalid_balance_kind"
         if method == "verified" and not heat:
             errors["thermal_heat_activity_entity"] = "required"
         if (
@@ -804,6 +863,14 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
             errors["thermal_heat_activity_entity"] = "entity_not_found"
 
         for key, domain in (
+            ("thermal_balance_entity", "sensor."),
+            ("thermal_supply_target_entity", "sensor."),
+            ("thermal_brine_in_entity", "sensor."),
+            ("thermal_brine_out_entity", "sensor."),
+            ("thermal_brine_pump_entity", "binary_sensor."),
+            ("thermal_circulation_pump_entity", "binary_sensor."),
+            ("thermal_aux_heat_entity", "binary_sensor."),
+            ("thermal_alarm_entity", "binary_sensor."),
             ("thermal_power_entity", "sensor."),
             ("thermal_hot_water_mode_entity", "binary_sensor."),
             ("thermal_supply_temp_entity", "sensor."),
@@ -831,8 +898,7 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
             )
         ):
             errors["thermal_energy_entities"] = "entity_not_found"
-        supply = user_input.get("thermal_supply_temp_entity")
-        if supply and not user_input.get("thermal_heating_mode_entity"):
+        if method == "manual" and not user_input.get("thermal_heating_mode_entity"):
             errors["thermal_heating_mode_entity"] = "entity_not_found"
 
         # ohmigo_entity is optional — validate only if set

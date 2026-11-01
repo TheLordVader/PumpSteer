@@ -402,3 +402,92 @@ def test_legacy_data_heat_signal_alias_is_rejected(monkeypatch):
     )
     assert result["type"] == "form"
     assert result["errors"]["thermal_compressor_entity"] == "heat_signal_alias"
+
+
+def test_optional_heat_pump_telemetry_preserves_existing_options_and_can_clear():
+    flow = PumpSteerOptionsFlowHandler()
+    flow.config_entry = SimpleNamespace(
+        data={"thermal_balance_entity": "sensor.old"},
+        options={
+            "thermal_compressor_entity": "binary_sensor.compressor",
+            "notify_service": "notify.family",
+        },
+    )
+    flow.hass = SimpleNamespace(states=SimpleNamespace(async_all=lambda domain: []))
+    flow._validate_entities = lambda data: {}
+    flow.async_create_entry = lambda **kwargs: kwargs
+    result = asyncio.run(
+        flow.async_step_heat_pump_telemetry(
+            {
+                "thermal_balance_kind": "integral",
+                "thermal_supply_target_entity": "sensor.target",
+                "thermal_alarm_entity": "binary_sensor.alarm",
+            }
+        )
+    )
+    assert result["data"]["thermal_balance_entity"] == ""
+    assert result["data"]["thermal_supply_target_entity"] == "sensor.target"
+    assert result["data"]["thermal_alarm_entity"] == "binary_sensor.alarm"
+    assert result["data"]["thermal_balance_kind"] == "integral"
+    assert result["data"]["thermal_compressor_entity"] == "binary_sensor.compressor"
+    assert result["data"]["notify_service"] == "notify.family"
+
+
+def test_heat_pump_telemetry_menu_and_invalid_entity_validation():
+    flow = PumpSteerOptionsFlowHandler()
+    flow.async_show_menu = lambda **kwargs: kwargs
+    assert (
+        "heat_pump_telemetry"
+        in asyncio.run(flow.async_step_telemetry())["menu_options"]
+    )
+    flow.hass = SimpleNamespace(
+        states=SimpleNamespace(get=lambda entity: SimpleNamespace(state="10"))
+    )
+    errors = flow._validate_entities(
+        {
+            "thermal_balance_entity": "switch.nope",
+            "thermal_alarm_entity": "climate.nope",
+            "thermal_balance_kind": "bogus",
+        }
+    )
+    assert errors["thermal_balance_entity"] == "entity_not_found"
+    assert errors["thermal_alarm_entity"] == "entity_not_found"
+    assert errors["thermal_balance_kind"] == "invalid_balance_kind"
+
+
+def test_automatic_supply_sensor_can_be_saved_without_radiator_signal():
+    flow = PumpSteerOptionsFlowHandler()
+    flow.config_entry = SimpleNamespace(
+        data={}, options={"notify_service": "notify.me"}
+    )
+    flow.hass = SimpleNamespace(
+        states=SimpleNamespace(
+            async_all=lambda domain: [], get=lambda entity: SimpleNamespace(state="20")
+        )
+    )
+    flow.async_create_entry = lambda **kwargs: {"type": "create_entry", **kwargs}
+    saved = asyncio.run(
+        flow.async_step_heat_sensors(
+            {
+                "thermal_detection_method": "automatic",
+                "thermal_supply_temp_entity": "sensor.supply",
+            }
+        )
+    )
+    assert saved["type"] == "create_entry"
+    assert saved["data"]["thermal_supply_temp_entity"] == "sensor.supply"
+    assert saved["data"]["notify_service"] == "notify.me"
+
+
+def test_manual_method_requires_supply_sensor():
+    flow = PumpSteerOptionsFlowHandler()
+    flow.hass = SimpleNamespace(
+        states=SimpleNamespace(get=lambda entity: SimpleNamespace(state="on"))
+    )
+    errors = flow._validate_entities(
+        {
+            "thermal_detection_method": "manual",
+            "thermal_heating_mode_entity": "binary_sensor.radiator",
+        }
+    )
+    assert errors["thermal_supply_temp_entity"] == "required"
