@@ -75,6 +75,7 @@ class ControlReplayInput:
     outlook: Any
     preheat_enabled: bool
     prices_available: bool = True
+    control_observation_states: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -122,6 +123,7 @@ class _Scratch:
 
     def __init__(self, state, inputs):
         self._control_passive = True
+        self._control_observation_states = inputs.control_observation_states or {}
         self._pi = copy.deepcopy(state.pi)
         self._pi.emit_log = False
         self._pi_precool_paused = state.pi_precool_paused
@@ -177,6 +179,8 @@ class _Scratch:
 
     async def _set_state(self, fake_temp, mode, attrs, now):
         self._close_short_dip(mode)
+        if getattr(self, "_control_intelligence", None) is not None:
+            attrs["control_intelligence"] = self._control_intelligence
         self._decision = ControlReplayDecision(
             fake_temp, mode, attrs, tuple(self._intentions)
         )

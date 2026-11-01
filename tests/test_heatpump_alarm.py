@@ -78,3 +78,29 @@ def test_delayed_prior_generation_cannot_acknowledge_new_alarm_or_recovery():
     assert not monitor.mark_delivered("alarm", old_generation)
     assert monitor.observe(state.last_reported, state)[1] == "alarm"
     assert not monitor.mark_delivered("recovery", old_generation)
+
+
+def test_live_active_fault_before_integration_load_is_not_suppressed():
+    now = datetime(2026, 11, 1, tzinfo=timezone.utc)
+    monitor = HeatPumpAlarm(
+        "binary_sensor.fault",
+        {
+            "entity": "binary_sensor.fault",
+            "active": False,
+            "sent": False,
+        },
+        started_at=now,
+    )
+    state = SimpleNamespace(
+        state="on", attributes={}, last_reported=now - timedelta(seconds=10)
+    )
+    assert monitor.observe(now, state)[1] == "alarm"
+
+
+def test_restored_active_fault_is_not_new_evidence():
+    now = datetime(2026, 11, 1, tzinfo=timezone.utc)
+    monitor = HeatPumpAlarm("binary_sensor.fault", started_at=now)
+    state = SimpleNamespace(
+        state="on", attributes={"restored": True}, last_reported=now
+    )
+    assert monitor.observe(now, state)[1] is None

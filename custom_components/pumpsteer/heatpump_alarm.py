@@ -14,6 +14,7 @@ class HeatPumpAlarm:
         self.active = saved.get("active") is True
         self.sent = saved.get("sent") is True
         self.recovery_pending = saved.get("recovery_pending") is True
+        self.persistent = saved.get("persistent") is True
         self.generation = 0
         self.started_at = started_at if saved else None
         self.status = "unknown"
@@ -33,6 +34,7 @@ class HeatPumpAlarm:
                 <= timedelta(minutes=60).total_seconds()
                 and (
                     self.started_at is None
+                    or state.state == "on"
                     or report.timestamp() > self.started_at.timestamp()
                 )
             )
@@ -62,6 +64,7 @@ class HeatPumpAlarm:
             "status": self.status,
             "active": self.active,
             "sent": self.sent,
+            "persistent": self.persistent,
             "recovery_pending": self.recovery_pending,
         }, event
 

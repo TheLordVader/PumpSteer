@@ -491,3 +491,212 @@ def test_manual_method_requires_supply_sensor():
         }
     )
     assert errors["thermal_supply_temp_entity"] == "required"
+
+
+def _control_options_flow():
+    flow = PumpSteerOptionsFlowHandler()
+    flow.config_entry = SimpleNamespace(data={}, options={})
+    flow.hass = SimpleNamespace(
+        states=SimpleNamespace(
+            async_all=lambda domain: [],
+            get=lambda entity: SimpleNamespace(state="on"),
+        )
+    )
+    flow.async_create_entry = lambda **kwargs: {"type": "create_entry", **kwargs}
+    flow.async_show_form = lambda **kwargs: {"type": "form", **kwargs}
+    return flow
+
+
+def test_control_pages_preserve_other_options_and_legacy_sensors():
+    flow = _control_options_flow()
+    flow.config_entry.data = {
+        "thermal_aux_heat_entity": "binary_sensor.aux",
+        "thermal_compressor_entity": "binary_sensor.compressor",
+        "thermal_heating_mode_entity": "binary_sensor.heating",
+        "thermal_hot_water_mode_entity": "binary_sensor.water",
+    }
+    flow.config_entry.options = {
+        "zone_1_entity": "sensor.room",
+        "notify_service": "notify.family",
+    }
+    result = asyncio.run(
+        flow.async_step_extended_control(
+            {
+                "control_aux_preheat_limit": True,
+                "control_signals_verified": True,
+                "control_measurement_time_attribute": "measured_at",
+            }
+        )
+    )
+    assert result["type"] == "create_entry"
+    assert result["data"]["control_aux_preheat_limit"] is True
+    assert result["data"]["zone_1_entity"] == "sensor.room"
+    assert "thermal_aux_heat_entity" not in result["data"]  # retained in entry.data
+    flow.config_entry.options = result["data"]
+    result = asyncio.run(
+        flow.async_step_advanced_control({"control_balance_brake_limit": False})
+    )
+    assert result["data"]["control_aux_preheat_limit"] is True
+    assert result["data"]["notify_service"] == "notify.family"
+
+
+def test_optional_sensors_do_not_enable_control():
+    flow = _control_options_flow()
+    result = asyncio.run(
+        flow.async_step_heat_pump_telemetry(
+            {
+                "thermal_aux_heat_entity": "binary_sensor.aux",
+                "thermal_balance_entity": "sensor.balance",
+            }
+        )
+    )
+    assert "control_aux_preheat_limit" not in result["data"]
+    assert "control_balance_brake_limit" not in result["data"]
+
+
+def test_control_activation_requires_verified_signals_and_valid_normalization():
+    flow = _control_options_flow()
+    base = {
+        "control_aux_preheat_limit": True,
+        "control_balance_brake_limit": True,
+        "thermal_aux_heat_entity": "binary_sensor.aux",
+        "thermal_balance_entity": "sensor.balance",
+        "thermal_compressor_entity": "binary_sensor.compressor",
+        "thermal_heating_mode_entity": "binary_sensor.heating",
+        "thermal_hot_water_mode_entity": "binary_sensor.water",
+        "control_measurement_time_attribute": "measurement_time",
+    }
+    errors = flow._validate_entities(base)
+    assert errors["control_aux_preheat_limit"] == "control_signals_required"
+    assert errors["control_balance_brake_limit"] == "control_balance_required"
+    base.update(
+        control_signals_verified=True,
+        control_balance_verified=True,
+        control_balance_scale=-1,
+        control_balance_offset=0,
+        control_balance_deficit_threshold=100,
+        control_balance_deficit_full=300,
+    )
+    errors = flow._validate_entities(base)
+    assert "control_aux_preheat_limit" not in errors
+    assert "control_balance_brake_limit" not in errors
+    for change in (
+        {"control_balance_scale": 0},
+        {"control_balance_scale": float("nan")},
+        {"control_balance_offset": None},
+        {"control_balance_deficit_full": 100},
+        {"control_balance_deficit_threshold": -1},
+    ):
+        errors = flow._validate_entities({**base, **change})
+        assert errors["control_balance_brake_limit"] == "control_balance_required"
+    errors = flow._validate_entities({**base, "control_measurement_time_attribute": ""})
+    assert errors["control_aux_preheat_limit"] == "control_signals_required"
+
+
+def test_disabling_control_clears_optional_legacy_calibration_only_on_own_page():
+    flow = _control_options_flow()
+    flow.config_entry.data = {"control_balance_scale": -1, "control_balance_offset": 0}
+    flow.config_entry.options = {
+        "control_aux_preheat_limit": True,
+        "control_balance_brake_limit": True,
+    }
+    result = asyncio.run(
+        flow.async_step_advanced_control({"control_balance_brake_limit": False})
+    )
+    assert result["type"] == "create_entry"
+    assert result["data"]["control_balance_scale"] == ""
+    assert result["data"]["control_balance_offset"] == ""
+    assert result["data"]["control_balance_brake_limit"] is False
+    assert result["data"]["control_aux_preheat_limit"] is True
+
+
+def test_control_level_pages_have_translated_explanations():
+    import json
+    from pathlib import Path
+
+    for filename in (
+        "strings.json",
+        "translations/en.json",
+        "translations/sv.json",
+        "translations/se.json",
+    ):
+        translations = json.loads(
+            (Path("custom_components/pumpsteer") / filename).read_text()
+        )
+        steps = translations["options"]["step"]
+        for page in ("extended_control", "advanced_control"):
+            assert page in steps["telemetry"]["menu_options"]
+            assert steps[page]["description"]
+            assert set(steps[page]["data"]) == set(steps[page]["data_description"])
+        assert (
+            "50"
+            in steps["advanced_control"]["data_description"][
+                "control_balance_deficit_full"
+            ]
+        )
+
+
+def test_source_change_revokes_verification_across_pages():
+    flow = _control_options_flow()
+    flow.config_entry.options = {
+        "control_signals_verified": True,
+        "control_balance_verified": True,
+        "thermal_compressor_entity": "binary_sensor.old",
+        "thermal_balance_entity": "sensor.old_balance",
+        "control_balance_scale": -1,
+        "control_balance_offset": 0,
+    }
+    result = asyncio.run(
+        flow.async_step_heat_details({"thermal_compressor_entity": "binary_sensor.new"})
+    )
+    assert result["data"]["control_signals_verified"] is False
+    assert result["data"]["control_balance_verified"] is True
+    flow.config_entry.options = result["data"]
+    result = asyncio.run(
+        flow.async_step_heat_pump_telemetry(
+            {"thermal_balance_entity": "sensor.new_balance"}
+        )
+    )
+    assert result["data"]["control_balance_verified"] is False
+    assert result["data"]["control_balance_scale"] == -1
+
+
+def test_calibration_and_measurement_attribute_changes_need_new_confirmation():
+    flow = _control_options_flow()
+    flow.config_entry.options = {
+        "control_balance_verified": True,
+        "control_balance_scale": -1,
+        "control_balance_offset": 0,
+        "control_signals_verified": True,
+        "control_measurement_time_attribute": "measured_at",
+    }
+    result = asyncio.run(
+        flow.async_step_advanced_control(
+            {
+                "control_balance_scale": 1,
+                "control_balance_offset": 0,
+                "control_balance_verified": True,
+            }
+        )
+    )
+    assert result["data"]["control_balance_verified"] is False
+    flow.config_entry.options = result["data"]
+    result = asyncio.run(
+        flow.async_step_extended_control(
+            {
+                "control_signals_verified": True,
+                "control_measurement_time_attribute": "new_time",
+            }
+        )
+    )
+    assert result["data"]["control_signals_verified"] is False
+    flow.config_entry.options = result["data"]
+    result = asyncio.run(
+        flow.async_step_extended_control(
+            {
+                "control_signals_verified": True,
+                "control_measurement_time_attribute": "new_time",
+            }
+        )
+    )
+    assert result["data"]["control_signals_verified"] is True

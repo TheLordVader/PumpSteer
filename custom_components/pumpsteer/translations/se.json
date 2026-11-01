@@ -57,9 +57,11 @@
           "heat_sensors": "Analysmetod och huvudgivare",
           "energy": "El- och energimätning",
           "heat_details": "Fler värmepumpsgivare",
-          "heat_pump_telemetry": "Passiv värmepumpsdiagnostik"
+          "heat_pump_telemetry": "Passiv värmepumpsdiagnostik",
+          "extended_control": "Utökad – frivillig styrbegränsning",
+          "advanced_control": "Avancerad – verifierad värmebalans"
         },
-        "description": "Välj värmepumpsgivare eller frivillig energimätning."
+        "description": "Bas använder temperatur och pris utan extra givare. Utökad och Avancerad kan begränsa befintlig styrning först när respektive funktion uttryckligen aktiveras. Att välja en givare aktiverar aldrig ett styringrepp."
       },
       "notifications": {
         "title": "Notiser",
@@ -302,7 +304,7 @@
       },
       "heat_pump_telemetry": {
         "title": "Passiv värmepumpsdiagnostik",
-        "description": "Alla givare är frivilliga. Här visas passiva observationer och eventuella fellarm; ingen värmepumpsstyrning ändras. Kompressor, framledning, retur och varmvatten väljs på de andra givarsidorna.",
+        "description": "Alla givare är frivilliga. Valen här ger diagnostik och eventuella fellarm. Aktiv styrpåverkan kräver separat aktivering under Utökad eller Avancerad. Kompressor, framledning, retur och varmvatten väljs på övriga givarsidor.",
         "data": {
           "thermal_balance_entity": "Intern värmebalans",
           "thermal_balance_kind": "Typ av värmebalans",
@@ -323,7 +325,41 @@
           "thermal_brine_in_entity": "Temperaturgivare för inkommande köldbärare.",
           "thermal_brine_out_entity": "Temperaturgivare för utgående köldbärare.",
           "thermal_aux_heat_entity": "Binär signal för aktivt eltillskott.",
-          "thermal_alarm_entity": "Binär signal för aktivt fellarm. Notis använder den ordinarie PumpSteer-mottagaren om den är inställd."
+          "thermal_alarm_entity": "Binär signal för aktivt fellarm. Använder PumpSteers ordinarie notismottagare, oberoende av prisnotisfilter. Om mottagare saknas eller utskicket misslyckas visas en beständig HA-notis. Återhämtning meddelas också."
+        }
+      },
+      "extended_control": {
+        "title": "Utökad styrning",
+        "description": "Bas gäller när funktionerna är avstängda. Begränsaren behöver verifierad kompressordrift, radiatorvärmeläge, varmvattenläge och eltillskott. Kompressor och radiatorvärme måste vara på, varmvatten av. En vald köldbärarpump måste också rapportera drift. Alla deltagande signaler behöver verklig mättid som är högst fem minuter gammal; HA:s rapporttid räcker inte. Saknade eller motsägelsefulla uppgifter ger omedelbart Bas. Om en tidigare verifierad källa, mättidsinställning eller balanskalibrering ändras behöver verifieringen bekräftas på nytt efter att ändringen sparats. Under tiden används Bas.",
+        "data": {
+          "control_aux_preheat_limit": "Begränsa extra förvärmning vid eltillskott",
+          "control_signals_verified": "Jag har verifierat driftgivarnas betydelse och mättider",
+          "control_measurement_time_attribute": "Attribut för fysisk mättid"
+        },
+        "data_description": {
+          "control_aux_preheat_limit": "Av som standard. Tar bara bort den extra förvärmningshöjningen när eltillskott är verifierat aktivt för radiatorvärme. Ändrar inte pumpens egna tillskott eller nödvärme och garanterar ingen energibesparing.",
+          "control_signals_verified": "Bekräfta först efter kontroll av vad on/off betyder och att mättiden kommer från en fysisk avläsning, inte MQTT-återpublicering eller HA-uppdatering. Kryssrutan skapar inga verifierade data. Gäller båda styrbegränsarna.",
+          "control_measurement_time_attribute": "Samma attributnamn används på varje deltagande givare. Värdet ska vara en tidszonsangiven ISO-tid eller Unix-tid i sekunder. Om attributet saknas används bara Bas; skapa inte en syntetisk mättid."
+        }
+      },
+      "advanced_control": {
+        "title": "Avancerad styrning – värmebalans",
+        "description": "Av som standard. Kan släppa högst hälften av prisbromsningen vid verifierat värmeunderskott. Använder samma drift- och mättidskrav som Utökad. Normalisering: underskott = råvärde × skala + offset. Positiva värden måste betyda större värmeunderskott. Verifiera avkodning, tecken, enhet och gränser mot tillverkardokumentation eller samtidiga fysiska avläsningar. Ett registernamn eller några enstaka gradminutvärden räcker inte. Utan detta ska funktionen förbli avstängd; råvärde och trend kan fortfarande visas. Om en tidigare verifierad källa, mättidsinställning eller balanskalibrering ändras behöver verifieringen bekräftas på nytt efter att ändringen sparats. Under tiden används Bas.",
+        "data": {
+          "control_balance_brake_limit": "Begränsa prisbromsning med verifierad värmebalans",
+          "control_balance_verified": "Jag har verifierat normalisering och underskottsgränser",
+          "control_balance_scale": "Verifierad skalfaktor inklusive tecken",
+          "control_balance_offset": "Verifierad offset",
+          "control_balance_deficit_threshold": "Underskott där bromsen börjar släppas",
+          "control_balance_deficit_full": "Underskott för maximal bromsbegränsning"
+        },
+        "data_description": {
+          "control_balance_brake_limit": "Ändrar bara befintlig prisbromsning, inte PI eller pumpens interna reglering. Vid otillförlitliga data återgår styrningen till Bas och använder inte ett gammalt ingrepp.",
+          "control_balance_verified": "Bekräfta bara med verifierat underlag för just din givare och värmepump. Ingen avkodning eller generell teckenkonvention antas automatiskt.",
+          "control_balance_scale": "Ingen gissad standard. Måste vara ändlig och skild från noll; kan vara negativ beroende på verifierad teckenkonvention.",
+          "control_balance_offset": "Ange uttryckligen även om den verifierade offseten är noll. Samma enhet som det normaliserade underskottet.",
+          "control_balance_deficit_threshold": "Positiv verifierad gräns i normaliserade enheter. Vid och under gränsen ändras inte bromsningen.",
+          "control_balance_deficit_full": "Måste vara högre än första gränsen. Mellan gränserna släpps bromsen gradvis; vid och över denna gräns släpps högst 50 procent."
         }
       }
     },
@@ -335,7 +371,9 @@
       "invalid_notification_setting": "Ogiltig notisinställning",
       "invalid_detection_method": "Ogiltig metod för värmedetektering.",
       "heat_signal_alias": "Värmesignalen måste vara en separat indikator för radiatorvärme.",
-      "invalid_balance_kind": "Välj en giltig typ av värmebalans."
+      "invalid_balance_kind": "Välj en giltig typ av värmebalans.",
+      "control_signals_required": "Välj nödvändiga driftgivare på givarsidorna och verifiera deras betydelse samt attributet för fysisk mättid innan aktivering.",
+      "control_balance_required": "Välj värmebalansgivare och verifiera normalisering. Skalan måste vara skild från noll, offset angiven och 0 < första gränsen < maximalgränsen."
     }
   },
   "entity": {

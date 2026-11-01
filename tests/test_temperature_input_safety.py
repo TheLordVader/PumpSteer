@@ -938,3 +938,53 @@ def test_heat_pump_fault_recovery_waits_for_inflight_alarm(control, monkeypatch)
         assert "återgått" in delivered[-1]
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("service_fails", [False, True])
+def test_heatpump_fault_persistent_fallback_and_recovery(
+    control, monkeypatch, service_fails
+):
+    sensor, states, clock = control
+    sensor._config_entry.options.update(
+        thermal_alarm_entity="binary_sensor.fault",
+        notify_service="notify.broken" if service_fails else "",
+        notification_level="off",
+    )
+    sensor.hass.config = SimpleNamespace(language="en")
+    states["binary_sensor.fault"] = SimpleNamespace(
+        state="on", attributes={}, last_reported=clock[0]
+    )
+    original = sensor.hass.services.async_call
+
+    async def calls(domain, service, data, blocking=False):
+        if domain == "notify":
+            raise RuntimeError("delivery failed")
+        await original(domain, service, data, blocking=blocking)
+
+    monkeypatch.setattr(sensor.hass.services, "async_call", calls)
+
+    async def scenario():
+        _report(states, clock)
+        for _ in range(2):
+            await sensor.async_update()
+            await sensor._heatpump_alarm_task
+        persistent = [
+            c for c in sensor.hass.services.calls if c[0] == "persistent_notification"
+        ]
+        assert len(persistent) == 1
+        assert "active fault" in persistent[0][2]["message"]
+        clock[0] += timedelta(seconds=1)
+        states["binary_sensor.fault"].state = "off"
+        states["binary_sensor.fault"].last_reported = clock[0]
+        await sensor.async_update()
+        await sensor._heatpump_alarm_task
+        persistent = [
+            c for c in sensor.hass.services.calls if c[0] == "persistent_notification"
+        ]
+        assert len(persistent) == 2
+        assert "cleared" in persistent[1][2]["message"]
+        assert (
+            persistent[0][2]["notification_id"] == persistent[1][2]["notification_id"]
+        )
+
+    asyncio.run(scenario())

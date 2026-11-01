@@ -56,9 +56,11 @@
           "heat_sensors": "Analysis method and primary sensors",
           "energy": "Electricity and energy",
           "heat_details": "Additional heat pump sensors",
-          "heat_pump_telemetry": "Passive heat pump diagnostics"
+          "heat_pump_telemetry": "Passive heat pump diagnostics",
+          "extended_control": "Extended – optional control limits",
+          "advanced_control": "Advanced – verified heat balance"
         },
-        "description": "Choose heat pump sensors or optional energy meters."
+        "description": "Base uses temperature and price without extra sensors. Extended and Advanced can limit existing control only after you explicitly enable each function. Selecting a sensor never enables a control intervention."
       },
       "notifications": {
         "title": "Notifications",
@@ -301,7 +303,7 @@
       },
       "heat_pump_telemetry": {
         "title": "Passive heat pump diagnostics",
-        "description": "All sensors are optional. These are passive observations and optional fault alerts; heat pump control is unchanged. Choose compressor, supply, return and hot water sensors on the other sensor pages.",
+        "description": "All sensors are optional. These selections provide diagnostics and optional fault alerts. Active control effects require separate activation under Extended or Advanced. Choose compressor, supply, return and hot-water sensors on the other sensor pages.",
         "data": {
           "thermal_balance_entity": "Internal heat balance",
           "thermal_balance_kind": "Heat balance type",
@@ -322,7 +324,41 @@
           "thermal_brine_in_entity": "Temperature sensor for incoming brine.",
           "thermal_brine_out_entity": "Temperature sensor for outgoing brine.",
           "thermal_aux_heat_entity": "Binary signal for active auxiliary electric heat.",
-          "thermal_alarm_entity": "Binary active fault signal. Notifications use the regular PumpSteer recipient if configured."
+          "thermal_alarm_entity": "Binary active fault signal. Uses the regular PumpSteer recipient independently of price notification filters. If no recipient is configured or delivery fails, a persistent HA notification is used. Recovery is also reported."
+        }
+      },
+      "extended_control": {
+        "title": "Extended control",
+        "description": "Base applies when these functions are off. The limiter needs verified compressor, radiator heating, hot-water and auxiliary heat signals. Compressor and radiator heating must be on, hot water off. A selected brine pump must also report running. Every participating signal needs a physical measurement timestamp no older than five minutes; the HA report time alone is insufficient. Missing or conflicting data immediately returns control to Base.If a previously verified source, timestamp setting or balance calibration changes, verification must be confirmed again after saving the change. Base applies meanwhile.",
+        "data": {
+          "control_aux_preheat_limit": "Limit extra preheating during auxiliary heat",
+          "control_signals_verified": "I have verified operation signal meanings and measurement times",
+          "control_measurement_time_attribute": "Physical measurement timestamp attribute"
+        },
+        "data_description": {
+          "control_aux_preheat_limit": "Off by default. Removes only the extra preheat boost when auxiliary heat is verified active for radiator heating. Does not change the pump’s auxiliary or emergency heating and does not guarantee energy savings.",
+          "control_signals_verified": "Confirm only after checking what on/off means and that the timestamp comes from a physical measurement, not MQTT republication or an HA update. This checkbox does not create verified data. Applies to both control limiters.",
+          "control_measurement_time_attribute": "The same attribute name is read on every participating sensor. Its value must be a timezone-aware ISO timestamp or Unix seconds. If it is absent, only Base applies; do not create a synthetic measurement time."
+        }
+      },
+      "advanced_control": {
+        "title": "Advanced control – heat balance",
+        "description": "Off by default. Can release at most half of price braking during a verified heat deficit. Uses the same operation and timestamp requirements as Extended. Normalization: deficit = raw value × scale + offset. Positive values must mean a larger heat deficit. Verify decoding, sign, units and limits against manufacturer documentation or simultaneous physical readings. A register name or isolated degree-minute values are insufficient. Without this evidence, leave the function off; raw values and trends remain available.If a previously verified source, timestamp setting or balance calibration changes, verification must be confirmed again after saving the change. Base applies meanwhile.",
+        "data": {
+          "control_balance_brake_limit": "Limit price braking using verified heat balance",
+          "control_balance_verified": "I have verified normalization and deficit limits",
+          "control_balance_scale": "Verified scale factor including sign",
+          "control_balance_offset": "Verified offset",
+          "control_balance_deficit_threshold": "Deficit where brake release begins",
+          "control_balance_deficit_full": "Deficit for maximum brake limitation"
+        },
+        "data_description": {
+          "control_balance_brake_limit": "Changes only existing price braking, not PI or the pump’s internal controller. Unreliable data returns control to Base without reusing an old intervention.",
+          "control_balance_verified": "Confirm only with verified evidence for your sensor and heat pump. No decoding or universal sign convention is assumed automatically.",
+          "control_balance_scale": "No guessed default. Must be finite and nonzero; may be negative according to the verified sign convention.",
+          "control_balance_offset": "Enter explicitly even if the verified offset is zero. Uses the same unit as the normalized deficit.",
+          "control_balance_deficit_threshold": "A verified positive limit in normalized units. Braking is unchanged at and below this limit.",
+          "control_balance_deficit_full": "Must exceed the first limit. Between the limits braking is released gradually; at and above this limit at most 50 percent is released."
         }
       }
     },
@@ -334,7 +370,9 @@
       "invalid_notification_setting": "Invalid notification setting",
       "invalid_detection_method": "Invalid heating detection method.",
       "heat_signal_alias": "The heat signal must be a separate radiator heat indicator.",
-      "invalid_balance_kind": "Choose a valid heat balance type."
+      "invalid_balance_kind": "Choose a valid heat balance type.",
+      "control_signals_required": "Select the required operation sensors and verify their meanings and physical measurement timestamp attribute before activation.",
+      "control_balance_required": "Select a heat balance sensor and verify normalization. Scale must be nonzero, offset explicit, and 0 < first limit < maximum limit."
     }
   },
   "entity": {

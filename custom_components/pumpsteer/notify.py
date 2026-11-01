@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import math
 from time import monotonic
@@ -175,17 +176,25 @@ async def async_send_notification(
     title: str,
     message: str,
     notification_id: str = "pumpsteer",
-) -> None:
+    *,
+    confirmed: bool = False,
+    persistent_existing: bool = False,
+) -> str:
     """Send via notify_service (from options), or fall back to persistent_notification."""
     service = {**entry.data, **entry.options}.get("notify_service", "")
 
     if service:
         domain, svc = service.split(".", 1) if "." in service else ("notify", service)
         try:
-            await hass.services.async_call(
-                domain, svc, {"title": title, "message": message}
-            )
-            return
+            async with asyncio.timeout(20):
+                await hass.services.async_call(
+                    domain,
+                    svc,
+                    {"title": title, "message": message},
+                    **({"blocking": True} if confirmed else {}),
+                )
+            if not persistent_existing:
+                return "mobile"
         except Exception as err:
             _LOGGER.warning(
                 "PumpSteer notify failed (%s), using persistent_notification: %s",
@@ -197,4 +206,23 @@ async def async_send_notification(
         "persistent_notification",
         "create",
         {"title": title, "message": message, "notification_id": notification_id},
+        **({"blocking": True} if confirmed else {}),
+    )
+
+    return "persistent"
+
+
+def heatpump_alarm_message(hass, event):
+    """Localize safety alerts independently of price notification preferences."""
+    language = getattr(getattr(hass, "config", None), "language", "sv")
+    if language in ("sv", "se"):
+        return (
+            "Värmepumpen rapporterar ett aktivt fellarm."
+            if event == "alarm"
+            else "Värmepumpens fellarm har återgått."
+        )
+    return (
+        "The heat pump reports an active fault."
+        if event == "alarm"
+        else "The heat pump fault has cleared."
     )

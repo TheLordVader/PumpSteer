@@ -1710,6 +1710,7 @@ async def test_native_passive_heat_pump_telemetry_and_fault_notifications(
     """Real HA options and reports feed diagnostics and deduplicated fault alerts."""
     from custom_components.pumpsteer import pump_log
 
+    hass.config.language = "sv"
     monkeypatch.setattr(pump_log, "_PUMP_LOG_PATH", str(tmp_path / "pump.log"))
     freezer.move_to("2026-10-31T00:00:00+00:00")
     await hass.async_start()
@@ -1813,3 +1814,129 @@ async def test_native_passive_heat_pump_telemetry_and_fault_notifications(
     assert len(received) == 2
     assert "återgått" in received[-1]
     assert all(domain == "notify" for domain, service in calls)
+
+
+async def test_native_control_options_and_verified_brake_limit(
+    recorder_mock, hass, enable_custom_integrations, monkeypatch, tmp_path, freezer
+):
+    """Native options require opt-in; controller output uses live physical timestamps."""
+    from custom_components.pumpsteer import pump_log
+
+    monkeypatch.setattr(pump_log, "_PUMP_LOG_PATH", str(tmp_path / "pump.log"))
+    freezer.move_to("2026-11-01T08:00:00+00:00")
+    assert await async_setup_component(hass, "persistent_notification", {})
+    await hass.async_start()
+    options = {
+        "indoor_temp_entity": "sensor.room",
+        "real_outdoor_entity": "sensor.outside",
+        "electricity_price_entity": "sensor.price",
+        "price_tomorrow_entity": "sensor.price",
+        "thermal_compressor_entity": "binary_sensor.compressor",
+        "thermal_heating_mode_entity": "binary_sensor.heating",
+        "thermal_hot_water_mode_entity": "binary_sensor.water",
+        "thermal_balance_entity": "sensor.balance",
+        "thermal_aux_heat_entity": "binary_sensor.aux",
+    }
+    entry = MockConfigEntry(domain="pumpsteer", data={}, options=options)
+    entry.add_to_hass(hass)
+    assert await async_setup_component(hass, "pumpsteer", {})
+    await hass.async_block_till_done()
+    for entity, value in (
+        ("sensor.room", "20.8"),
+        ("sensor.outside", "0"),
+        ("sensor.price", "1"),
+    ):
+        hass.states.async_set(entity, value, {"unit_of_measurement": "°C"})
+    for entity, value in (
+        ("binary_sensor.compressor", "on"),
+        ("binary_sensor.heating", "on"),
+        ("binary_sensor.water", "off"),
+        ("binary_sensor.aux", "on"),
+        ("sensor.balance", "-300"),
+    ):
+        hass.states.async_set(
+            entity, value, {"measurement_time": dt_util.utcnow().isoformat()}
+        )
+    flow = await hass.config_entries.options.async_init(entry.entry_id)
+    flow = await hass.config_entries.options.async_configure(
+        flow["flow_id"], {"next_step_id": "telemetry"}
+    )
+    flow = await hass.config_entries.options.async_configure(
+        flow["flow_id"], {"next_step_id": "extended_control"}
+    )
+    defaults = {
+        key.schema: key.default()
+        for key in flow["data_schema"].schema
+        if key.schema == "control_aux_preheat_limit"
+    }
+    assert defaults["control_aux_preheat_limit"] is False
+    rejected = await hass.config_entries.options.async_configure(
+        flow["flow_id"], {"control_aux_preheat_limit": True}
+    )
+    assert rejected["errors"]["control_aux_preheat_limit"] == "control_signals_required"
+    saved = await hass.config_entries.options.async_configure(
+        flow["flow_id"],
+        {
+            "control_aux_preheat_limit": False,
+            "control_signals_verified": True,
+            "control_measurement_time_attribute": "measurement_time",
+        },
+    )
+    assert saved["type"] == "create_entry"
+    await hass.async_block_till_done()
+    controller = next(
+        e for e in hass.data[SENSOR].entities if e.unique_id == entry.entry_id
+    )
+
+    async def prices(cfg, now):
+        return [2.0] * 96, ["expensive"] * 96, 15, 32
+
+    async def forecast():
+        return []
+
+    monkeypatch.setattr(controller, "_get_prices", prices)
+    monkeypatch.setattr(controller, "_forecast_temps", forecast)
+    monkeypatch.setattr(controller, "_aggressiveness", lambda cfg: 3)
+    controller._brake_ramp = 1
+    controller._prev_aggressiveness = 3
+    freezer.tick(timedelta(seconds=1))
+    for entity, value in (("sensor.room", "20.8"), ("sensor.outside", "0")):
+        hass.states.async_set(entity, value, {"unit_of_measurement": "°C"})
+    await controller.async_update()
+    base = controller.state
+    assert controller.extra_state_attributes["mode"] == "braking"
+    flow = await hass.config_entries.options.async_init(entry.entry_id)
+    flow = await hass.config_entries.options.async_configure(
+        flow["flow_id"], {"next_step_id": "telemetry"}
+    )
+    flow = await hass.config_entries.options.async_configure(
+        flow["flow_id"], {"next_step_id": "advanced_control"}
+    )
+    saved = await hass.config_entries.options.async_configure(
+        flow["flow_id"],
+        {
+            "control_balance_brake_limit": True,
+            "control_balance_verified": True,
+            "control_balance_scale": -1,
+            "control_balance_offset": 0,
+            "control_balance_deficit_threshold": 100,
+            "control_balance_deficit_full": 300,
+        },
+    )
+    assert saved["type"] == "create_entry", saved
+    await hass.async_block_till_done()
+    controller._brake_ramp = 1
+    await controller.async_update()
+    assert controller.extra_state_attributes["mode"] == "braking"
+    assert controller.state < base
+    assert controller.extra_state_attributes["brake_factor"] == pytest.approx(0.5)
+    # Re-publication without a new physical measurement must lose the modifier.
+    freezer.tick(timedelta(minutes=6))
+    for entity, value in (("sensor.room", "20.8"), ("sensor.outside", "0")):
+        hass.states.async_set(entity, value, {"unit_of_measurement": "°C"})
+    old_physical = hass.states.get("sensor.balance").attributes["measurement_time"]
+    hass.states.async_set("sensor.balance", "-300", {"measurement_time": old_physical})
+    controller._brake_ramp = 1
+    await controller.async_update()
+    assert controller.state == pytest.approx(base)
+    assert controller.extra_state_attributes["brake_factor"] == pytest.approx(1)

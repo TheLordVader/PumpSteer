@@ -119,6 +119,19 @@ _GROUPS["heat_pump_telemetry"] = {
     "thermal_aux_heat_entity",
     "thermal_alarm_entity",
 }
+_GROUPS["extended_control"] = {
+    "control_aux_preheat_limit",
+    "control_signals_verified",
+    "control_measurement_time_attribute",
+}
+_GROUPS["advanced_control"] = {
+    "control_balance_brake_limit",
+    "control_balance_verified",
+    "control_balance_scale",
+    "control_balance_offset",
+    "control_balance_deficit_threshold",
+    "control_balance_deficit_full",
+}
 _GROUPS["generic_output"] = {
     "modbus_service",
     "modbus_payload_template",
@@ -151,6 +164,11 @@ _CLEARABLE = {
     "thermal_compressor_entity",
     "thermal_return_temp_entity",
     *(_GROUPS["heat_pump_telemetry"] - {"thermal_balance_kind"}),
+    "control_measurement_time_attribute",
+    "control_balance_scale",
+    "control_balance_offset",
+    "control_balance_deficit_threshold",
+    "control_balance_deficit_full",
 }
 
 
@@ -212,6 +230,12 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
     async def async_step_heat_pump_telemetry(self, user_input=None):
         return await self._section("heat_pump_telemetry", user_input)
 
+    async def async_step_extended_control(self, user_input=None):
+        return await self._section("extended_control", user_input)
+
+    async def async_step_advanced_control(self, user_input=None):
+        return await self._section("advanced_control", user_input)
+
     async def async_step_energy(self, user_input=None):
         return await self._section("energy", user_input)
 
@@ -228,6 +252,8 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
                 "heat_sensors",
                 "heat_details",
                 "heat_pump_telemetry",
+                "extended_control",
+                "advanced_control",
                 "energy",
             ],
         )
@@ -271,7 +297,7 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
                     **{k: v for k, v in user_input.items() if k in _GROUPS[section]},
                 }
                 for key in _GROUPS[section] & _CLEARABLE:
-                    if key not in user_input and current_data.get(key):
+                    if key not in user_input and current_data.get(key) is not None:
                         updated[key] = [] if key == "thermal_energy_entities" else ""
                 entity_errors = self._validate_entities({**entry.data, **updated})
                 errors = {
@@ -309,6 +335,39 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
                             errors[key] = "heat_signal_alias"
 
                 if not errors:
+                    # Verification belongs to the exact source/calibration, not a slot.
+                    # A changed source can be saved, but must be confirmed again on
+                    # its control page before a limiter may resume.
+                    merged = {**entry.data, **updated}
+                    for flag, keys in (
+                        (
+                            "control_signals_verified",
+                            (
+                                "thermal_compressor_entity",
+                                "thermal_heating_mode_entity",
+                                "thermal_heating_mode_inverted",
+                                "thermal_hot_water_mode_entity",
+                                "thermal_brine_pump_entity",
+                                "thermal_aux_heat_entity",
+                                "control_measurement_time_attribute",
+                            ),
+                        ),
+                        (
+                            "control_balance_verified",
+                            (
+                                "thermal_balance_entity",
+                                "thermal_balance_kind",
+                                "control_balance_scale",
+                                "control_balance_offset",
+                                "control_balance_deficit_threshold",
+                                "control_balance_deficit_full",
+                            ),
+                        ),
+                    ):
+                        if current_data.get(flag) is True and any(
+                            merged.get(key) != current_data.get(key) for key in keys
+                        ):
+                            updated[flag] = False
                     return self.async_create_entry(title="", data=updated)
 
             except Exception as err:
@@ -719,6 +778,36 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
                             }
                         }
                     )
+        for key in (
+            "control_aux_preheat_limit",
+            "control_signals_verified",
+            "control_balance_brake_limit",
+            "control_balance_verified",
+        ):
+            fields[vol.Optional(key, default=current_data.get(key, False))] = selector(
+                {"boolean": {}}
+            )
+        fields[
+            vol.Optional(
+                "control_measurement_time_attribute",
+                default=current_data.get(
+                    "control_measurement_time_attribute", "measurement_time"
+                ),
+            )
+        ] = selector({"text": {}})
+        for key in (
+            "control_balance_scale",
+            "control_balance_offset",
+            "control_balance_deficit_threshold",
+            "control_balance_deficit_full",
+        ):
+            fields[
+                vol.Optional(
+                    key, description={"suggested_value": current_data.get(key)}
+                )
+            ] = selector(
+                {"number": {"min": -1e9, "max": 1e9, "step": 0.001, "mode": "box"}}
+            )
         selected = {
             k: v
             for k, v in fields.items()
@@ -912,6 +1001,56 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
         if relay and not self._entity_exists(relay):
             errors[OHMIGO_RELAY_ENTITY] = "entity_not_found"
 
+        active = [
+            key
+            for key in ("control_aux_preheat_limit", "control_balance_brake_limit")
+            if user_input.get(key) is True
+        ]
+        if active:
+            required_signals = (
+                "thermal_compressor_entity",
+                "thermal_heating_mode_entity",
+                "thermal_hot_water_mode_entity",
+            )
+            attribute = user_input.get(
+                "control_measurement_time_attribute", "measurement_time"
+            )
+            signals_ready = (
+                user_input.get("control_signals_verified") is True
+                and isinstance(attribute, str)
+                and bool(attribute.strip())
+                and all(
+                    user_input.get(key) and self._entity_exists(user_input[key])
+                    for key in required_signals
+                )
+            )
+            for key in active:
+                if not signals_ready:
+                    errors[key] = "control_signals_required"
+            if "control_aux_preheat_limit" in active and not (
+                user_input.get("thermal_aux_heat_entity")
+                and self._entity_exists(user_input["thermal_aux_heat_entity"])
+            ):
+                errors["control_aux_preheat_limit"] = "control_signals_required"
+            if "control_balance_brake_limit" in active:
+                scale = safe_float(user_input.get("control_balance_scale"))
+                offset = safe_float(user_input.get("control_balance_offset"))
+                threshold = safe_float(
+                    user_input.get("control_balance_deficit_threshold")
+                )
+                full = safe_float(user_input.get("control_balance_deficit_full"))
+                if not (
+                    user_input.get("control_balance_verified") is True
+                    and user_input.get("thermal_balance_entity")
+                    and self._entity_exists(user_input["thermal_balance_entity"])
+                    and scale is not None
+                    and scale != 0
+                    and offset is not None
+                    and threshold is not None
+                    and full is not None
+                    and 0 < threshold < full
+                ):
+                    errors["control_balance_brake_limit"] = "control_balance_required"
         return errors
 
     def _entity_exists(self, entity_id: str) -> bool:

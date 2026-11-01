@@ -212,3 +212,13 @@ def test_missing_stale_or_misaligned_configured_hot_water_does_not_guess_mode():
         configured={"compressor", "hot_water"},
     )
     assert result["operation"] == "compressor_running"
+
+
+def test_raw_kind_and_optional_absent_brine_are_not_errors():
+    result = HeatPumpTelemetry().observe(
+        T, {"balance": state(123), "compressor": state("on")}, balance_kind="raw"
+    )
+    assert result["balance"]["kind"] == "raw"
+    assert result["balance"]["value"] == 123
+    assert result["signal_consistency"] == "no_conflict_observed"
+    assert result["operation"] == "compressor_running"

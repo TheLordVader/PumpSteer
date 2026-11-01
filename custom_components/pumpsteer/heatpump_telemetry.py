@@ -146,7 +146,11 @@ class HeatPumpTelemetry:
 
         balance = states.get("balance")
         attrs = getattr(balance, "attributes", {}) or {}
-        kind = balance_kind if balance_kind in ("degree_minutes", "integral") else None
+        kind = (
+            balance_kind
+            if balance_kind in ("raw", "degree_minutes", "integral")
+            else None
+        )
         identity = (
             getattr(balance, "entity_id", None),
             kind,
@@ -235,7 +239,9 @@ class HeatPumpTelemetry:
             "conflicting"
             if conflict
             else "insufficient_data"
-            if not brine_observable
+            if missing_context
+            or binary["compressor"] is None
+            or (hot_water_configured and not hot_water_observable)
             else "no_conflict_observed"
         )
         return {
