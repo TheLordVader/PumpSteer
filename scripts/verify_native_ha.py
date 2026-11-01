@@ -972,6 +972,7 @@ async def test_initial_store_read_failure_can_recover_plan_history(
 
     monkeypatch.setattr(pump_log, "_PUMP_LOG_PATH", str(tmp_path / "pump.log"))
     await hass.async_start()
+    await hass.config.async_set_time_zone("UTC")
     entry = MockConfigEntry(
         domain="pumpsteer",
         title="test",
@@ -1036,6 +1037,7 @@ async def test_unknown_store_version_is_not_overwritten(
 
     monkeypatch.setattr(pump_log, "_PUMP_LOG_PATH", str(tmp_path / "pump.log"))
     await hass.async_start()
+    await hass.config.async_set_time_zone("UTC")
     entry = MockConfigEntry(
         domain="pumpsteer",
         title="test",
@@ -1682,3 +1684,21 @@ async def test_native_zone_pages_save_independently(
         assert entry.options["zone_notify_service"] == "notify.shared"
         for saved in range(1, i + 1):
             assert entry.options[f"zone_{saved}_entity"] == f"sensor.z{saved}"
+
+
+async def test_native_zone_profile_selector_translations(
+    hass, enable_custom_integrations
+):
+    from homeassistant.helpers.translation import async_get_translations
+
+    translations = await async_get_translations(
+        hass, "sv", "selector", integrations={"pumpsteer"}
+    )
+    assert (
+        translations["component.pumpsteer.selector.zone_profile.options.maintenance"]
+        == "Underhållsvärme"
+    )
+    assert (
+        translations["component.pumpsteer.selector.zone_profile.options.comfort"]
+        == "Komfort"
+    )

@@ -1244,7 +1244,7 @@ class PumpSteerSensor(RestoreEntity):
             if self._temperature_reported_after is None:
                 return None
             minutes = configured_default
-        cutoff = dt_util.now() - timedelta(minutes=minutes)
+        cutoff = dt_util.now().astimezone(timezone.utc) - timedelta(minutes=minutes)
         if self._temperature_reported_after is not None:
             cutoff = max(cutoff, self._temperature_reported_after)
         return cutoff
@@ -1319,7 +1319,7 @@ class PumpSteerSensor(RestoreEntity):
         def timestamp(values, operation):
             try:
                 return (
-                    operation(values)
+                    operation(values, key=lambda v: v.timestamp())
                     if all(
                         isinstance(v, datetime) and v.utcoffset() is not None
                         for v in values
@@ -1336,8 +1336,9 @@ class PumpSteerSensor(RestoreEntity):
                 "source_temperatures_used": {r[0]: r[2] for r in rows},
                 "source_weights": {r[0]: r[1] for r in rows},
                 "physical_measurement_time": "unknown",
+                "oldest_component_report": timestamp(timestamps, min),
             },
-            last_reported=timestamp(timestamps, min),
+            last_reported=timestamp(timestamps, max),
             last_changed=timestamp(changes, max),
             last_updated=timestamp(changes, max),
         )
@@ -1441,12 +1442,28 @@ class PumpSteerSensor(RestoreEntity):
             return not interrupted
 
         if check():
+            indoor = self._temperature_state(cfg, "indoor_temp_entity")
+            indoor_attrs = getattr(indoor, "attributes", {}) or {}
+            contributors = indoor_attrs.get("source_weights")
+            sources = (
+                list(contributors)
+                if isinstance(contributors, dict)
+                else (
+                    [cfg["indoor_temp_entity"]]
+                    if indoor is not None and cfg.get("indoor_temp_entity")
+                    else []
+                )
+            )
+            outside_id = self._temperature_identity(cfg)[1]
+            if outside_id:
+                sources.append(outside_id)
             self._ohmigo_last_push = await async_push_ohmigo(
                 self.hass,
                 self._config_entry,
                 fake_temp,
                 self._ohmigo_last_push,
                 temperature_check=check,
+                temperature_sources=sources,
             )
         if not check():
             await self._temperature_interrupted(cfg)

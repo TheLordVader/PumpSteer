@@ -76,7 +76,7 @@ class PIController:
         if self._last_time is None:
             dt_minutes = 1.0
         else:
-            dt_seconds = (update_time - self._last_time).total_seconds()
+            dt_seconds = update_time.timestamp() - self._last_time.timestamp()
             dt_minutes = max(dt_seconds / 60.0, 0.01)
         self._last_time = update_time
 

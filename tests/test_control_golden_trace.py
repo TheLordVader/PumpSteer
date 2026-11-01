@@ -250,7 +250,7 @@ def test_frozen_summer_reset_and_long_gap(monkeypatch):
         )
 
 
-def test_frozen_repeated_winter_hour_preserves_existing_clock_semantics(monkeypatch):
+def test_repeated_winter_hour_uses_elapsed_time(monkeypatch):
     import asyncio
     from zoneinfo import ZoneInfo
     from custom_components.pumpsteer import sensor as sensor_module
@@ -262,7 +262,7 @@ def test_frozen_repeated_winter_hour_preserves_existing_clock_semantics(monkeypa
     states["sensor.price"].attributes["today"] = prices
     expected = [
         (0, 3.5, "preheating", 0, 0.066667, 0.0175, 0.5, False, False, False, 21),
-        (1, 2.2, "preheating", 0, 0.4, 0.017675, 0.5, False, False, False, 21),
+        (1, 1.1, "preheating", 0, 0.4, 1.0675, 0.5, False, False, False, 21),
     ]
     for row in expected:
         fold = row[0]

@@ -365,3 +365,40 @@ def test_zone_recipient_omitted_by_ui_is_cleared_to_inherit_shared():
     saved = asyncio.run(flow.async_step_zone_1({"zone_1_entity": "sensor.a"}))["data"]
     assert saved["zone_1_notify_service"] == ""
     assert saved["zone_notify_service"] == "notify.shared"
+
+
+def test_legacy_data_heat_signal_alias_is_rejected(monkeypatch):
+    from custom_components.pumpsteer import options_flow
+
+    monkeypatch.setattr(
+        options_flow.vol,
+        "Optional",
+        lambda name, default=None, **kwargs: (name, default),
+    )
+    monkeypatch.setattr(
+        options_flow.vol,
+        "Required",
+        lambda name, default=None, **kwargs: (name, default),
+    )
+    flow = PumpSteerOptionsFlowHandler()
+    flow.config_entry = SimpleNamespace(
+        data={
+            "thermal_detection_method": "verified",
+            "thermal_heat_activity_entity": "binary_sensor.heat",
+        },
+        options={},
+    )
+    flow.hass = SimpleNamespace(
+        states=SimpleNamespace(
+            async_all=lambda domain: [], get=lambda entity: SimpleNamespace(state="on")
+        )
+    )
+    flow.async_create_entry = lambda **kwargs: {"type": "create_entry", **kwargs}
+    flow.async_show_form = lambda **kwargs: {"type": "form", **kwargs}
+    result = asyncio.run(
+        flow.async_step_heat_details(
+            {"thermal_compressor_entity": "binary_sensor.heat"}
+        )
+    )
+    assert result["type"] == "form"
+    assert result["errors"]["thermal_compressor_entity"] == "heat_signal_alias"

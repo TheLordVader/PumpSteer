@@ -100,13 +100,23 @@ def get_temperature(
         try:
             if (
                 not isinstance(reported, datetime)
-                or reported <= reported_after
-                or reported > dt_util.now()
+                or reported.utcoffset() is None
+                or reported_after.utcoffset() is None
+                or reported.timestamp() <= reported_after.timestamp()
+                or reported.timestamp() > dt_util.now().timestamp()
             ):
                 return None
         except TypeError:
             return None
-    return safe_float(entity.state)
+    return temperature_from_state(entity)
+
+
+def temperature_from_state(entity):
+    """Validate Celsius temperature without assuming a foreign unit is Celsius."""
+    attrs = getattr(entity, "attributes", {}) or {}
+    if attrs.get("restored") or attrs.get("unit_of_measurement") not in (None, "°C"):
+        return None
+    return safe_float(getattr(entity, "state", None), -50, 60)
 
 
 def get_attr(

@@ -5,7 +5,7 @@ command and never turns inferred electrical power or compressor status into heat
 """
 
 from collections import deque
-from datetime import timedelta
+from datetime import timedelta, timezone
 import math
 from .pilot_vendor.adaptive_model import AdaptiveThermalModel
 from .pilot_vendor.learning_interval import IntervalCollector
@@ -199,15 +199,39 @@ class PilotPassive:
             return None
         at = getattr(state, "last_reported", None)
         try:
+            if at is not None and at.tzinfo is not None:
+                at = at.astimezone(timezone.utc)
             if (
                 at is None
                 or at.tzinfo is None
-                or now - at < timedelta(0)
-                or (max_age is not None and now - at > max_age)
+                or now.timestamp() - at.timestamp() < 0
+                or (
+                    max_age is not None
+                    and now.timestamp() - at.timestamp() > max_age.total_seconds()
+                )
             ):
                 return None
-            if reported_after is not None and at <= reported_after:
+            if (
+                reported_after is not None
+                and at.timestamp() <= reported_after.timestamp()
+            ):
                 return None
+            oldest = (getattr(state, "attributes", {}) or {}).get(
+                "oldest_component_report"
+            )
+            if oldest is not None:
+                if oldest.tzinfo is None or oldest.timestamp() > at.timestamp():
+                    return None
+                if (
+                    max_age is not None
+                    and now.timestamp() - oldest.timestamp() > max_age.total_seconds()
+                ):
+                    return None
+                if (
+                    reported_after is not None
+                    and oldest.timestamp() <= reported_after.timestamp()
+                ):
+                    return None
             if temperature:
                 if (getattr(state, "attributes", {}) or {}).get(
                     "unit_of_measurement"

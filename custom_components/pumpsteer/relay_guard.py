@@ -85,7 +85,7 @@ class OhmigoRelayGuard:
         self._temperature_check: Callable[[], bool] | None = None
 
     @contextmanager
-    def temperature_write(self, check: Callable[[], bool]):
+    def temperature_write(self, check: Callable[[], bool], source_entities=None):
         """Latch source changes from before number dispatch through ACTIVE."""
         interrupted = False
 
@@ -100,9 +100,17 @@ class OhmigoRelayGuard:
         cfg = {**self.entry.data, **self.entry.options}
         sources = [
             cfg[key]
-            for key in ("indoor_temp_entity", "real_outdoor_entity")
+            for key in (
+                "indoor_temp_entity",
+                "indoor_temp_entity_2",
+                "indoor_temp_entity_3",
+                "real_outdoor_entity",
+                "outdoor_temp_entity_2",
+            )
             if cfg.get(key)
         ]
+        if source_entities is not None:
+            sources = list(dict.fromkeys(source_entities))
         unsubscribe = (
             async_track_state_change_event(self.hass, sources, changed)
             if sources

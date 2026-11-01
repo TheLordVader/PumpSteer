@@ -276,7 +276,9 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
                     and entity_errors.get("thermal_heat_activity_entity")
                     == "heat_signal_alias"
                 ):
-                    source = updated.get("thermal_heat_activity_entity")
+                    source = {**entry.data, **updated}.get(
+                        "thermal_heat_activity_entity"
+                    )
                     for key in (
                         "thermal_compressor_entity",
                         "thermal_heating_mode_entity",

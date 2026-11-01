@@ -697,3 +697,24 @@ def test_queue_overflow_is_distinguished_from_invalid_meter_reports():
     assert result["exact_interval_queue_drops"] == 1
     assert result["near_interval_queue_drops"] == 1
     assert result["near_pending_intervals"] == 1024
+
+
+def test_price_snapshots_share_unchanged_data_and_preserve_revisions():
+    ledger = PowerLedger()
+    price = prices()
+    for minute in range(3):
+        at = T + timedelta(minutes=minute)
+        price.last_reported = at
+        ledger.observe_energy(
+            at, {"a": state(10 + minute, at, "kWh")}, [price], meter_ids=["a", "b"]
+        )
+    queue = ledger._energy_intervals["a"]
+    assert queue[0][3][0].attributes is queue[1][3][0].attributes
+    price.attributes["raw_today"][0]["value"] = 9
+    at = T + timedelta(minutes=3)
+    price.last_reported = at
+    ledger.observe_energy(
+        at, {"a": state(13, at, "kWh")}, [price], meter_ids=["a", "b"]
+    )
+    assert queue[0][3][0].attributes["raw_today"][0]["value"] == 1
+    assert ledger._energy_anchors["a"][2][0].attributes["raw_today"][0]["value"] == 9

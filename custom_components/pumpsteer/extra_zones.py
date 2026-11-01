@@ -1,8 +1,8 @@
 """Passive zone observations. HA report time is not physical measurement time."""
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
-from .utils import safe_float
+from .utils import safe_float, temperature_from_state
 
 _EVENTS = ("temperature", "forecast", "heat_shortage", "sensor_fault")
 _GAP = timedelta(minutes=35)
@@ -28,7 +28,7 @@ def _temperature(state, now, max_age=_MAX_AGE):
         _fresh(state, now, max_age)
         and (getattr(state, "attributes", {}) or {}).get("unit_of_measurement") == "°C"
     ):
-        return safe_float(state.state)
+        return temperature_from_state(state)
     return None
 
 
@@ -70,6 +70,7 @@ class ExtraZones:
         )
 
     def observe(self, now, configs, states, outdoor=None, outdoor_max_age_minutes=5):
+        now = now.astimezone(timezone.utc)
         result, alerts = {}, []
         active = set()
         outdoor_value = _temperature(
@@ -153,6 +154,8 @@ class ExtraZones:
             value = _temperature(state, now)
             valid = value is not None and threshold is not None
             report = getattr(state, "last_reported", None)
+            if isinstance(report, datetime) and report.utcoffset() is not None:
+                report = report.astimezone(timezone.utc)
             if valid and zone["restored_active"] and self._started_at is not None:
                 if report <= self._started_at:
                     valid = False
@@ -176,6 +179,11 @@ class ExtraZones:
                 elif valve is not None:
                     demand = valve > 0
             climate_report = getattr(climate, "last_reported", None)
+            if (
+                isinstance(climate_report, datetime)
+                and climate_report.utcoffset() is not None
+            ):
+                climate_report = climate_report.astimezone(timezone.utc)
             if demand is True and zone["climate_report"] is not None:
                 if (
                     not timedelta(0)

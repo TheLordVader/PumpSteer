@@ -553,3 +553,78 @@ def test_clock_backwards_then_reload_requires_new_reports(rig, monkeypatch):
         assert receiver.active
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "key", ["indoor_temp_entity_2", "indoor_temp_entity_3", "outdoor_temp_entity_2"]
+)
+def test_extra_temperature_source_flap_revokes_guard_grant(rig, monkeypatch, key):
+    sensor, states, clock, manager, receiver = rig
+    sensor._config_entry.options[key] = "sensor.extra"
+    watchers = {}
+
+    def subscribe(hass, entities, listener):
+        for entity in entities:
+            watchers[entity] = listener
+        return lambda: None
+
+    monkeypatch.setattr(relay_guard, "async_track_state_change_event", subscribe)
+    with manager.temperature_write(lambda: True) as valid:
+        assert "sensor.extra" in watchers
+        assert valid()
+        watchers["sensor.extra"](SimpleNamespace(data={"entity_id": "sensor.extra"}))
+        assert not valid()
+
+
+def test_guard_only_subscribes_to_selected_sources_when_known(rig, monkeypatch):
+    sensor, states, clock, manager, receiver = rig
+    sensor._config_entry.options["outdoor_temp_entity_2"] = "sensor.backup"
+    watched = []
+
+    def subscribe(hass, entities, listener):
+        watched.extend(entities)
+        return lambda: None
+
+    monkeypatch.setattr(relay_guard, "async_track_state_change_event", subscribe)
+    with manager.temperature_write(
+        lambda: True, source_entities=["sensor.indoor", "sensor.outdoor"]
+    ) as valid:
+        assert valid()
+        assert set(watched) == {"sensor.indoor", "sensor.outdoor"}
+
+
+def test_weighted_source_flap_during_write_revokes_guard_through_controller(
+    rig, monkeypatch
+):
+    sensor, states, clock, manager, receiver = rig
+    sensor._config_entry.options["indoor_temp_entity_2"] = "sensor.extra"
+    states["sensor.extra"] = SimpleNamespace(
+        state="20",
+        attributes={"unit_of_measurement": "°C"},
+        last_reported=clock[0],
+        last_changed=clock[0],
+    )
+    listeners = {}
+
+    def subscribe(hass, entities, listener):
+        for entity in entities:
+            listeners[entity] = listener
+        return lambda: None
+
+    monkeypatch.setattr(relay_guard, "async_track_state_change_event", subscribe)
+    original = sensor.hass.services.async_call
+
+    async def dispatch(domain, service, data, blocking=False):
+        await original(domain, service, data, blocking)
+        if domain == "number":
+            assert "sensor.extra" in listeners
+            states["sensor.extra"].state = "unavailable"
+            listeners["sensor.extra"](
+                SimpleNamespace(data={"entity_id": "sensor.extra"})
+            )
+            states["sensor.extra"].state = "20"
+
+    sensor.hass.services.async_call = dispatch
+    asyncio.run(update(sensor, manager))
+    assert all(call[0] == "number" for call in receiver.calls)
+    assert not receiver.active

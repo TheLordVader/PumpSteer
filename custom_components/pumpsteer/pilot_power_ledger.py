@@ -27,6 +27,7 @@ class PowerLedger:
         self.currency = None
         self.mixed_currency = False
         self._price_cache = None
+        self._energy_price_attributes = {}
         self._energy_anchors = {}
         self._energy_updated = {}
         self._energy_units = {}
@@ -408,15 +409,23 @@ class PowerLedger:
                 elif dt > 0:
                     self.gaps += 1
             if previous is None or at > previous[0]:
-                price_snapshot = tuple(
-                    SimpleNamespace(
-                        state=getattr(source, "state", None),
-                        last_reported=getattr(source, "last_reported", None),
-                        attributes=deepcopy(getattr(source, "attributes", {}) or {}),
+                snapshots = []
+                for index, source in enumerate(prices):
+                    if source is None:
+                        continue
+                    attrs = getattr(source, "attributes", {}) or {}
+                    cached = self._energy_price_attributes.get(index)
+                    if cached is None or cached != attrs:
+                        cached = deepcopy(attrs)
+                        self._energy_price_attributes[index] = cached
+                    snapshots.append(
+                        SimpleNamespace(
+                            state=getattr(source, "state", None),
+                            last_reported=getattr(source, "last_reported", None),
+                            attributes=cached,
+                        )
                     )
-                    for source in prices
-                    if source is not None
-                )
+                price_snapshot = tuple(snapshots)
                 units = [
                     (
                         (getattr(source, "attributes", {}) or {}).get(

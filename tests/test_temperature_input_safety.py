@@ -779,3 +779,47 @@ def test_slow_zone_notification_does_not_block_main_control(control, monkeypatch
             await asyncio.sleep(0)
 
     asyncio.run(scenario())
+
+
+def test_unreasonable_or_fahrenheit_single_control_sensor_enters_safe_mode(control):
+    sensor, states, clock = control
+    _report(states, clock)
+    states["sensor.indoor"].state = "68"
+    states["sensor.indoor"].attributes = {"unit_of_measurement": "°F"}
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["mode"] == MODE_SAFE
+    states["sensor.indoor"].state = "999"
+    states["sensor.indoor"].attributes = {"unit_of_measurement": "°C"}
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["mode"] == MODE_SAFE
+
+
+def test_weighted_temperature_has_consistent_report_and_component_freshness(control):
+    from custom_components.pumpsteer.pilot_passive import PilotPassive
+
+    sensor, states, clock = control
+    sensor._config_entry.options.update(
+        indoor_temp_entity_2="sensor.second", indoor_temp_weight_2=1
+    )
+    _report(states, clock)
+    states["sensor.indoor"].last_changed = clock[0] - timedelta(minutes=4)
+    states["sensor.indoor"].last_reported = clock[0] - timedelta(minutes=2)
+    states["sensor.second"] = SimpleNamespace(
+        state="19",
+        attributes={"unit_of_measurement": "°C"},
+        last_reported=clock[0],
+        last_changed=clock[0] - timedelta(minutes=1),
+    )
+    state = sensor._temperature_state(sensor._cfg(), "indoor_temp_entity")
+    assert state.last_changed <= state.last_reported
+    assert PilotPassive._report(state, clock[0], temperature=True) is not None
+    outside = states["sensor.outdoor"]
+    outside.attributes = {"unit_of_measurement": "°C"}
+    outside.last_changed = clock[0] - timedelta(minutes=2)
+    pilot = PilotPassive()
+    pilot.observe_indicated(clock[0], state, outside, {})
+    assert pilot.indicated_house.last_status != "temperature_context_transition"
+    assert pilot.indicated_house.last_status != "temperature_report_unavailable"
+    states["sensor.indoor"].last_reported = clock[0] - timedelta(minutes=6)
+    state = sensor._temperature_state(sensor._cfg(), "indoor_temp_entity")
+    assert PilotPassive._report(state, clock[0], temperature=True) is None

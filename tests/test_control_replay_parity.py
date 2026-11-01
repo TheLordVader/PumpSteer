@@ -272,7 +272,7 @@ def test_winter_time_fold_matches_frozen_live(monkeypatch, caplog):
     state = ControlReplayState.from_sensor(sensor)
     for fold, fake, preheat, integral in (
         (0, 3.5, 0.066667, 0.0175),
-        (1, 2.2, 0.4, 0.017675),
+        (1, 1.1, 0.4, 1.0675),
     ):
         now = datetime(
             2026, 10, 25, 2, 15, tzinfo=ZoneInfo("Europe/Stockholm"), fold=fold

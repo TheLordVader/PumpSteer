@@ -60,7 +60,7 @@ async def async_push_modbus(
     )
     now = dt_util.now()
     if last_push_time is not None:
-        elapsed = (now - last_push_time).total_seconds() / 60.0
+        elapsed = (now.timestamp() - last_push_time.timestamp()) / 60.0
         if elapsed < interval_minutes:
             return last_push_time
 
@@ -150,6 +150,7 @@ async def async_push_ohmigo(
     last_push_time: Optional[datetime],
     *,
     temperature_check: Optional[Callable[[], bool]] = None,
+    temperature_sources=None,
 ) -> Optional[datetime]:
     """Push fake_temp to GOS and, when configured, to an Ohmigo number entity."""
     # GOS is independent from Ohmigo and must run even if no Ohmigo entity is configured.
@@ -168,7 +169,7 @@ async def async_push_ohmigo(
     )
     now = dt_util.now()
     if last_push_time is not None:
-        elapsed = (now - last_push_time).total_seconds() / 60.0
+        elapsed = (now.timestamp() - last_push_time.timestamp()) / 60.0
         if elapsed < interval_minutes:
             return last_push_time
 
@@ -197,7 +198,7 @@ async def async_push_ohmigo(
         )
 
     context = (
-        guard.temperature_write(output_check)
+        guard.temperature_write(output_check, source_entities=temperature_sources)
         if guard is not None and temperature_check is not None
         else nullcontext(output_check if temperature_check is not None else None)
     )

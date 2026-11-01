@@ -307,14 +307,6 @@
       "invalid_notification_setting": "Invalid notification setting",
       "invalid_detection_method": "Invalid heating detection method.",
       "heat_signal_alias": "The heat signal must be a separate radiator heat indicator."
-    },
-    "selector": {
-      "zone_profile": {
-        "options": {
-          "maintenance": "Maintenance heat",
-          "comfort": "Comfort"
-        }
-      }
     }
   },
   "entity": {
@@ -347,6 +339,12 @@
         "automatic": "Automatic (recommended)",
         "manual": "Manual supply threshold",
         "verified": "Verified heating entity"
+      }
+    },
+    "zone_profile": {
+      "options": {
+        "maintenance": "Maintenance heat",
+        "comfort": "Comfort"
       }
     }
   }

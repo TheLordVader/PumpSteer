@@ -603,3 +603,28 @@ def test_relative_trend_accepts_slightly_asynchronous_observed_reports():
             outdoor.last_reported, cfg, {"sensor.z": room}, outdoor=outdoor
         )
     assert result["1"]["relative_trend_c_per_hour"] == pytest.approx(0)
+
+
+def test_invalid_high_temperature_cannot_clear_alarm():
+    now = datetime(2026, 10, 31, tzinfo=timezone.utc)
+    cfg = [
+        {
+            "entity": "sensor.zone",
+            "threshold": 5,
+            "enabled": True,
+            "alarm_delay_minutes": 1,
+        }
+    ]
+    state = SimpleNamespace(
+        state="4", attributes={"unit_of_measurement": "°C"}, last_reported=now
+    )
+    monitor = ExtraZones()
+    monitor.observe(now, cfg, {"sensor.zone": state})
+    state.last_reported += timedelta(minutes=1)
+    monitor.observe(state.last_reported, cfg, {"sensor.zone": state})
+    monitor.mark_sent(1)
+    state.state = "999"
+    state.last_reported += timedelta(minutes=1)
+    result, alerts = monitor.observe(state.last_reported, cfg, {"sensor.zone": state})
+    assert result["1"]["alarm_active"]
+    assert not any(a["event"] == "recovery" for a in alerts)

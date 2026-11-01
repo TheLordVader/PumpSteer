@@ -308,14 +308,6 @@
       "invalid_notification_setting": "Ogiltig notisinställning",
       "invalid_detection_method": "Ogiltig metod för värmedetektering.",
       "heat_signal_alias": "Värmesignalen måste vara en separat indikator för radiatorvärme."
-    },
-    "selector": {
-      "zone_profile": {
-        "options": {
-          "maintenance": "Underhållsvärme",
-          "comfort": "Komfort"
-        }
-      }
     }
   },
   "entity": {
@@ -348,6 +340,12 @@
         "automatic": "Automatisk (rekommenderas)",
         "manual": "Manuell framledningströskel",
         "verified": "Verifierad värmedriftssignal"
+      }
+    },
+    "zone_profile": {
+      "options": {
+        "maintenance": "Underhållsvärme",
+        "comfort": "Komfort"
       }
     }
   }
