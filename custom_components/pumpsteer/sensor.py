@@ -178,6 +178,15 @@ class PumpSteerSensor(RestoreEntity):
         self._pi = PIController()
         self._pi_precool_paused: bool = False
         self._thermal_model = ThermalModel()
+        self._adaptive_context = None
+        self._adaptive_report = None
+        self._adaptive_new_report = False
+        self._adaptive_inputs_fresh = False
+        self._adaptive_braking = {
+            "state": "base",
+            "reason": "disabled",
+            "multiplier": 1.0,
+        }
         self._pilot = None
         from .pilot_forecast_audit import ForecastAudit
 
@@ -588,33 +597,49 @@ class PumpSteerSensor(RestoreEntity):
             self._brake_last_expensive_t,
         )
 
-        saved_k = safe_float(
-            self._attributes.get("thermal_k_restore", self._attributes.get("thermal_k"))
-        )
-        if saved_k is not None and self._attributes.get("thermal_k_valid") is True:
-            self._thermal_model.restore_k(saved_k)
-            self._thermal_model.restore_diagnostics(
-                sample_count=self._attributes.get("thermal_k_samples", 0),
-                fit_rmse=self._attributes.get("thermal_fit_rmse_c_per_hour"),
-                learning_sessions=self._attributes.get("thermal_learning_sessions", 0),
-                validated_sessions=self._attributes.get(
-                    "thermal_validated_sessions", 0
-                ),
-                prediction_mae=self._attributes.get("thermal_prediction_mae_c"),
-                validation_basis=self._attributes.get("thermal_validation_basis"),
-                last_prediction_error=self._attributes.get(
-                    "thermal_last_prediction_error_c"
-                ),
-                last_session_duration_minutes=self._attributes.get(
-                    "thermal_last_session_duration_minutes"
-                ),
-                last_session_actual_drop=self._attributes.get(
-                    "thermal_last_session_actual_drop_c"
-                ),
-                last_session_predicted_drop=self._attributes.get(
-                    "thermal_last_session_predicted_drop_c"
-                ),
+        try:
+            saved_k = safe_float(
+                self._attributes.get(
+                    "thermal_k_restore", self._attributes.get("thermal_k")
+                )
             )
+            if saved_k is not None and self._attributes.get("thermal_k_valid") is True:
+                self._thermal_model.restore_k(saved_k)
+                self._thermal_model.restore_diagnostics(
+                    sample_count=self._attributes.get("thermal_k_samples", 0),
+                    fit_rmse=self._attributes.get("thermal_fit_rmse_c_per_hour"),
+                    learning_sessions=self._attributes.get(
+                        "thermal_learning_sessions", 0
+                    ),
+                    validated_sessions=self._attributes.get(
+                        "thermal_validated_sessions", 0
+                    ),
+                    prediction_mae=self._attributes.get("thermal_prediction_mae_c"),
+                    validation_basis=self._attributes.get("thermal_validation_basis"),
+                    last_prediction_error=self._attributes.get(
+                        "thermal_last_prediction_error_c"
+                    ),
+                    last_session_duration_minutes=self._attributes.get(
+                        "thermal_last_session_duration_minutes"
+                    ),
+                    last_session_actual_drop=self._attributes.get(
+                        "thermal_last_session_actual_drop_c"
+                    ),
+                    last_session_predicted_drop=self._attributes.get(
+                        "thermal_last_session_predicted_drop_c"
+                    ),
+                )
+
+        except (TypeError, ValueError, OverflowError):
+            self._thermal_model = ThermalModel()
+            _LOGGER.warning("Discarding corrupt restored thermal model")
+
+        adaptive_saved = self._attributes.get("adaptive_model_state")
+        if isinstance(adaptive_saved, dict):
+            self._adaptive_context = adaptive_saved.get("context")
+            self._thermal_model.restore_adaptive(adaptive_saved.get("evidence"))
+
+        self._attributes["adaptive_braking"] = dict(self._adaptive_braking)
 
         # Wait until Home Assistant is fully started before the first real update.
         # If HA is already running (for example on reload), update immediately.
@@ -1093,6 +1118,11 @@ class PumpSteerSensor(RestoreEntity):
                 if self._last_pi_result is not None
                 else None
             ),
+            "adaptive_braking": dict(self._adaptive_braking),
+            "adaptive_model_state": {
+                "context": self._adaptive_context,
+                "evidence": self._thermal_model.adaptive_snapshot(),
+            },
             "thermal_k": round(self._thermal_model.k, 4),
             "thermal_k_restore": self._thermal_model.k,
             "thermal_k_valid": self._thermal_model.is_valid,
@@ -1163,6 +1193,13 @@ class PumpSteerSensor(RestoreEntity):
         outdoor: float,
     ) -> None:
         """Observe stable braking without changing the heat pump control path."""
+        adaptive = self._cfg().get("adaptive_braking_enabled") is True
+        if adaptive and active:
+            if not self._adaptive_inputs_fresh:
+                self._thermal_model.cancel_validation_session()
+                active, reason = False, "temperature_reports_unavailable"
+            elif not self._adaptive_new_report:
+                return
         was_active = self._thermal_learning_active
         self._thermal_learning_active = active
         self._thermal_learning_reason = reason
@@ -1184,11 +1221,20 @@ class PumpSteerSensor(RestoreEntity):
                 )
         if not was_active:
             # Never infer the stable brake cooling rate from earlier PI/ramp history.
-            self._thermal_model.reset_temp_history(now, indoor)
+            self._thermal_model.reset_temp_history(
+                self._adaptive_report if adaptive else now, indoor
+            )
 
         if not self._thermal_model.validation_session_active:
-            self._thermal_model.start_validation_session(now, indoor, outdoor)
-        elif not self._thermal_model.update_validation_session(now, indoor, outdoor):
+            self._thermal_model.start_validation_session(
+                self._adaptive_report if adaptive else now,
+                indoor,
+                outdoor,
+                adaptive_observations=adaptive,
+            )
+        elif not self._thermal_model.update_validation_session(
+            self._adaptive_report if adaptive else now, indoor, outdoor
+        ):
             # An interrupted session is discarded, then restarted next cycle.
             self._thermal_learning_reason = "observation_gap"
 
@@ -1201,6 +1247,12 @@ class PumpSteerSensor(RestoreEntity):
         now: datetime,
     ) -> None:
         self._control_modifier_state = None
+        self._adaptive_braking = {
+            "state": "base",
+            "reason": "safe_mode",
+            "multiplier": 1.0,
+        }
+        self._adaptive_inputs_fresh = False
         self._control_signal_snapshot = {}
         self._control_applied_kind = None
         self._pilot_plan = self._unavailable_pilot_plan("safe_mode")
@@ -1621,12 +1673,99 @@ class PumpSteerSensor(RestoreEntity):
         )
         return self._preheat_ramp
 
+    def _prepare_adaptive_observation(self, cfg, now, identity):
+        """HA report evidence is observed response, never physical heat delivery."""
+        context = repr(
+            (
+                identity,
+                cfg.get("brake_delta_c", BRAKE_DELTA_C),
+                self._aggressiveness(cfg),
+                cfg.get("external_heat_sources", False),
+            )
+        )
+        if self._adaptive_context != context:
+            self._thermal_model = ThermalModel()
+            self._adaptive_context = context
+            self._adaptive_report = None
+        indoor = self._temperature_state(cfg, "indoor_temp_entity")
+        outdoor = self._temperature_state(cfg, "real_outdoor_entity")
+        reports = [getattr(s, "last_reported", None) for s in (indoor, outdoor)]
+        oldest = (getattr(indoor, "attributes", {}) or {}).get(
+            "oldest_component_report"
+        )
+        if oldest is not None:
+            reports.append(oldest)
+        self._adaptive_inputs_fresh = all(
+            isinstance(at, datetime)
+            and at.utcoffset() is not None
+            and 0 <= now.timestamp() - at.timestamp() <= 300
+            for at in reports
+        )
+        report = reports[0]
+        self._adaptive_new_report = bool(
+            self._adaptive_inputs_fresh
+            and (
+                self._adaptive_report is None
+                or report.timestamp() > self._adaptive_report.timestamp()
+            )
+        )
+        if self._adaptive_new_report:
+            self._adaptive_report = report
+
+    def _adaptive_brake_multiplier(
+        self, now, cfg, indoor, outdoor, comfort_floor, ramp_in, ramp_out, eligible
+    ):
+        enabled = cfg.get("adaptive_braking_enabled") is True
+        model = getattr(self, "_adaptive_evidence_model", self._thermal_model)
+        reason = "disabled"
+        predicted = None
+        requested = 1.0
+        if enabled:
+            reason = model.adaptive_reason(now, indoor - outdoor)
+            if not getattr(self, "_adaptive_inputs_fresh", False):
+                reason = "temperature_reports_unavailable"
+            elif cfg.get("external_heat_sources") is True:
+                reason = "external_heat_sources"
+            if reason == "qualified" and eligible:
+                predicted = model.predict_drop(indoor, outdoor, 30)
+                # The model describes unmodified braking, not causal heat output.
+                # Reduce only: retain a 0.2 C reserve plus 0.2 C validation allowance.
+                budget = max(0.0, indoor - comfort_floor - 0.4)
+                if predicted > budget and predicted > 0:
+                    requested = 1.0 - 0.25 * min(1.0, (predicted - budget) / predicted)
+            elif reason == "qualified":
+                reason = "outside_price_braking"
+        history = getattr(self, "_control_modifier_state", None) or {}
+        if enabled or "adaptive" in history:
+            multiplier = self._control_modifier_multiplier(
+                now, "adaptive", requested, True, ramp_in, ramp_out
+            )
+        else:
+            multiplier = 1.0
+        self._adaptive_braking = {
+            "state": "adapting"
+            if multiplier < 1 and requested < 1
+            else "returning_to_base"
+            if multiplier < 1
+            else "learned"
+            if reason == "qualified"
+            else "collecting"
+            if enabled
+            else "base",
+            "reason": reason,
+            "multiplier": round(multiplier, 6),
+            "predicted_drop_30m_c": round(predicted, 3)
+            if predicted is not None
+            else None,
+        }
+        return multiplier
+
     def _control_modifier_multiplier(
         self, now, kind, target, enabled, ramp_in, ramp_out
     ):
         """Ramp only the optional correction; stale observations are never reused."""
         history = dict(getattr(self, "_control_modifier_state", None) or {})
-        previous_kind = history.get("_last_kind")
+        previous_kind = kind if kind == "adaptive" else history.get("_last_kind")
         if not enabled:
             history.pop(kind, None)
             if history:
@@ -1634,7 +1773,7 @@ class PumpSteerSensor(RestoreEntity):
             self._control_modifier_state = history or None
             return 1.0
         previous = history.get(kind)
-        maximum = 0.5 if kind == "brake" else 1.0
+        maximum = 0.25 if kind == "adaptive" else 0.5 if kind == "brake" else 1.0
         requested = max(0.0, min(maximum, 1.0 - target))
         if previous is None:
             current, elapsed = 0.0, 60.0
@@ -1658,9 +1797,13 @@ class PumpSteerSensor(RestoreEntity):
             now if now.timestamp() >= previous_time.timestamp() else previous_time
         )
         history[kind] = (current, timestamp)
-        history["_last_kind"] = kind
+        if kind != "adaptive":
+            history["_last_kind"] = kind
         self._control_modifier_state = history
-        if getattr(self, "_control_intelligence", None) is not None:
+        if (
+            kind != "adaptive"
+            and getattr(self, "_control_intelligence", None) is not None
+        ):
             self._control_intelligence["transition"] = (
                 "returning_to_base"
                 if requested == 0 and current > 0
@@ -2097,7 +2240,15 @@ class PumpSteerSensor(RestoreEntity):
         aggressiveness = self._aggressiveness(cfg)
         house_inertia = self._house_inertia(cfg)
 
-        self._thermal_model.record_temp(now, indoor)
+        if cfg.get("adaptive_braking_enabled") is True:
+            self._prepare_adaptive_observation(cfg, now, identity)
+            if self._adaptive_new_report:
+                self._thermal_model.record_temp(self._adaptive_report, indoor)
+            elif not self._adaptive_inputs_fresh:
+                self._thermal_model.record_temp(now, None)
+        else:
+            self._adaptive_inputs_fresh = False
+            self._thermal_model.record_temp(now, indoor)
 
         if indoor is None or outdoor is None:
             missing = []
@@ -2315,6 +2466,14 @@ class PumpSteerSensor(RestoreEntity):
         # 1. Summer mode.
         if outdoor >= summer_threshold:
             self._control_modifier_state = None
+            self._adaptive_braking = {
+                "state": "base",
+                "reason": "control_phase_reset"
+                if cfg.get("adaptive_braking_enabled") is True
+                else "disabled",
+                "multiplier": 1.0,
+                "predicted_drop_30m_c": None,
+            }
             self._update_thermal_learning(
                 active=False,
                 reason="summer_mode",
@@ -2353,6 +2512,14 @@ class PumpSteerSensor(RestoreEntity):
         # 2. Precool.
         if self._should_precool(summer_threshold, forecast_temps):
             self._control_modifier_state = None
+            self._adaptive_braking = {
+                "state": "base",
+                "reason": "control_phase_reset"
+                if cfg.get("adaptive_braking_enabled") is True
+                else "disabled",
+                "multiplier": 1.0,
+                "predicted_drop_30m_c": None,
+            }
             self._update_thermal_learning(
                 active=False,
                 reason="precool",
@@ -2395,6 +2562,14 @@ class PumpSteerSensor(RestoreEntity):
         # 3. Aggressiveness 0 -> pure PI, no price logic.
         if aggressiveness == 0:
             self._control_modifier_state = None
+            self._adaptive_braking = {
+                "state": "base",
+                "reason": "control_phase_reset"
+                if cfg.get("adaptive_braking_enabled") is True
+                else "disabled",
+                "multiplier": 1.0,
+                "predicted_drop_30m_c": None,
+            }
             self._update_thermal_learning(
                 active=False,
                 reason="price_control_disabled",
@@ -2477,7 +2652,17 @@ class PumpSteerSensor(RestoreEntity):
                 ramp_in,
                 ramp_out,
             )
-            factor *= multiplier
+            adaptive_multiplier = self._adaptive_brake_multiplier(
+                now,
+                cfg,
+                indoor,
+                outdoor,
+                comfort_floor,
+                ramp_in,
+                ramp_out,
+                brake_requested and multiplier == 1.0,
+            )
+            factor *= multiplier * adaptive_multiplier
             if factor > 0.0:
                 pi_demand = self._pi_output(
                     target,
@@ -2493,7 +2678,9 @@ class PumpSteerSensor(RestoreEntity):
                 learning_active = (
                     brake_requested
                     and multiplier == 1.0
-                    and factor >= 0.75
+                    and adaptive_multiplier == 1.0
+                    and factor
+                    >= (0.99 if cfg.get("adaptive_braking_enabled") is True else 0.75)
                     and outdoor <= summer_threshold - 2.0
                     and indoor - outdoor >= 2.0
                 )
@@ -2633,7 +2820,9 @@ class PumpSteerSensor(RestoreEntity):
                     ramp_in,
                     ramp_out,
                 )
-                factor *= multiplier
+                factor *= multiplier * self._adaptive_brake_multiplier(
+                    now, cfg, indoor, outdoor, comfort_floor, ramp_in, ramp_out, False
+                )
                 pi_demand = self._pi_output(
                     target,
                     indoor,
@@ -2834,7 +3023,16 @@ class PumpSteerSensor(RestoreEntity):
             ramp_in,
             ramp_out,
         )
-        factor *= multiplier
+        factor *= multiplier * self._adaptive_brake_multiplier(
+            now,
+            cfg,
+            indoor,
+            outdoor,
+            comfort_floor,
+            ramp_in,
+            ramp_out,
+            bridge_short_dip and multiplier == 1.0,
+        )
 
         # Hold and ramp-out still limit heating through the brake overlay.
         # Resume integration only once that overlay has fully released.

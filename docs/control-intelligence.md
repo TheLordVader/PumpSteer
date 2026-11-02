@@ -1,5 +1,15 @@
 # One control engine, three optional levels
 
+## Product objective
+
+PumpSteer aims to be a self-learning, autonomous and manufacturer-independent
+heating controller that uses available reliable information to improve comfort
+and electricity cost. A basic installation must work without optional telemetry;
+additional verified information should improve the same control process. Learned
+house response must eventually inform bounded control decisions, with automatic
+fallback when evidence is insufficient. Predictions and simulated savings must
+remain distinct from measured outcomes.
+
 ## Control map and existing contracts
 
 The stable baseline is `b273afc`; this hardening starts from `78b9807`.
@@ -165,3 +175,68 @@ claim field savings or fewer compressor starts.
 The helper has no buffer, background task, listener, model or database. It reads
 only a bounded handful of already available states on the existing control cycle.
 Diagnostics are excluded from Recorder; no large per-cycle history is added.
+
+## Adaptive price braking — first closed-loop delivery
+
+The product objective above is implemented first as an optional conservative
+adjustment of existing price braking. `adaptive_braking_enabled` defaults to
+false, independently of passive Thermal Intelligence and the two verified
+telemetry limiters. The existing thermal coefficient describes **observed net
+cooling during unmodified braking**, not measured heat loss, power or COP.
+
+Implementation sequence: qualify distinct HA temperature reports; fit the existing
+ThermalModel; issue independent 30-minute forecasts; validate three later baseline
+braking sessions; use the qualified response to reduce price braking near the
+comfort floor; ramp back to Base as evidence expires or degrades. The existing PI,
+price classification, output validation, Ohmigo and Relay Guard remain the only
+control/output chain. Preheat and recovery optimization remain future consumers
+of this same evidence, and are not implemented in this delivery.
+
+Activation and quality:
+
+- Enable **Adaptiv prisbromsning / Adaptive price braking** under Thermal
+  Intelligence after a separate installation GO. No extra heat-pump sensors are
+  required. Normal room/outdoor HA reports are observational evidence, not proof
+  of physical sampling time or heat delivery. Cached/repeated polling ticks do
+  not add learning samples.
+- Learning requires distinct indoor reports and indoor/outdoor report coverage
+  within five minutes, stable near-full braking, heating-season temperature
+  difference, at least 20 accepted rate samples and fit residual <=0.3 C/hour.
+  Slower or insufficient reports leave existing Base control available unchanged.
+- Each qualifying session issues a 30-minute prediction using only information
+  available at its start. Check it against a new indoor report at 30–31 minutes.
+  Three separate sessions must each have absolute error <=0.2 C. Confidence alone
+  cannot activate control. Evidence expires after seven days; current indoor–outdoor
+  difference must remain within 5 C of the validation range.
+- Only reduce braking, by at most 25%. Compare predicted 30-minute cooling with
+  remaining comfort margin after a 0.2 C reserve and 0.2 C error allowance. Ramp
+  the correction using existing ramp times (minimum ten minutes, elapsed time
+  capped at one minute per update). Never add braking or bypass the comfort floor.
+- Modified braking does not train or validate the baseline response. Expired
+  evidence returns gradually to Base, allowing new unmodified validation. Sensor
+  source/weight, selected outdoor source, brake-depth or aggressiveness changes
+  discard old evidence. SAFE resets output correction; restored correction is
+  never applied. Known intermittent extra heat disables adaptive use.
+
+`adaptive_braking` reports `collecting` (Samlar erfarenhet), `learned` (Lärt husets
+respons), `adapting` (Anpassar styrningen), `returning_to_base` (Återgår) or `base`
+(Grundreglering), together with the gate reason, applied multiplier and predicted
+30-minute drop. `adaptive_model_state` is a compact versioned RestoreEntity
+summary: coefficient association, source context and only three validation rows.
+Existing bounded learning buffers remain unchanged; no new listener, polling,
+database, service, output path or model training dependency is introduced.
+
+For a later Tallåsen installation GO: verify candidate file hashes, back up HA
+and preserve the installed `b273afc` integration/settings, install only candidate
+integration files and perform the agreed Core restart. Verify normal SAFE recovery,
+PI/prices, ordinary Ohmigo output and Relay Guard before enabling this option.
+Then observe sample count, fit residual, three holdouts, gate reasons, brake factor,
+virtual outdoor command and room-temperature floor during actual price periods.
+Disable this option for immediate normal-operation selection (an existing correction
+ramps out); restore only the previous integration files/settings if rollback is
+needed. No production actions are part of local development.
+
+Replay changes demonstrate program behavior and bounded comfort protection, not
+measured energy, compressor-start, comfort or monetary improvements. Actual benefit
+requires later prospective temperature/comfort comparison and, for cost claims,
+qualified metering and prices. The electricity accounting engine is untouched.

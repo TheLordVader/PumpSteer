@@ -2294,3 +2294,60 @@ async def test_native_rest_ebusd_message_timestamp_is_not_refreshed_by_http(
     )
     assert evaluate()["brake_multiplier"] == 1.0
     assert len(requests) >= 3 and all(path == "/data/mc" for path in requests)
+
+
+@pytest.mark.parametrize("corrupt", [False, True])
+async def test_native_adaptive_model_restore_and_default_off(
+    recorder_mock, hass, enable_custom_integrations, corrupt
+):
+    """Real RestoreEntity cache retains evidence, never an applied correction."""
+    from homeassistant.core import State
+    from pytest_homeassistant_custom_component.common import mock_restore_cache
+    from custom_components.pumpsteer.thermal_model import VALIDATION_BASIS
+
+    now = dt_util.utcnow()
+    evidence = {
+        "version": 1,
+        "k": 0.04,
+        "validations": [
+            [(now - timedelta(hours=hour)).timestamp(), 0.05, 16.0]
+            for hour in (3, 2, 1)
+        ],
+    }
+    saved = {
+        "thermal_k_restore": 0.04,
+        "thermal_k_valid": True,
+        "thermal_k_samples": "broken" if corrupt else 30,
+        "thermal_fit_rmse_c_per_hour": 0.05,
+        "thermal_validation_basis": VALIDATION_BASIS,
+        "adaptive_model_state": {"context": "source-context", "evidence": evidence},
+        "adaptive_braking": {"state": "adapting", "multiplier": 0.75},
+    }
+    mock_restore_cache(hass, [State("sensor.pumpsteer", "8", saved)])
+    entry = MockConfigEntry(domain="pumpsteer", title="test", data={}, options={})
+    entry.add_to_hass(hass)
+    assert await async_setup_component(hass, "pumpsteer", {})
+    await hass.async_block_till_done()
+    sensor = next(
+        e for e in hass.data[SENSOR].entities if e.unique_id == entry.entry_id
+    )
+    assert sensor._cfg().get("adaptive_braking_enabled", False) is False
+    assert sensor._control_modifier_state is None
+    assert sensor._thermal_model.adaptive_reason(now, 16) == (
+        "model_unqualified" if corrupt else "qualified"
+    )
+    assert not sensor._thermal_model.validation_session_active
+    flow = await hass.config_entries.options.async_init(entry.entry_id)
+    flow = await hass.config_entries.options.async_configure(
+        flow["flow_id"], {"next_step_id": "thermal"}
+    )
+    assert flow["step_id"] == "thermal"
+    flow = await hass.config_entries.options.async_configure(
+        flow["flow_id"],
+        {
+            "adaptive_braking_enabled": True,
+            "thermal_intelligence_enabled": False,
+        },
+    )
+    assert flow["type"] == "create_entry"
+    assert entry.options["adaptive_braking_enabled"] is True

@@ -9,7 +9,8 @@ to accumulate general year-round household telemetry.
 
 In PumpSteer 2.2.x the fitted model remains diagnostic with respect to control
 decisions. It can predict expected temperature drop and validate those predictions,
-but it does NOT directly change brake depth or state-machine decisions.
+An explicitly enabled adaptive brake may use separately qualified, fixed-horizon
+validation to conservatively reduce existing price braking.
 """
 
 from __future__ import annotations
@@ -88,12 +89,15 @@ class _ValidationSession:
     start_outdoor: float
     last_time: datetime
     last_indoor: float
+    forecast_30m: Optional[float] = None
+    forecast_checked: bool = False
 
 
 class ThermalModel:
     """Estimate and validate observed house cooling response during braking."""
 
     def __init__(self) -> None:
+        self._adaptive_validations = deque(maxlen=3)
         self._k: float = _FALLBACK_K
         self._valid: bool = False
         self._sample_count: int = 0
@@ -308,6 +312,70 @@ class ThermalModel:
             return None
         return numeric if math.isfinite(numeric) and numeric >= 0.0 else None
 
+    def adaptive_snapshot(self):
+        """Tiny versioned evidence for the current fitted coefficient; no raw history."""
+        return {
+            "version": 1,
+            "k": self._k,
+            "validations": list(self._adaptive_validations),
+        }
+
+    def restore_adaptive(self, saved):
+        """Reject incompatible/corrupt evidence instead of qualifying an old model."""
+        self._adaptive_validations.clear()
+        try:
+            if (
+                not isinstance(saved, dict)
+                or saved.get("version") != 1
+                or saved.get("k") != self._k
+            ):
+                return
+            rows = saved["validations"]
+            if not isinstance(rows, list) or len(rows) > 3:
+                return
+            parsed = []
+            for row in rows:
+                if len(row) != 3 or not all(
+                    type(v) in (float, int) and math.isfinite(v) for v in row
+                ):
+                    return
+                at, error, delta = row
+                if (
+                    at <= 0
+                    or not 2 <= delta <= 70
+                    or (parsed and at - parsed[-1][0] < 1800)
+                ):
+                    return
+                parsed.append((at, error, delta))
+            self._adaptive_validations.extend(parsed)
+        except (KeyError, TypeError, ValueError):
+            return
+
+    def adaptive_reason(self, now, delta):
+        """Quality gates independent of heuristic confidence and in-sample fit."""
+        if (
+            not self._valid
+            or self._sample_count < 20
+            or self._fit_rmse is None
+            or self._fit_rmse > 0.3
+        ):
+            return "model_unqualified"
+        rows = self._adaptive_validations
+        if len(rows) < 3:
+            return "insufficient_validation"
+        ages = [now.timestamp() - row[0] for row in rows]
+        if min(ages) < 0 or max(ages) > 7 * 86400:
+            return "validation_expired"
+        if any(abs(row[1]) > 0.2 for row in rows):
+            return "validation_error"
+        if (
+            not min(row[2] for row in rows) - 5
+            <= delta
+            <= max(row[2] for row in rows) + 5
+        ):
+            return "outside_validation_range"
+        return "qualified"
+
     # ── Temperature history and learning samples ───────────────────────────────
 
     def record_temp(self, now: datetime, indoor_temp: Optional[float]) -> None:
@@ -432,6 +500,7 @@ class ThermalModel:
             # Prediction metrics describe the previous k and must be revalidated.
             # Keep the historical learning-session count, not the old accuracy.
             self.cancel_validation_session()
+            self._adaptive_validations.clear()
             self._validated_sessions = 0
             self._prediction_mae = None
             self._last_prediction_error = None
@@ -465,6 +534,8 @@ class ThermalModel:
         now: datetime,
         indoor_temp: float,
         outdoor_temp: float,
+        *,
+        adaptive_observations: bool = False,
     ) -> None:
         """Start one relevant stable-braking validation session."""
         if self._session is not None:
@@ -478,6 +549,11 @@ class ThermalModel:
             start_outdoor=outdoor_temp,
             last_time=now,
             last_indoor=indoor_temp,
+            forecast_30m=(
+                self.predict_drop(indoor_temp, outdoor_temp, 30)
+                if self._valid and adaptive_observations
+                else None
+            ),
         )
 
     def update_validation_session(
@@ -495,6 +571,19 @@ class ThermalModel:
         ):
             self.cancel_validation_session()
             return False
+        duration = (now.timestamp() - session.start_time.timestamp()) / 60.0
+        if not session.forecast_checked and duration >= 30:
+            session.forecast_checked = True
+            if duration <= 31 and session.forecast_30m is not None:
+                # An issued 30-minute forecast, checked against a later real report.
+                error = session.start_indoor - indoor_temp - session.forecast_30m
+                self._adaptive_validations.append(
+                    (
+                        now.timestamp(),
+                        error,
+                        session.start_indoor - session.start_outdoor,
+                    )
+                )
         session.last_time = now
         session.last_indoor = indoor_temp
         return True

@@ -43,13 +43,15 @@
         "title": "Thermal Intelligence",
         "data": {
           "thermal_intelligence_enabled": "Thermal Intelligence (experimental diagnostics)",
-          "external_heat_sources": "Do you sometimes use an additional heat source?"
+          "external_heat_sources": "Do you sometimes use an additional heat source?",
+          "adaptive_braking_enabled": "Adaptive price braking"
         },
         "data_description": {
           "thermal_intelligence_enabled": "Passively collects qualified observations when a verified heat signal is selected. Does not affect heating control.",
-          "external_heat_sources": "For example, a fireplace or air-to-air heat pump. Intermittent extra heat cannot be reliably identified; learned results remain unvalidated."
+          "external_heat_sources": "For example, a fireplace or air-to-air heat pump. Intermittent extra heat cannot be reliably identified; learned results remain unvalidated.",
+          "adaptive_braking_enabled": "Learns observed house temperature response using your ordinary indoor and outdoor sensors. After at least three checks against later temperatures, it can cautiously reduce price braking near the comfort floor. Off on upgrade. Uncertain or old data returns to Base; no extra heat pump sensors are required. Does not claim measured energy savings."
         },
-        "description": "Passive analysis collects observations and diagnostics. Indicated heating is an estimate; verified heat delivery needs a reliable signal. Verified model learning needs qualified data. Analysis does not control the heat pump."
+        "description": "Passive analysis and optional adaptive price braking are separate choices. Adaptive braking uses observed temperature response, not assumed heat output. Advanced verified model learning requires reliable heat signals."
       },
       "telemetry": {
         "title": "Advanced sensors",

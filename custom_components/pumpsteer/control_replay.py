@@ -36,6 +36,7 @@ class ControlReplayState:
     prev_aggressiveness: int | None = None
     bridge_short_dip_active: bool = False
     control_modifier_state: dict | None = None
+    adaptive_model: Any = None
     thermal_pending_samples: int = 0
     thermal_should_refit: bool | None = None
 
@@ -55,6 +56,11 @@ class ControlReplayState:
             bridge_short_dip_active=sensor._bridge_short_dip_active,
             control_modifier_state=copy.deepcopy(
                 getattr(sensor, "_control_modifier_state", None)
+            ),
+            adaptive_model=(
+                copy.deepcopy(sensor._thermal_model)
+                if sensor._cfg().get("adaptive_braking_enabled") is True
+                else None
             ),
             thermal_pending_samples=sensor._thermal_model.pending_samples,
             thermal_should_refit=sensor._thermal_model.should_refit(),
@@ -80,6 +86,7 @@ class ControlReplayInput:
     preheat_enabled: bool
     prices_available: bool = True
     control_observation_states: dict | None = None
+    temperature_report_time: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -125,8 +132,30 @@ class _Scratch:
     _upcoming_expensive = PumpSteerSensor._upcoming_expensive
     _close_short_dip = PumpSteerSensor._close_short_dip
     _control_modifier_multiplier = PumpSteerSensor._control_modifier_multiplier
+    _adaptive_brake_multiplier = PumpSteerSensor._adaptive_brake_multiplier
 
     def __init__(self, state, inputs):
+        from .thermal_model import ThermalModel
+
+        self._adaptive_evidence_model = (
+            copy.deepcopy(state.adaptive_model)
+            if state.adaptive_model is not None
+            else ThermalModel()
+            if inputs.cfg.get("adaptive_braking_enabled") is True
+            else None
+        )
+        report = inputs.temperature_report_time
+        self._adaptive_inputs_fresh = bool(
+            isinstance(report, datetime)
+            and report.utcoffset() is not None
+            and 0 <= inputs.now.timestamp() - report.timestamp() <= 300
+        )
+        self._adaptive_braking = {
+            "state": "base",
+            "reason": "disabled",
+            "multiplier": 1.0,
+            "predicted_drop_30m_c": None,
+        }
         self._control_passive = True
         self._control_observation_states = inputs.control_observation_states or {}
         self._pi = copy.deepcopy(state.pi)
@@ -187,6 +216,7 @@ class _Scratch:
         self._close_short_dip(mode)
         if getattr(self, "_control_intelligence", None) is not None:
             attrs["control_intelligence"] = self._control_intelligence
+        attrs["adaptive_braking"] = dict(self._adaptive_braking)
         self._decision = ControlReplayDecision(
             fake_temp, mode, attrs, tuple(self._intentions)
         )
@@ -205,6 +235,7 @@ class _Scratch:
             prev_aggressiveness=self._prev_aggressiveness,
             bridge_short_dip_active=self._bridge_short_dip_active,
             control_modifier_state=copy.deepcopy(self._control_modifier_state),
+            adaptive_model=copy.deepcopy(self._adaptive_evidence_model),
             thermal_pending_samples=self._thermal_model.pending_samples,
             thermal_should_refit=self._thermal_model._should_refit,
         )

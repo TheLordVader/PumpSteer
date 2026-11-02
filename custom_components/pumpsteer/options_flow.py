@@ -40,7 +40,11 @@ _GROUPS = {
             )
         ],
     },
-    "thermal": {"thermal_intelligence_enabled", "external_heat_sources"},
+    "thermal": {
+        "thermal_intelligence_enabled",
+        "external_heat_sources",
+        "adaptive_braking_enabled",
+    },
     "telemetry": {
         "thermal_detection_method",
         "thermal_compressor_entity",
@@ -470,6 +474,10 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
                     "sensor.elpris_tomorrow",
                 ),
             ): selector({"entity": {"domain": "sensor"}}),
+            vol.Optional(
+                "adaptive_braking_enabled",
+                default=current_data.get("adaptive_braking_enabled", False),
+            ): selector({"boolean": {}}),
             vol.Optional(
                 "thermal_intelligence_enabled",
                 default=current_data.get("thermal_intelligence_enabled", False),

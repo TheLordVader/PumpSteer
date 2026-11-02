@@ -43,13 +43,15 @@
         "title": "Thermal Intelligence",
         "data": {
           "thermal_intelligence_enabled": "Thermal Intelligence (experimentell diagnostik)",
-          "external_heat_sources": "Använder du ibland en extra värmekälla?"
+          "external_heat_sources": "Använder du ibland en extra värmekälla?",
+          "adaptive_braking_enabled": "Adaptiv prisbromsning"
         },
         "data_description": {
           "thermal_intelligence_enabled": "Samlar passivt kvalificerade observationer om en verifierad värmesignal väljs. Påverkar inte värmestyrningen.",
-          "external_heat_sources": "Exempelvis braskamin eller luftvärmepump. Tillfällig extravärme kan inte identifieras säkert; inlärningsresultat förblir ovaliderade."
+          "external_heat_sources": "Exempelvis braskamin eller luftvärmepump. Tillfällig extravärme kan inte identifieras säkert; inlärningsresultat förblir ovaliderade.",
+          "adaptive_braking_enabled": "Lär husets observerade temperaturrespons med dina vanliga inne- och utegivare. Efter minst tre kontroller av senare temperaturutfall kan prisbromsningen minskas försiktigt nära komfortgränsen. Avstängd vid uppgradering. Osäkra eller gamla data ger grundreglering; inga extra värmepumpsgivare krävs. Visar inte uppmätta energibesparingar."
         },
-        "description": "Passiv analys samlar observationer och ger diagnostik. Indikerad värmedrift är en uppskattning; verifierad värmeleverans kräver en tillförlitlig signal. Verifierad modellinlärning kräver kvalificerade data. Analysen styr inte värmepumpen."
+        "description": "Passiv analys och frivillig adaptiv prisbromsning är separata val. Adaptiv bromsning använder observerad temperaturrespons, inte antagen värmeeffekt. Mer avancerad verifierad modellinlärning kräver tillförlitliga värmesignaler."
       },
       "telemetry": {
         "title": "Avancerade givare",
