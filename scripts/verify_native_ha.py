@@ -2307,7 +2307,7 @@ async def test_native_adaptive_model_restore_and_default_off(
 
     now = dt_util.utcnow()
     evidence = {
-        "version": 1,
+        "version": 2,
         "k": 0.04,
         "validations": [
             [(now - timedelta(hours=hour)).timestamp(), 0.05, 16.0]
@@ -2351,3 +2351,61 @@ async def test_native_adaptive_model_restore_and_default_off(
     )
     assert flow["type"] == "create_entry"
     assert entry.options["adaptive_braking_enabled"] is True
+
+
+async def test_native_adaptive_fifteen_minute_reports_are_distinct_observations(
+    recorder_mock, hass, enable_custom_integrations, freezer, monkeypatch
+):
+    """Real HA report timestamps, ordinary 0.1 C values, minute control cycles."""
+    from datetime import datetime, timezone
+
+    start = datetime(2026, 11, 3, 8, tzinfo=timezone.utc)
+    freezer.move_to(start)
+    entry = MockConfigEntry(
+        domain="pumpsteer",
+        title="test",
+        data={},
+        options={
+            "indoor_temp_entity": "sensor.room",
+            "real_outdoor_entity": "sensor.out",
+            "electricity_price_entity": "sensor.price",
+            "adaptive_braking_enabled": True,
+            "target_temperature": 21,
+            "aggressiveness": 3,
+            "house_inertia": 2,
+            "preheat_boost_enabled": False,
+        },
+    )
+    entry.add_to_hass(hass)
+    assert await async_setup_component(hass, "persistent_notification", {})
+    assert await async_setup_component(hass, "pumpsteer", {})
+    await hass.async_block_till_done()
+    sensor = next(
+        e for e in hass.data[SENSOR].entities if e.unique_id == entry.entry_id
+    )
+
+    async def prices(cfg, at):
+        return [10.0] * 96, ["expensive"] * 96, 15, at.hour * 4 + at.minute // 15
+
+    monkeypatch.setattr(sensor, "_get_prices", prices)
+    reports = []
+    for minute in range(61):
+        freezer.move_to(start + timedelta(minutes=minute, seconds=1))
+        if minute % 15 == 0:
+            hass.states.async_set(
+                "sensor.room",
+                round(23 - minute * 0.005, 1),
+                {"unit_of_measurement": "°C"},
+                force_update=True,
+            )
+            hass.states.async_set(
+                "sensor.out", 5, {"unit_of_measurement": "°C"}, force_update=True
+            )
+            reports.append(hass.states.get("sensor.room").last_reported)
+        await sensor._do_update()
+    assert sensor._attributes["mode"] == "braking"
+    assert sensor._thermal_model.pending_samples >= 2
+    assert all(at in reports for at, value in sensor._thermal_model._temp_history)
+    assert len(sensor._thermal_model._temp_history) <= len(reports)
+    assert sensor._adaptive_inputs_fresh
+    assert sensor._adaptive_braking["multiplier"] == 1

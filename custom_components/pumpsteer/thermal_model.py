@@ -7,10 +7,9 @@ The model estimates the house's observed cooling response during PumpSteer braki
 It deliberately learns only from relevant heating/braking periods; it is not intended
 to accumulate general year-round household telemetry.
 
-In PumpSteer 2.2.x the fitted model remains diagnostic with respect to control
-decisions. It can predict expected temperature drop and validate those predictions,
-An explicitly enabled adaptive brake may use separately qualified, fixed-horizon
-validation to conservatively reduce existing price braking.
+The fitted model can predict observed temperature drop and validate those
+predictions. An explicitly enabled adaptive brake may use separately qualified,
+prospective validation to conservatively reduce existing price braking.
 """
 
 from __future__ import annotations
@@ -48,6 +47,7 @@ _MIN_RATE_WINDOW_MINUTES = 3.0
 
 # Break temperature history and sessions across stale observations.
 _MAX_TEMP_GAP_MINUTES = 5.0
+ADAPTIVE_MAX_REPORT_GAP_MINUTES = 18.0
 
 # Plausible bounds for measured indoor temperature rate (°C/h).
 _MIN_RATE_C_PER_HOUR = -5.0
@@ -91,12 +91,15 @@ class _ValidationSession:
     last_indoor: float
     forecast_30m: Optional[float] = None
     forecast_checked: bool = False
+    adaptive_reports: bool = False
+    reports: int = 1
 
 
 class ThermalModel:
     """Estimate and validate observed house cooling response during braking."""
 
     def __init__(self) -> None:
+        self._adaptive_reports = False
         self._adaptive_validations = deque(maxlen=3)
         self._k: float = _FALLBACK_K
         self._valid: bool = False
@@ -315,7 +318,7 @@ class ThermalModel:
     def adaptive_snapshot(self):
         """Tiny versioned evidence for the current fitted coefficient; no raw history."""
         return {
-            "version": 1,
+            "version": 2,
             "k": self._k,
             "validations": list(self._adaptive_validations),
         }
@@ -326,7 +329,7 @@ class ThermalModel:
         try:
             if (
                 not isinstance(saved, dict)
-                or saved.get("version") != 1
+                or saved.get("version") != 2
                 or saved.get("k") != self._k
             ):
                 return
@@ -378,21 +381,45 @@ class ThermalModel:
 
     # ── Temperature history and learning samples ───────────────────────────────
 
-    def record_temp(self, now: datetime, indoor_temp: Optional[float]) -> None:
+    def record_temp(
+        self,
+        now: datetime,
+        indoor_temp: Optional[float],
+        *,
+        adaptive_reports: bool = False,
+    ) -> None:
         """
         Record indoor temperature for later cooling-rate estimation.
 
         Call every polling cycle, including missing readings, so an invalid
         observation breaks the rate history instead of inventing a temperature.
         """
+        if adaptive_reports and not self._adaptive_reports:
+            self._adaptive_reports = True
+            self._temp_history = deque(self._temp_history, maxlen=32)
         if indoor_temp is None or not math.isfinite(indoor_temp):
             self._temp_history.clear()
             return
         if self._temp_history:
             elapsed_seconds = now.timestamp() - self._temp_history[-1][0].timestamp()
-            if elapsed_seconds <= 0.0 or elapsed_seconds > _MAX_TEMP_GAP_MINUTES * 60:
+            if (
+                elapsed_seconds <= 0.0
+                or elapsed_seconds
+                > (
+                    ADAPTIVE_MAX_REPORT_GAP_MINUTES
+                    if self._adaptive_reports
+                    else _MAX_TEMP_GAP_MINUTES
+                )
+                * 60
+            ):
                 self._temp_history.clear()
         self._temp_history.append((now, indoor_temp))
+        if self._adaptive_reports:
+            while (
+                len(self._temp_history) > 1
+                and now.timestamp() - self._temp_history[0][0].timestamp() > 90 * 60
+            ):
+                self._temp_history.popleft()
 
     def reset_temp_history(self, now: datetime, indoor_temp: float) -> None:
         """Start a fresh rate window when stable thermal learning becomes eligible."""
@@ -443,14 +470,16 @@ class ThermalModel:
         - there are fewer than two samples
         - the history span is too short to be reliable
         """
-        if len(self._temp_history) < 2:
+        if len(self._temp_history) < (3 if self._adaptive_reports else 2):
             return None
 
         t_old, temp_old = self._temp_history[0]
         t_now, temp_now = self._temp_history[-1]
 
         dt_hours = (t_now.timestamp() - t_old.timestamp()) / 3600.0
-        if dt_hours < (_MIN_RATE_WINDOW_MINUTES / 60.0):
+        if dt_hours < (
+            (15 if self._adaptive_reports else _MIN_RATE_WINDOW_MINUTES) / 60.0
+        ):
             # Too little history — the estimate becomes noisy and unstable.
             return None
 
@@ -549,6 +578,7 @@ class ThermalModel:
             start_outdoor=outdoor_temp,
             last_time=now,
             last_indoor=indoor_temp,
+            adaptive_reports=adaptive_observations,
             forecast_30m=(
                 self.predict_drop(indoor_temp, outdoor_temp, 30)
                 if self._valid and adaptive_observations
@@ -566,17 +596,35 @@ class ThermalModel:
         elapsed = (now.timestamp() - session.last_time.timestamp()) / 60.0
         if (
             elapsed <= 0.0
-            or elapsed > _MAX_TEMP_GAP_MINUTES
+            or elapsed
+            > (
+                ADAPTIVE_MAX_REPORT_GAP_MINUTES
+                if session.adaptive_reports
+                else _MAX_TEMP_GAP_MINUTES
+            )
             or not all(math.isfinite(x) for x in (indoor_temp, outdoor_temp))
         ):
             self.cancel_validation_session()
             return False
+        session.reports += 1
         duration = (now.timestamp() - session.start_time.timestamp()) / 60.0
         if not session.forecast_checked and duration >= 30:
             session.forecast_checked = True
-            if duration <= 31 and session.forecast_30m is not None:
-                # An issued 30-minute forecast, checked against a later real report.
-                error = session.start_indoor - indoor_temp - session.forecast_30m
+            if (
+                duration <= 48
+                and session.reports >= 3
+                and session.forecast_30m is not None
+            ):
+                # Rule issued with the frozen trajectory: first actual report at/after
+                # 30 minutes, no later than 48. The endpoint is chosen by report time,
+                # never by its temperature/error. No temperature is interpolated.
+                predicted = self._predict_drop_with_k(
+                    session.prediction_k,
+                    session.start_indoor,
+                    session.start_outdoor,
+                    duration,
+                )
+                error = session.start_indoor - indoor_temp - predicted
                 self._adaptive_validations.append(
                     (
                         now.timestamp(),

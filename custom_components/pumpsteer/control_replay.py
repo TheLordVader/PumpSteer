@@ -135,7 +135,7 @@ class _Scratch:
     _adaptive_brake_multiplier = PumpSteerSensor._adaptive_brake_multiplier
 
     def __init__(self, state, inputs):
-        from .thermal_model import ThermalModel
+        from .thermal_model import ADAPTIVE_MAX_REPORT_GAP_MINUTES, ThermalModel
 
         self._adaptive_evidence_model = (
             copy.deepcopy(state.adaptive_model)
@@ -148,7 +148,9 @@ class _Scratch:
         self._adaptive_inputs_fresh = bool(
             isinstance(report, datetime)
             and report.utcoffset() is not None
-            and 0 <= inputs.now.timestamp() - report.timestamp() <= 300
+            and 0
+            <= inputs.now.timestamp() - report.timestamp()
+            <= ADAPTIVE_MAX_REPORT_GAP_MINUTES * 60
         )
         self._adaptive_braking = {
             "state": "base",

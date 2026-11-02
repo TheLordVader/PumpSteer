@@ -12,7 +12,11 @@ remain distinct from measured outcomes.
 
 ## Control map and existing contracts
 
-The stable baseline is `b273afc`; this hardening starts from `78b9807`.
+The reported installed reference is `76bf06d55f816aa69a612b9a61567b65523e0594`;
+verify the actual installed files/settings before any future deployment. Historical
+control-parity tests also retain `b273afc` as a verified code reference; it must not
+be mistaken for the currently reported installed version. This hardening starts
+from `78b9807`.
 The following map describes the actual code, not a replacement controller.
 
 1. `sensor._do_update` obtains qualified indoor temperature (up to three normalized
@@ -52,7 +56,7 @@ The following map describes the actual code, not a replacement controller.
 
 Both switches default off. Choosing any optional entity does not activate them.
 No changes to PI, prices, ramps, targets, physical outputs or safety contracts are
-needed. The baseline test executes the installed commit's actual branch method
+needed. The baseline test executes the historical verified reference's branch method
 against identical initial states and inputs (54 combinations). It also compares
 its control helpers and `control.py`, `control_ramps.py`, `settings.py` against
 working-tree code. Existing full golden traces cover price cycles, preheat,
@@ -185,8 +189,8 @@ telemetry limiters. The existing thermal coefficient describes **observed net
 cooling during unmodified braking**, not measured heat loss, power or COP.
 
 Implementation sequence: qualify distinct HA temperature reports; fit the existing
-ThermalModel; issue independent 30-minute forecasts; validate three later baseline
-braking sessions; use the qualified response to reduce price braking near the
+ThermalModel; issue independent frozen prediction trajectories; validate three
+later baseline braking sessions; use the qualified response to reduce price braking near the
 comfort floor; ramp back to Base as evidence expires or degrades. The existing PI,
 price classification, output validation, Ohmigo and Relay Guard remain the only
 control/output chain. Preheat and recovery optimization remain future consumers
@@ -200,11 +204,21 @@ Activation and quality:
   of physical sampling time or heat delivery. Cached/repeated polling ticks do
   not add learning samples.
 - Learning requires distinct indoor reports and indoor/outdoor report coverage
-  within five minutes, stable near-full braking, heating-season temperature
+  within eighteen minutes, stable near-full braking, heating-season temperature
   difference, at least 20 accepted rate samples and fit residual <=0.3 C/hour.
-  Slower or insufficient reports leave existing Base control available unchanged.
-- Each qualifying session issues a 30-minute prediction using only information
-  available at its start. Check it against a new indoor report at 30–31 minutes.
+  Adaptive rates use at least three distinct observations over at least fifteen
+  minutes, with up to 32 reports and at most 90 minutes in the existing small
+  history. This reduces 0.1 C quantization noise without inventing samples.
+  Ordinary 1/5/10/15-minute reports (including bounded jitter) can qualify when
+  sufficient long braking sessions exist. A 30-minute stream is explicitly too
+  sparse for this first adaptive policy. Base report-age settings and output
+  safety are unchanged.
+- Each qualifying session freezes its coefficient, initial room value and outdoor
+  value as a prediction trajectory. At issue, the endpoint rule is fixed: use the
+  first actual report at/after 30 minutes, no later than 48 minutes, with at least
+  three observations including the start. Predict for that actual elapsed time
+  using only the frozen starting data; never choose an endpoint by its error,
+  interpolate temperatures or use later outdoor measurements.
   Three separate sessions must each have absolute error <=0.2 C. Confidence alone
   cannot activate control. Evidence expires after seven days; current indoor–outdoor
   difference must remain within 5 C of the validation range.
@@ -222,12 +236,21 @@ Activation and quality:
 respons), `adapting` (Anpassar styrningen), `returning_to_base` (Återgår) or `base`
 (Grundreglering), together with the gate reason, applied multiplier and predicted
 30-minute drop. `adaptive_model_state` is a compact versioned RestoreEntity
-summary: coefficient association, source context and only three validation rows.
-Existing bounded learning buffers remain unchanged; no new listener, polling,
-database, service, output path or model training dependency is introduced.
+summary (policy version 2): coefficient association, source context and only three
+validation rows. Older qualification is discarded while the fitted coefficient
+can still be independently revalidated. For weighted room temperature, a learning
+snapshot is accepted only after every contributing indoor source has reported
+again. Its timestamp is the newest included HA report; component times remain
+separate and it is explicitly a causal asynchronous snapshot, not a simultaneous
+physical measurement. An individual report cannot fabricate new observations for
+other contributors.
+The existing 240-sample fitting buffer stays bounded; the adaptive rate window
+is capped at 32 reports/90 minutes. No new listener, polling, database, service,
+output path or model training dependency is introduced.
 
 For a later Tallåsen installation GO: verify candidate file hashes, back up HA
-and preserve the installed `b273afc` integration/settings, install only candidate
+and preserve the actually installed `76bf06d55f816aa69a612b9a61567b65523e0594`
+integration/settings after verifying that reference, install only candidate
 integration files and perform the agreed Core restart. Verify normal SAFE recovery,
 PI/prices, ordinary Ohmigo output and Relay Guard before enabling this option.
 Then observe sample count, fit residual, three holdouts, gate reasons, brake factor,

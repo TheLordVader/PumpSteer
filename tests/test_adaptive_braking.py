@@ -121,7 +121,7 @@ def test_real_replay_off_unqualified_adaptive_and_fallback(monkeypatch):
         assert 0.75 <= adapted.attributes["adaptive_braking"]["multiplier"] <= 1
         assert adapted.attributes["brake_factor"] <= base.attributes["brake_factor"]
     previous = adapted.attributes["adaptive_braking"]["multiplier"]
-    stale = replace(step, now=step.now + timedelta(minutes=10))
+    stale = replace(step, now=step.now + timedelta(minutes=20))
     state, fallback = replay_control_step(state, stale)
     assert (
         previous

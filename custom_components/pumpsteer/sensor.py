@@ -17,7 +17,11 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers.typing import StateType
 
-from .thermal_model import VALIDATION_BASIS, ThermalModel
+from .thermal_model import (
+    ADAPTIVE_MAX_REPORT_GAP_MINUTES,
+    VALIDATION_BASIS,
+    ThermalModel,
+)
 from .const import (
     DEFAULT_OUTDOOR_REPORT_MAX_AGE_MINUTES,
     DEFAULT_TEMPERATURE_REPORT_MAX_AGE_MINUTES,
@@ -1687,30 +1691,73 @@ class PumpSteerSensor(RestoreEntity):
             self._thermal_model = ThermalModel()
             self._adaptive_context = context
             self._adaptive_report = None
+            self._adaptive_component_reports = {}
+            self._adaptive_seen_reports = {}
+            self._adaptive_sparse_sources = set()
         indoor = self._temperature_state(cfg, "indoor_temp_entity")
-        outdoor = self._temperature_state(cfg, "real_outdoor_entity")
-        reports = [getattr(s, "last_reported", None) for s in (indoor, outdoor)]
-        oldest = (getattr(indoor, "attributes", {}) or {}).get(
-            "oldest_component_report"
+        indoor_attrs = getattr(indoor, "attributes", {}) or {}
+        contributors = indoor_attrs.get("source_temperatures_used")
+        contributors = (
+            list(contributors)
+            if isinstance(contributors, dict)
+            else [cfg.get("indoor_temp_entity")]
         )
-        if oldest is not None:
-            reports.append(oldest)
-        self._adaptive_inputs_fresh = all(
-            isinstance(at, datetime)
-            and at.utcoffset() is not None
-            and 0 <= now.timestamp() - at.timestamp() <= 300
-            for at in reports
+        entities = list(dict.fromkeys([*contributors, self._outdoor_active_entity]))
+        accepted = getattr(self, "_adaptive_component_reports", {})
+        seen = getattr(self, "_adaptive_seen_reports", {})
+        sparse = getattr(self, "_adaptive_sparse_sources", set())
+        reports = {}
+        valid = True
+        for entity in entities:
+            at = getattr(self.hass.states.get(entity), "last_reported", None)
+            if (
+                not isinstance(at, datetime)
+                or at.utcoffset() is None
+                or not 0
+                <= now.timestamp() - at.timestamp()
+                <= ADAPTIVE_MAX_REPORT_GAP_MINUTES * 60
+            ):
+                valid = False
+                continue
+            previous = seen.get(entity)
+            if previous is None or at.timestamp() > previous.timestamp():
+                if previous is not None:
+                    gap = (at.timestamp() - previous.timestamp()) / 60
+                    if gap > ADAPTIVE_MAX_REPORT_GAP_MINUTES:
+                        sparse.add(entity)
+                    else:
+                        sparse.discard(entity)
+                seen[entity] = at
+            reports[entity] = at
+        self._adaptive_seen_reports = seen
+        self._adaptive_sparse_sources = sparse
+        self._adaptive_inputs_fresh = valid and not sparse
+        self._adaptive_observation_reason = (
+            "report_interval_too_sparse"
+            if sparse
+            else "temperature_reports_unavailable"
         )
-        report = reports[0]
         self._adaptive_new_report = bool(
             self._adaptive_inputs_fresh
-            and (
-                self._adaptive_report is None
-                or report.timestamp() > self._adaptive_report.timestamp()
+            and all(
+                entity in reports
+                and (
+                    entity not in accepted
+                    or reports[entity].timestamp() > accepted[entity].timestamp()
+                )
+                for entity in contributors
             )
         )
         if self._adaptive_new_report:
-            self._adaptive_report = report
+            # A causal snapshot of actual asynchronous reports, never a simultaneous
+            # physical measurement. All indoor contributors must advance once.
+            self._adaptive_component_reports = {
+                entity: reports[entity] for entity in contributors
+            }
+            self._adaptive_report = max(
+                (reports[entity] for entity in contributors),
+                key=lambda at: at.timestamp(),
+            )
 
     def _adaptive_brake_multiplier(
         self, now, cfg, indoor, outdoor, comfort_floor, ramp_in, ramp_out, eligible
@@ -1723,7 +1770,11 @@ class PumpSteerSensor(RestoreEntity):
         if enabled:
             reason = model.adaptive_reason(now, indoor - outdoor)
             if not getattr(self, "_adaptive_inputs_fresh", False):
-                reason = "temperature_reports_unavailable"
+                reason = getattr(
+                    self,
+                    "_adaptive_observation_reason",
+                    "temperature_reports_unavailable",
+                )
             elif cfg.get("external_heat_sources") is True:
                 reason = "external_heat_sources"
             if reason == "qualified" and eligible:
@@ -2243,7 +2294,9 @@ class PumpSteerSensor(RestoreEntity):
         if cfg.get("adaptive_braking_enabled") is True:
             self._prepare_adaptive_observation(cfg, now, identity)
             if self._adaptive_new_report:
-                self._thermal_model.record_temp(self._adaptive_report, indoor)
+                self._thermal_model.record_temp(
+                    self._adaptive_report, indoor, adaptive_reports=True
+                )
             elif not self._adaptive_inputs_fresh:
                 self._thermal_model.record_temp(now, None)
         else:
