@@ -87,7 +87,7 @@
       },
       "zones": {
         "title": "Extra temperaturzoner",
-        "description": "Välj en zon att redigera. Zoner är frivilliga och påverkar inte värmestyrningen.",
+        "description": "Välj en zon. Den övervakar rumstemperatur och trend och kan vid tillräckligt underlag uppmärksamma misstänkt värmebrist. Zonerna styr inte värmen.",
         "menu_options": {
           "zone_1": "Zon 1",
           "zone_2": "Zon 2",
@@ -149,7 +149,7 @@
       },
       "zone_1": {
         "title": "Zon 1",
-        "description": "Frivillig övervakning utan styrning. Zonen kan visas även när larmet är av. Termostatens börvärde är inte larmgränsen; en givare nära radiatorn kan visa annan temperatur än rummet.",
+        "description": "Endast övervakning, även när larm är på. Zonen ändrar inte termostatens börvärde eller ventilöppning och styr inte den centrala värmeproduktionen. En kall zon påverkar inte den gemensamma PI-regulatorn.",
         "data": {
           "zone_1_name": "Zon 1 – namn",
           "zone_1_entity": "Zon 1 – temperaturgivare",
@@ -162,13 +162,20 @@
           "zone_1_alarm_delay_minutes": "Zon 1 – Larmfördröjning (minuter)"
         },
         "data_description": {
+          "zone_1_name": "Namnet visas i diagnostik och zonnotiser.",
+          "zone_1_entity": "Välj en rumstemperaturgivare i °C. En givare nära radiatorn kan visa en annan temperatur än rummet.",
+          "zone_1_enabled": "Av som standard. När larm är aktiverat kan zonen ge larm vid låg temperatur, förvarning, misstänkt värmebrist och givarfel. Temperaturen övervakas även med larm av.",
+          "zone_1_profile": "Välj manuellt vilken av zonens två temperaturgränser som används.",
+          "zone_1_threshold": "Temperaturgräns för profilen Underhållsvärme. Standard är 5 °C. Används endast när profilen är vald.",
+          "zone_1_comfort_threshold": "Temperaturgräns för profilen Komfort. Standard är 18 °C. Används endast när profilen är vald.",
+          "zone_1_climate": "Valfri och endast för avläsning. Utan termostat fungerar temperaturövervakningen fortfarande, men termostatdiagnostik och analys av värmebrist begränsas. Termostatens börvärde är inte zonens larmgräns.",
           "zone_1_notify_service": "Valfritt undantag. Tomt använder den gemensamma zonmottagaren; saknas även den skickas ingen push.",
-          "zone_1_alarm_delay_minutes": "Standard 15 minuter. Larm kräver minst två separata låga rapporter."
+          "zone_1_alarm_delay_minutes": "Standard 15 minuter, valbart 1–240 minuter. Lågtemperaturlarm kräver minst två separata rapporter under gränsen som sträcker sig över fördröjningen. Övriga larm har egna underlagskrav."
         }
       },
       "zone_2": {
         "title": "Zon 2",
-        "description": "Frivillig övervakning utan styrning. Zonen kan visas även när larmet är av. Termostatens börvärde är inte larmgränsen; en givare nära radiatorn kan visa annan temperatur än rummet.",
+        "description": "Endast övervakning, även när larm är på. Zonen ändrar inte termostatens börvärde eller ventilöppning och styr inte den centrala värmeproduktionen. En kall zon påverkar inte den gemensamma PI-regulatorn.",
         "data": {
           "zone_2_name": "Zon 2 – namn",
           "zone_2_entity": "Zon 2 – temperaturgivare",
@@ -181,13 +188,20 @@
           "zone_2_alarm_delay_minutes": "Zon 2 – Larmfördröjning (minuter)"
         },
         "data_description": {
+          "zone_2_name": "Namnet visas i diagnostik och zonnotiser.",
+          "zone_2_entity": "Välj en rumstemperaturgivare i °C. En givare nära radiatorn kan visa en annan temperatur än rummet.",
+          "zone_2_enabled": "Av som standard. När larm är aktiverat kan zonen ge larm vid låg temperatur, förvarning, misstänkt värmebrist och givarfel. Temperaturen övervakas även med larm av.",
+          "zone_2_profile": "Välj manuellt vilken av zonens två temperaturgränser som används.",
+          "zone_2_threshold": "Temperaturgräns för profilen Underhållsvärme. Standard är 5 °C. Används endast när profilen är vald.",
+          "zone_2_comfort_threshold": "Temperaturgräns för profilen Komfort. Standard är 18 °C. Används endast när profilen är vald.",
+          "zone_2_climate": "Valfri och endast för avläsning. Utan termostat fungerar temperaturövervakningen fortfarande, men termostatdiagnostik och analys av värmebrist begränsas. Termostatens börvärde är inte zonens larmgräns.",
           "zone_2_notify_service": "Valfritt undantag. Tomt använder den gemensamma zonmottagaren; saknas även den skickas ingen push.",
-          "zone_2_alarm_delay_minutes": "Standard 15 minuter. Larm kräver minst två separata låga rapporter."
+          "zone_2_alarm_delay_minutes": "Standard 15 minuter, valbart 1–240 minuter. Lågtemperaturlarm kräver minst två separata rapporter under gränsen som sträcker sig över fördröjningen. Övriga larm har egna underlagskrav."
         }
       },
       "zone_3": {
         "title": "Zon 3",
-        "description": "Frivillig övervakning utan styrning. Zonen kan visas även när larmet är av. Termostatens börvärde är inte larmgränsen; en givare nära radiatorn kan visa annan temperatur än rummet.",
+        "description": "Endast övervakning, även när larm är på. Zonen ändrar inte termostatens börvärde eller ventilöppning och styr inte den centrala värmeproduktionen. En kall zon påverkar inte den gemensamma PI-regulatorn.",
         "data": {
           "zone_3_name": "Zon 3 – namn",
           "zone_3_entity": "Zon 3 – temperaturgivare",
@@ -200,13 +214,20 @@
           "zone_3_alarm_delay_minutes": "Zon 3 – Larmfördröjning (minuter)"
         },
         "data_description": {
+          "zone_3_name": "Namnet visas i diagnostik och zonnotiser.",
+          "zone_3_entity": "Välj en rumstemperaturgivare i °C. En givare nära radiatorn kan visa en annan temperatur än rummet.",
+          "zone_3_enabled": "Av som standard. När larm är aktiverat kan zonen ge larm vid låg temperatur, förvarning, misstänkt värmebrist och givarfel. Temperaturen övervakas även med larm av.",
+          "zone_3_profile": "Välj manuellt vilken av zonens två temperaturgränser som används.",
+          "zone_3_threshold": "Temperaturgräns för profilen Underhållsvärme. Standard är 5 °C. Används endast när profilen är vald.",
+          "zone_3_comfort_threshold": "Temperaturgräns för profilen Komfort. Standard är 18 °C. Används endast när profilen är vald.",
+          "zone_3_climate": "Valfri och endast för avläsning. Utan termostat fungerar temperaturövervakningen fortfarande, men termostatdiagnostik och analys av värmebrist begränsas. Termostatens börvärde är inte zonens larmgräns.",
           "zone_3_notify_service": "Valfritt undantag. Tomt använder den gemensamma zonmottagaren; saknas även den skickas ingen push.",
-          "zone_3_alarm_delay_minutes": "Standard 15 minuter. Larm kräver minst två separata låga rapporter."
+          "zone_3_alarm_delay_minutes": "Standard 15 minuter, valbart 1–240 minuter. Lågtemperaturlarm kräver minst två separata rapporter under gränsen som sträcker sig över fördröjningen. Övriga larm har egna underlagskrav."
         }
       },
       "zone_4": {
         "title": "Zon 4",
-        "description": "Frivillig övervakning utan styrning. Zonen kan visas även när larmet är av. Termostatens börvärde är inte larmgränsen; en givare nära radiatorn kan visa annan temperatur än rummet.",
+        "description": "Endast övervakning, även när larm är på. Zonen ändrar inte termostatens börvärde eller ventilöppning och styr inte den centrala värmeproduktionen. En kall zon påverkar inte den gemensamma PI-regulatorn.",
         "data": {
           "zone_4_name": "Zon 4 – namn",
           "zone_4_entity": "Zon 4 – temperaturgivare",
@@ -219,8 +240,15 @@
           "zone_4_alarm_delay_minutes": "Zon 4 – Larmfördröjning (minuter)"
         },
         "data_description": {
+          "zone_4_name": "Namnet visas i diagnostik och zonnotiser.",
+          "zone_4_entity": "Välj en rumstemperaturgivare i °C. En givare nära radiatorn kan visa en annan temperatur än rummet.",
+          "zone_4_enabled": "Av som standard. När larm är aktiverat kan zonen ge larm vid låg temperatur, förvarning, misstänkt värmebrist och givarfel. Temperaturen övervakas även med larm av.",
+          "zone_4_profile": "Välj manuellt vilken av zonens två temperaturgränser som används.",
+          "zone_4_threshold": "Temperaturgräns för profilen Underhållsvärme. Standard är 5 °C. Används endast när profilen är vald.",
+          "zone_4_comfort_threshold": "Temperaturgräns för profilen Komfort. Standard är 18 °C. Används endast när profilen är vald.",
+          "zone_4_climate": "Valfri och endast för avläsning. Utan termostat fungerar temperaturövervakningen fortfarande, men termostatdiagnostik och analys av värmebrist begränsas. Termostatens börvärde är inte zonens larmgräns.",
           "zone_4_notify_service": "Valfritt undantag. Tomt använder den gemensamma zonmottagaren; saknas även den skickas ingen push.",
-          "zone_4_alarm_delay_minutes": "Standard 15 minuter. Larm kräver minst två separata låga rapporter."
+          "zone_4_alarm_delay_minutes": "Standard 15 minuter, valbart 1–240 minuter. Lågtemperaturlarm kräver minst två separata rapporter under gränsen som sträcker sig över fördröjningen. Övriga larm har egna underlagskrav."
         }
       },
       "zone_notifications": {
@@ -314,7 +342,9 @@
           "thermal_brine_in_entity": "Köldbärare in",
           "thermal_brine_out_entity": "Köldbärare ut",
           "thermal_aux_heat_entity": "Eltillskott",
-          "thermal_alarm_entity": "Aktivt värmepumpslarm"
+          "thermal_alarm_entity": "Aktivt värmepumpslarm",
+          "thermal_alarm_numeric_normal": "Normalt värde för numeriskt larm",
+          "thermal_alarm_numeric_verified": "Jag har verifierat det numeriska larmets betydelse"
         },
         "data_description": {
           "thermal_balance_entity": "Välj en numerisk givare om värdet finns. Ingen skalning eller teckentolkning antas.",
@@ -325,7 +355,9 @@
           "thermal_brine_in_entity": "Temperaturgivare för inkommande köldbärare.",
           "thermal_brine_out_entity": "Temperaturgivare för utgående köldbärare.",
           "thermal_aux_heat_entity": "Binär signal för aktivt eltillskott.",
-          "thermal_alarm_entity": "Binär signal för aktivt fellarm. Använder PumpSteers ordinarie notismottagare, oberoende av prisnotisfilter. Om mottagare saknas eller utskicket misslyckas visas en beständig HA-notis. Återhämtning meddelas också."
+          "thermal_alarm_entity": "Välj binär eller numerisk fellarmssignal. Numerisk signal är avstängd tills du verifierat normalvärdet och att alla andra ändliga värden betyder aktivt fellarm. Notiser använder ordinarie mottagare eller beständig HA-notis.",
+          "thermal_alarm_numeric_normal": "Endast för numerisk givare: ange ett verifierat normalt värde, exempelvis 0 bara om din värmepumps dokumentation bekräftar det. Tomt ger okänt larmtillstånd.",
+          "thermal_alarm_numeric_verified": "Endast för numerisk givare: bekräfta att det angivna värdet är normalt och att alla andra ändliga värden betyder aktivt fellarm. Ändrad givare eller normalt värde kräver ny bekräftelse."
         }
       },
       "extended_control": {
@@ -373,7 +405,8 @@
       "heat_signal_alias": "Värmesignalen måste vara en separat indikator för radiatorvärme.",
       "invalid_balance_kind": "Välj en giltig typ av värmebalans.",
       "control_signals_required": "Välj nödvändiga driftgivare och verifiera deras betydelse samt attributet för observationstid. En gemensam växelventil kräver verifierad invertering av radiatorläget.",
-      "control_balance_required": "Välj värmebalansgivare och verifiera normalisering. Skalan måste vara skild från noll, offset angiven och 0 < första gränsen < maximalgränsen."
+      "control_balance_required": "Välj värmebalansgivare och verifiera normalisering. Skalan måste vara skild från noll, offset angiven och 0 < första gränsen < maximalgränsen.",
+      "invalid_numeric_alarm": "Ange ett giltigt numeriskt normalvärde innan du bekräftar tolkningen."
     }
   },
   "entity": {

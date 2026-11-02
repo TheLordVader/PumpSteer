@@ -113,6 +113,8 @@ _PASSIVE_HEATPUMP_OPTIONS = frozenset(
         "thermal_brine_out_entity",
         "thermal_aux_heat_entity",
         "thermal_alarm_entity",
+        "thermal_alarm_numeric_verified",
+        "thermal_alarm_numeric_normal",
     }
 )
 
@@ -1776,33 +1778,36 @@ class PumpSteerSensor(RestoreEntity):
             if self._temperature_unloaded or not monitor.notification_current(alert):
                 return
             event, slot = alert["event"], alert["slot"]
-            reasons = {
-                "temperature": "Temperaturlarm",
-                "forecast": "Förvarning: temperaturgränsen kan nås inom två timmar",
-                "heat_shortage": "Misstänkt värmebrist: värmebegäran utan temperaturåterhämtning",
-                "sensor_fault": "Givarfel: temperaturdata saknas eller är för gamla",
-                "recovery": "Återhämtning: zonen är normal igen",
-            }
-            value = alert["temperature"]
-            detail = f" ({value:.1f} °C)" if value is not None else ""
+            from .extra_zones import zone_notification_message
+
+            payload = monitor.notification_payload(
+                alert, dt_util.now(), self.hass.states
+            )
+            if payload is None:
+                return
+            language = getattr(getattr(self.hass, "config", None), "language", "sv")
+            message = zone_notification_message(payload, language)
             async with asyncio.timeout(30):
                 await self.hass.services.async_call(
                     "notify",
                     service[7:],
-                    {"message": f"{alert['name']}: {reasons[event]}{detail}"},
+                    {"message": message},
                     blocking=True,
                 )
-            if getattr(
-                self, "_extra_zones", None
-            ) is not monitor or not monitor.notification_current(alert):
+            if getattr(self, "_extra_zones", None) is not monitor:
                 return
-            monitor.mark_sent(slot, event)
+            acknowledged = monitor.mark_delivered(alert)
+            if acknowledged is None:
+                return
             diagnostic = self._zone_diagnostics[str(slot)]
-            diagnostic["notifications_sent"][event] = True
-            if event == "temperature":
-                diagnostic["notification_sent"] = True
-            if event == "recovery":
-                diagnostic["recovery_pending"] = False
+            for related in payload.get("related_events", ()):
+                if monitor.notification_current({**alert, "event": related}):
+                    monitor.mark_sent(slot, related)
+                    acknowledged["notifications_sent"][related] = True
+            diagnostic.update(acknowledged)
+            diagnostic["notification_sent"] = acknowledged["notifications_sent"].get(
+                "temperature", False
+            )
             async_dispatcher_send(self.hass, self._input_temperature_signal)
             if getattr(self, "platform", None) is not None:
                 self.async_write_ha_state()
@@ -1850,7 +1855,13 @@ class PumpSteerSensor(RestoreEntity):
             from .heatpump_alarm import HeatPumpAlarm
 
             monitor = getattr(self, "_heatpump_alarm", None)
-            if monitor is None or monitor.entity != alarm_entity:
+            numeric_options = {
+                "numeric_verified": cfg.get("thermal_alarm_numeric_verified") is True,
+                "numeric_normal": cfg.get("thermal_alarm_numeric_normal"),
+            }
+            if monitor is None or not monitor.matches_config(
+                alarm_entity, **numeric_options
+            ):
                 task = getattr(self, "_heatpump_alarm_task", None)
                 if task is not None:
                     task.cancel()
@@ -1858,6 +1869,7 @@ class PumpSteerSensor(RestoreEntity):
                     alarm_entity,
                     getattr(self, "_heatpump_alarm_restore", None),
                     self._temperature_reported_after,
+                    **numeric_options,
                 )
                 self._heatpump_alarm_restore = {}
             self._heatpump_alarm_status, event = monitor.observe(
@@ -1987,6 +1999,11 @@ class PumpSteerSensor(RestoreEntity):
                     )
                     if self._temperature_cutoff(cfg, outdoor=True) is not None
                     else 0,
+                    climate_temperature_unit=getattr(
+                        getattr(getattr(self.hass, "config", None), "units", None),
+                        "temperature_unit",
+                        None,
+                    ),
                 )
                 for alert in alerts:
                     slot = alert["slot"]
@@ -1995,11 +2012,6 @@ class PumpSteerSensor(RestoreEntity):
                     )
                     if isinstance(service, str) and service.startswith("notify."):
                         self._queue_zone_notification(self._extra_zones, alert, service)
-                for pending_alert, task in list(
-                    getattr(self, "_zone_notify_tasks", {}).values()
-                ):
-                    if not self._extra_zones.notification_current(pending_alert):
-                        task.cancel()
             except Exception:
                 _LOGGER.exception("Passive extra zone monitoring failed")
         else:

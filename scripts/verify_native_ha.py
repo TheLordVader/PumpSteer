@@ -1410,6 +1410,7 @@ async def test_native_zone_options_and_passive_notifications(
     """Real options flow, last_reported, service dispatch and RestoreEntity data."""
     from custom_components.pumpsteer import pump_log
 
+    hass.config.language = "sv"
     monkeypatch.setattr(pump_log, "_PUMP_LOG_PATH", str(tmp_path / "pump.log"))
     freezer.move_to("2026-10-31T00:00:00+00:00")
     await hass.async_start()
@@ -1538,6 +1539,7 @@ async def test_native_zone_forecast_and_heat_response(hass, freezer):
     """Actual repeated HA reports feed forecast and demand-response events."""
     from custom_components.pumpsteer.sensor import PumpSteerSensor
 
+    hass.config.language = "sv"
     freezer.move_to("2026-10-31T00:00:00+00:00")
     await hass.async_start()
     received = []
@@ -1979,6 +1981,138 @@ async def test_native_control_options_and_verified_brake_limit(
     assert recovery_outputs == sorted(recovery_outputs)
     assert controller.state == pytest.approx(base)
     assert controller.extra_state_attributes["brake_factor"] == pytest.approx(1)
+
+
+async def test_native_numeric_fault_options_fallback_and_reload(
+    recorder_mock, hass, enable_custom_integrations, monkeypatch, tmp_path, freezer
+):
+    """Native options, finite numeric alarm, persistent fallback and restoration."""
+    from custom_components.pumpsteer import pump_log
+
+    hass.config.language = "en"
+    monkeypatch.setattr(pump_log, "_PUMP_LOG_PATH", str(tmp_path / "pump.log"))
+    freezer.move_to("2026-11-01T08:00:00+00:00")
+    await hass.async_start()
+    assert await async_setup_component(hass, "persistent_notification", {})
+    for name, value in (("room", "21"), ("outdoor", "0")):
+        hass.states.async_set("sensor." + name, value, {"unit_of_measurement": "°C"})
+    hass.states.async_set("sensor.price", "1")
+    hass.states.async_set("sensor.heat_fault", "0.0")
+    attempts, notices = [], []
+
+    async def failed_notify(call):
+        attempts.append(call.data["message"])
+        raise RuntimeError("Notification transport unavailable")
+
+    hass.services.async_register("notify", "pump_numeric_failure", failed_notify)
+
+    def service_event(event):
+        if (
+            event.data["domain"] == "persistent_notification"
+            and event.data["service"] == "create"
+        ):
+            notices.append(event.data["service_data"])
+
+    hass.bus.async_listen("call_service", service_event)
+    entry = MockConfigEntry(
+        domain="pumpsteer",
+        data={},
+        options={
+            "indoor_temp_entity": "sensor.room",
+            "real_outdoor_entity": "sensor.outdoor",
+            "electricity_price_entity": "sensor.price",
+            "price_tomorrow_entity": "sensor.price",
+            "notify_service": "notify.pump_numeric_failure",
+            "notification_level": "off",
+        },
+    )
+    entry.add_to_hass(hass)
+    assert await async_setup_component(hass, "pumpsteer", {})
+    await hass.async_block_till_done()
+    flow = await hass.config_entries.options.async_init(entry.entry_id)
+    flow = await hass.config_entries.options.async_configure(
+        flow["flow_id"], {"next_step_id": "telemetry"}
+    )
+    flow = await hass.config_entries.options.async_configure(
+        flow["flow_id"], {"next_step_id": "heat_pump_telemetry"}
+    )
+    pending = await hass.config_entries.options.async_configure(
+        flow["flow_id"],
+        {
+            "thermal_alarm_entity": "sensor.heat_fault",
+            "thermal_alarm_numeric_normal": 0,
+        },
+    )
+    assert pending["type"] == "create_entry", pending
+    await hass.async_block_till_done()
+    controller = next(
+        e for e in hass.data[SENSOR].entities if e.unique_id == entry.entry_id
+    )
+    assert controller._heatpump_alarm_status["status"] == "unknown"
+    assert not attempts and not notices
+    flow = await hass.config_entries.options.async_init(entry.entry_id)
+    flow = await hass.config_entries.options.async_configure(
+        flow["flow_id"], {"next_step_id": "telemetry"}
+    )
+    flow = await hass.config_entries.options.async_configure(
+        flow["flow_id"], {"next_step_id": "heat_pump_telemetry"}
+    )
+    saved = await hass.config_entries.options.async_configure(
+        flow["flow_id"],
+        {
+            "thermal_alarm_entity": "sensor.heat_fault",
+            "thermal_alarm_numeric_verified": True,
+            "thermal_alarm_numeric_normal": 0,
+        },
+    )
+    assert saved["type"] == "create_entry", saved
+    await hass.async_block_till_done()
+    controller = next(
+        e for e in hass.data[SENSOR].entities if e.unique_id == entry.entry_id
+    )
+
+    async def prices(cfg, now):
+        return [1.0] * 24, ["normal"] * 24, 60, 0
+
+    async def forecast():
+        return []
+
+    monkeypatch.setattr(controller, "_get_prices", prices)
+    monkeypatch.setattr(controller, "_forecast_temps", forecast)
+    freezer.tick(timedelta(seconds=1))
+    for entity, value in (("sensor.room", "21"), ("sensor.outdoor", "0")):
+        hass.states.async_set(entity, value, {"unit_of_measurement": "°C"})
+    hass.states.async_set("sensor.heat_fault", "2")
+    for _ in range(2):
+        await controller.async_update()
+        await hass.async_block_till_done()
+    assert controller.extra_state_attributes["heat_pump_alarm"]["status"] == "alarm"
+    assert len(attempts) == len(notices) == 1
+    assert "active fault" in notices[0]["message"]
+    controller.async_write_ha_state()
+    await hass.async_block_till_done()
+    assert await hass.config_entries.async_reload(entry.entry_id)
+    await hass.async_block_till_done()
+    resumed = next(
+        e for e in hass.data[SENSOR].entities if e.unique_id == entry.entry_id
+    )
+    await resumed.async_update()
+    await hass.async_block_till_done()
+    assert len(attempts) == len(notices) == 1
+    freezer.tick(timedelta(seconds=1))
+    hass.states.async_set("sensor.heat_fault", "unknown")
+    await resumed.async_update()
+    await hass.async_block_till_done()
+    assert len(attempts) == len(notices) == 1
+    freezer.tick(timedelta(seconds=1))
+    hass.states.async_set("sensor.heat_fault", "0.0")
+    await resumed.async_update()
+    await hass.async_block_till_done()
+    await resumed.async_update()
+    await hass.async_block_till_done()
+    assert len(attempts) == len(notices) == 2
+    assert "cleared" in notices[-1]["message"]
+    assert notices[0]["notification_id"] == notices[-1]["notification_id"]
 
 
 @pytest.mark.enable_socket

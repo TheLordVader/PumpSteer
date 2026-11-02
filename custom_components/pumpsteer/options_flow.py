@@ -118,6 +118,8 @@ _GROUPS["heat_pump_telemetry"] = {
     "thermal_brine_out_entity",
     "thermal_aux_heat_entity",
     "thermal_alarm_entity",
+    "thermal_alarm_numeric_verified",
+    "thermal_alarm_numeric_normal",
 }
 _GROUPS["extended_control"] = {
     "control_aux_preheat_limit",
@@ -163,7 +165,10 @@ _CLEARABLE = {
     "thermal_hot_water_mode_entity",
     "thermal_compressor_entity",
     "thermal_return_temp_entity",
-    *(_GROUPS["heat_pump_telemetry"] - {"thermal_balance_kind"}),
+    *(
+        _GROUPS["heat_pump_telemetry"]
+        - {"thermal_balance_kind", "thermal_alarm_numeric_verified"}
+    ),
     "control_measurement_time_attribute",
     "control_balance_scale",
     "control_balance_offset",
@@ -363,6 +368,10 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
                                 "control_balance_deficit_full",
                             ),
                         ),
+                        (
+                            "thermal_alarm_numeric_verified",
+                            ("thermal_alarm_entity", "thermal_alarm_numeric_normal"),
+                        ),
                     ):
                         if current_data.get(flag) is True and any(
                             merged.get(key) != current_data.get(key) for key in keys
@@ -515,9 +524,33 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
                     ("thermal_brine_pump_entity", "binary_sensor"),
                     ("thermal_circulation_pump_entity", "binary_sensor"),
                     ("thermal_aux_heat_entity", "binary_sensor"),
-                    ("thermal_alarm_entity", "binary_sensor"),
                 )
             },
+            vol.Optional(
+                "thermal_alarm_entity",
+                description={
+                    "suggested_value": current_data.get("thermal_alarm_entity")
+                },
+            ): selector({"entity": {"domain": ["binary_sensor", "sensor"]}}),
+            vol.Optional(
+                "thermal_alarm_numeric_verified",
+                default=current_data.get("thermal_alarm_numeric_verified", False),
+            ): selector({"boolean": {}}),
+            vol.Optional(
+                "thermal_alarm_numeric_normal",
+                description={
+                    "suggested_value": current_data.get("thermal_alarm_numeric_normal")
+                },
+            ): selector(
+                {
+                    "number": {
+                        "min": -1000000000,
+                        "max": 1000000000,
+                        "step": "any",
+                        "mode": "box",
+                    }
+                }
+            ),
             vol.Optional(
                 "thermal_compressor_entity",
                 description={
@@ -959,7 +992,6 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
             ("thermal_brine_pump_entity", "binary_sensor."),
             ("thermal_circulation_pump_entity", "binary_sensor."),
             ("thermal_aux_heat_entity", "binary_sensor."),
-            ("thermal_alarm_entity", "binary_sensor."),
             ("thermal_power_entity", "sensor."),
             ("thermal_hot_water_mode_entity", "binary_sensor."),
             ("thermal_supply_temp_entity", "sensor."),
@@ -974,6 +1006,21 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
                 or not self._entity_exists(entity)
             ):
                 errors[key] = "entity_not_found"
+        alarm_entity = user_input.get("thermal_alarm_entity")
+        if alarm_entity and (
+            not isinstance(alarm_entity, str)
+            or not alarm_entity.startswith(("sensor.", "binary_sensor."))
+            or not self._entity_exists(alarm_entity)
+        ):
+            errors["thermal_alarm_entity"] = "entity_not_found"
+        numeric_normal = user_input.get("thermal_alarm_numeric_normal")
+        if (
+            isinstance(alarm_entity, str)
+            and alarm_entity.startswith("sensor.")
+            and user_input.get("thermal_alarm_numeric_verified") is True
+            and (isinstance(numeric_normal, bool) or safe_float(numeric_normal) is None)
+        ):
+            errors["thermal_alarm_numeric_normal"] = "invalid_numeric_alarm"
         meters = user_input.get("thermal_energy_entities") or []
         if (
             not isinstance(meters, list)

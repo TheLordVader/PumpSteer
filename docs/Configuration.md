@@ -483,26 +483,41 @@ is misconfigured or temporarily unavailable.
 
 ### Thermal Zone Intelligence (extra temperature zones)
 
-The **Extra temperature zones** options page supports up to four optional zones.
-Choose a Celsius room sensor, a name and whether alarms are enabled. Select
-**Maintenance heat** or **Comfort** manually; each profile has its own minimum
-temperature. Disabling alarms keeps passive temperature trends available.
-The low-temperature delay is configurable from 1 to 240 minutes
-(default 15). Recovery uses a 0.5 °C margin. Leave unused zones empty.
+The **Extra temperature zones** options menu supports up to four optional zones.
+Each zone monitors a Celsius room sensor. With enough suitable observations it can
+show a trend or warn about suspected heat shortage. Choose a name and manually
+select **Maintenance heat** or **Comfort**. Their separate temperature thresholds
+default to 5 °C and 18 °C respectively; only the selected profile's threshold is
+used. The thermostat setpoint is not the zone alarm threshold.
 
-These observations never control thermostats or alter the main building's
-weighted temperature, PI, prices, Ohmigo, relay protection or verified learning.
-A zone-only options change preserves the controller's learning state.
+Zone alarms are off by default. With alarms off, temperature and qualified trends
+remain available. If enabled, low-temperature alerts use a configurable 1–240
+minute delay (15 minutes by default), with at least two distinct low reports
+spanning that period. Forecast, suspected heat-shortage and sensor-fault alerts
+have separate evidence requirements. Recovery uses a 0.5 °C margin. Leave unused
+zones empty.
+
+**Zone monitoring is read-only.** It never changes a thermostat setpoint or valve
+opening and does not change central heat production. A cold zone does not change
+the main building's weighted temperature or PI controller. Zones also do not
+alter prices, Ohmigo, relay protection or verified learning. A zone-only options
+change preserves the controller's learning state.
 
 Each zone reports separate low-temperature, forecast, suspected heat-shortage
 and sensor-fault states. A recovery notification follows a return to normal.
-Specify `notify.your_service` globally or override it per zone. Events are
-notified once per episode; failed service calls are retried on the next cycle.
+Specify the shared zone recipient `notify.your_service` or override it per zone.
+An empty individual recipient uses the shared recipient. If both are empty no
+push is sent; diagnostics remain available. These settings are independent of
+ordinary price notifications. Failed service calls are retried on the next cycle.
 Delivery runs in cancellable background tasks with a 30-second timeout, so a slow
 notification service cannot block regulation. HA's existing restore data preserves
 notification state over restarts; pending
 measurement intervals and trends start afresh. Delivery confirmation is the
 notification service completing, not confirmation from the recipient's phone.
+Recovery messages require evidence that an alarm was delivered. After upgrading,
+an older pending recovery with no saved delivery evidence is suppressed rather
+than reported as a potentially false recovery; new episodes preserve this
+evidence in HA's existing restore state.
 
 Zone reports older than 60 minutes, future reports, restored values and
 non-Celsius readings cannot establish temperature evidence. Startup allows 60
@@ -518,16 +533,46 @@ three-hour horizon or when cooling stops. Estimates are observational linear
 extrapolations, not verified thermal predictions. HA report time does not prove
 physical measurement time.
 
-An optional climate entity supplies its actual setpoint, `hvac_action` and,
-when exposed, numeric `pi_heating_demand`, `valve_position` or `heating_demand`
-(percent). An existing HA climate group can represent multiple radiators.
-The climate temperature never replaces the chosen room sensor. A continuous
-observed heating request with a flat or falling room temperature below the
+An optional climate entity is **only read**; it may supply its setpoint,
+`hvac_action` and, when exposed, numeric `pi_heating_demand`, `valve_position`
+or `heating_demand` (percent). A setpoint or heat request alone does not prove
+that a valve is open or heat is being delivered. Without a climate entity, room
+temperature monitoring still works, but thermostat diagnostics and suspected
+heat-shortage analysis have less information. An existing HA climate group can
+represent multiple radiators. The climate temperature never replaces the chosen
+room sensor; a sensor near a radiator can read differently from the room. Continuous
+reported heating operation or demand with a flat or falling room temperature below the
 selected threshold for at least 30 minutes raises **suspected** heat shortage.
 Missing telemetry does not establish heating, heat output or recovery. The
 outdoor-relative trend is shown only with matching qualified outdoor coverage.
+The `hvac_action` attribute reports the thermostat's current operating action;
+notifications describe it as operation rather than as a separately verified
+heat request. Conflicting explicit demand and action are treated as unknown.
 
 Compact diagnostics, event reasons and forecast uncertainty are available in
 `extra_temperature_zones` on the controller and the existing Thermal Intelligence
 status sensor. The latter remains accessible when the main controller temperature
 is unavailable. No extra database or monitoring service is required.
+
+When evidence is available, zone notifications include the room temperature,
+selected limit, qualified trend, and the thermostat's reported setpoint and heat
+request. A simultaneous low-temperature and suspected-heat-shortage event is
+combined into one message. A heat request is not proof of a valve opening or heat
+delivery; unavailable thermostat data is described as unknown. The message says
+that PumpSteer only monitored the zone and suggests a practical check.
+
+### Optional heat-pump fault signal
+
+Under **Advanced sensors → Passive heat pump diagnostics**, a fault signal can be
+a binary sensor or a numeric sensor. A numeric sensor remains unknown until you
+enter its documented normal value and explicitly verify that every other finite
+number means an active fault. Do not assume that `0` is normal unless the actual
+sensor's meaning is verified. Selecting a different sensor or changing the normal
+value requires confirmation again. Invalid, restored, future or over-60-minute-old
+reports cannot establish a normal state or recovery. Fault notifications use the
+existing recipient and persistent HA fallback independently of price alerts.
+
+Any future temporary thermostat assistance would need a separately authorized,
+bounded setpoint change, a genuinely measured response, safe restoration after
+restart and a rule that preserves manual edits. A mobile confirmation button
+would need those same safeguards. PumpSteer does not implement either here.

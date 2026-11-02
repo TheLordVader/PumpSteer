@@ -47,6 +47,147 @@ def _trend(samples):
     return slope, fit
 
 
+def zone_notification_message(alert, language="sv"):
+    """Explain a passive zone alert using only qualified observation fields."""
+    swedish = str(language).lower().split("-")[0] in ("sv", "se")
+
+    def number(value):
+        text = f"{value:.1f}"
+        return text.replace(".", ",") if swedish else text
+
+    event = alert["event"]
+    value, threshold = alert.get("temperature"), alert.get("threshold")
+    source = alert.get("heat_demand_source")
+    if swedish:
+        reasons = {
+            "temperature": "Temperaturlarm",
+            "forecast": "Förvarning",
+            "heat_shortage": "Misstänkt värmebrist",
+            "sensor_fault": "Givarfel: temperaturdata saknas eller är för gamla",
+            "recovery": "Återhämtning: zonens larm har upphört",
+        }
+        parts = [f"{alert['name']}: {reasons[event]}."]
+        if value is not None:
+            detail = f"Temperaturen är {number(value)} °C"
+            if threshold is not None:
+                detail += (
+                    f", under larmgränsen {number(threshold)} °C"
+                    if event in ("temperature", "heat_shortage") and value < threshold
+                    else f", larmgränsen är {number(threshold)} °C"
+                )
+            parts.append(detail + ".")
+        if event == "forecast" and alert.get("estimated_hours") is not None:
+            parts.append(
+                f"Gränsen kan nås inom {number(alert['estimated_hours'])} timmar enligt trenden."
+            )
+        if alert.get("trend_c_per_hour") is not None:
+            parts.append(
+                f"Observerad trend: {number(alert['trend_c_per_hour'])} °C/timme."
+            )
+        if alert.get("climate_setpoint") is not None and alert.get(
+            "climate_temperature_unit"
+        ) in ("°C", "°F"):
+            parts.append(
+                f"Termostatens börvärde är {number(alert['climate_setpoint'])} {alert['climate_temperature_unit']}."
+            )
+        if event in ("temperature", "heat_shortage", "forecast"):
+            parts.append(
+                "Termostaten rapporterar värmedrift."
+                if source == "hvac_action" and alert.get("heat_demand") is True
+                else "Termostaten rapporterar ingen pågående värmedrift."
+                if source == "hvac_action" and alert.get("heat_demand") is False
+                else "Termostaten rapporterar att den begär värme."
+                if source in ("heating_demand", "pi_heating_demand")
+                and alert.get("heat_demand") is True
+                else "Termostaten rapporterar att den inte begär värme."
+                if source in ("heating_demand", "pi_heating_demand")
+                and alert.get("heat_demand") is False
+                else "Termostaten rapporterar ett ventilläge; värmebegäran kan inte fastställas enbart från detta."
+                if source == "valve_position"
+                else "Termostatens värmebegäran är okänd."
+            )
+        if alert.get("heat_response_qualified"):
+            parts.append(
+                "Temperaturen visar ingen tydlig återhämtning enligt de tillgängliga mätningarna."
+            )
+        parts.append(
+            "PumpSteers zonfunktion har endast övervakat; den har inte ändrat termostaten eller central styrning utifrån zonen."
+        )
+        if event == "sensor_fault":
+            parts.append("Kontrollera temperaturgivaren och dess rapportering.")
+        elif event in ("temperature", "heat_shortage", "forecast"):
+            parts.append(
+                "Kontrollera radiator och värmetillförsel."
+                if alert.get("heat_demand") is True
+                else "Kontrollera termostatens inställning och läge."
+                if alert.get("heat_demand") is False
+                else "Kontrollera rumsgivare, termostat och värmetillförsel."
+            )
+        return " ".join(parts)
+
+    reasons = {
+        "temperature": "Low temperature alarm",
+        "forecast": "Early warning",
+        "heat_shortage": "Possible insufficient heat",
+        "sensor_fault": "Sensor fault: temperature data is missing or stale",
+        "recovery": "Recovery: the zone alarm has cleared",
+    }
+    parts = [f"{alert['name']}: {reasons[event]}."]
+    if value is not None:
+        detail = f"Temperature is {number(value)} °C"
+        if threshold is not None:
+            detail += (
+                f", below the alarm limit of {number(threshold)} °C"
+                if event in ("temperature", "heat_shortage") and value < threshold
+                else f", the alarm limit is {number(threshold)} °C"
+            )
+        parts.append(detail + ".")
+    if event == "forecast" and alert.get("estimated_hours") is not None:
+        parts.append(
+            f"The trend suggests the limit may be reached within {number(alert['estimated_hours'])} hours."
+        )
+    if alert.get("trend_c_per_hour") is not None:
+        parts.append(f"Observed trend: {number(alert['trend_c_per_hour'])} °C/hour.")
+    if alert.get("climate_setpoint") is not None and alert.get(
+        "climate_temperature_unit"
+    ) in ("°C", "°F"):
+        parts.append(
+            f"Thermostat setpoint is {number(alert['climate_setpoint'])} {alert['climate_temperature_unit']}."
+        )
+    if event in ("temperature", "heat_shortage", "forecast"):
+        parts.append(
+            "The thermostat reports heating operation."
+            if source == "hvac_action" and alert.get("heat_demand") is True
+            else "The thermostat reports no ongoing heating operation."
+            if source == "hvac_action" and alert.get("heat_demand") is False
+            else "The thermostat reports a heat request."
+            if source in ("heating_demand", "pi_heating_demand")
+            and alert.get("heat_demand") is True
+            else "The thermostat reports no heat request."
+            if source in ("heating_demand", "pi_heating_demand")
+            and alert.get("heat_demand") is False
+            else "The thermostat reports a valve position; a heat request cannot be verified from this alone."
+            if source == "valve_position"
+            else "The thermostat's heat request is unknown."
+        )
+    if alert.get("heat_response_qualified"):
+        parts.append("The available measurements show no clear temperature recovery.")
+    parts.append(
+        "PumpSteer's zone function has only monitored; it has not changed the thermostat or central control based on this zone."
+    )
+    if event == "sensor_fault":
+        parts.append("Check the temperature sensor and its reports.")
+    elif event in ("temperature", "heat_shortage", "forecast"):
+        parts.append(
+            "Check the radiator and heat supply."
+            if alert.get("heat_demand") is True
+            else "Check the thermostat setpoint and mode."
+            if alert.get("heat_demand") is False
+            else "Check the room sensor, thermostat and heat supply."
+        )
+    return " ".join(parts)
+
+
 class ExtraZones:
     def __init__(self, restored=None, started_at=None):
         self._started_at = started_at
@@ -57,10 +198,50 @@ class ExtraZones:
         self._zones[slot]["sent"][event] = True
         if event == "recovery":
             self._zones[slot]["recovery_pending"] = False
+            self._zones[slot]["episode_notified"] = False
+            self._zones[slot]["resolved"] = False
+        else:
+            self._zones[slot]["episode_notified"] = True
+
+    def mark_delivered(self, alert):
+        """Acknowledge delivery even when the same episode resolved in flight."""
+        zone = self._zones.get(alert["slot"])
+        if (
+            zone is None
+            or zone["generation"] is not alert["generation"]
+            or zone["episode_serial"] != alert.get("episode_serial")
+        ):
+            return None
+        event = alert["event"]
+        if event == "recovery":
+            if not zone["recovery_pending"]:
+                return None
+            self.mark_sent(alert["slot"], event)
+        else:
+            zone["episode_notified"] = True
+            if zone["events"].get(event):
+                zone["sent"][event] = True
+            if not zone["episode"] and zone["resolved"]:
+                zone["recovery_pending"] = True
+            elif not zone["episode"]:
+                # The observation became uncertain or fell again while a
+                # successful delivery was in flight. Keep the notified episode
+                # open until a new report actually confirms recovery.
+                zone["episode"] = True
+        return {
+            "notifications_sent": dict(zone["sent"]),
+            "episode_active": zone["episode"],
+            "episode_notified": zone["episode_notified"],
+            "recovery_pending": zone["recovery_pending"],
+        }
 
     def notification_current(self, alert):
         zone = self._zones.get(alert["slot"])
-        if zone is None or zone["generation"] is not alert["generation"]:
+        if (
+            zone is None
+            or zone["generation"] is not alert["generation"]
+            or zone["episode_serial"] != alert.get("episode_serial")
+        ):
             return False
         event = alert["event"]
         return (
@@ -69,7 +250,56 @@ class ExtraZones:
             else zone["events"].get(event, False)
         )
 
-    def observe(self, now, configs, states, outdoor=None, outdoor_max_age_minutes=5):
+    def notification_payload(self, alert, now, states):
+        """Recheck the observations before an asynchronously queued message."""
+        if not self.notification_current(alert):
+            return None
+        now = now.astimezone(timezone.utc)
+        zone = self._zones[alert["slot"]]
+        entity, threshold, _, _, climate_entity, _ = zone["signature"]
+        state = states.get(entity)
+        value = _temperature(state, now)
+        event = alert["event"]
+        if event == "sensor_fault":
+            if value is not None:
+                return None
+        else:
+            if (
+                value is None
+                or value != alert.get("temperature")
+                or getattr(state, "last_reported", None) != zone["report"]
+            ):
+                return None
+            if event == "recovery" and (threshold is None or value < threshold + 0.5):
+                return None
+            if event in ("forecast", "heat_shortage") and now - zone["report"] > _GAP:
+                return None
+        payload = dict(alert)
+        climate = states.get(climate_entity) if climate_entity else None
+        if (
+            not _fresh(climate, now, _CLIMATE_GAP)
+            or getattr(climate, "last_reported", None) != zone["climate_report"]
+        ):
+            if event == "heat_shortage":
+                return None
+            payload.update(
+                heat_demand=None,
+                heat_demand_source=None,
+                climate_setpoint=None,
+                heat_response_qualified=False,
+            )
+            payload.pop("related_events", None)
+        return payload
+
+    def observe(
+        self,
+        now,
+        configs,
+        states,
+        outdoor=None,
+        outdoor_max_age_minutes=5,
+        climate_temperature_unit=None,
+    ):
         now = now.astimezone(timezone.utc)
         result, alerts = {}, []
         active = set()
@@ -122,6 +352,14 @@ class ExtraZones:
                         sent.get("temperature", False)
                         or saved.get("notification_sent") is True
                     )
+                episode_notified = bool(
+                    same
+                    and (
+                        saved.get("episode_notified") is True
+                        if "episode_notified" in saved
+                        else any(sent.get(event) is True for event in _EVENTS)
+                    )
+                )
                 zone = {
                     "signature": signature,
                     "generation": object(),
@@ -145,7 +383,19 @@ class ExtraZones:
                     "sent": sent,
                     "episode": same
                     and (saved.get("episode_active") is True or any(events.values())),
-                    "recovery_pending": same and saved.get("recovery_pending") is True,
+                    "episode_serial": int(
+                        same
+                        and (
+                            saved.get("episode_active") is True
+                            or any(events.values())
+                            or saved.get("recovery_pending") is True
+                        )
+                    ),
+                    "episode_notified": episode_notified,
+                    "resolved": same and saved.get("recovery_pending") is True,
+                    "recovery_pending": same
+                    and saved.get("recovery_pending") is True
+                    and episode_notified,
                     "last_event": saved.get("last_event") if same else None,
                     "last_event_at": saved.get("last_event_at") if same else None,
                 }
@@ -164,20 +414,44 @@ class ExtraZones:
             climate = states.get(cfg.get("climate")) if cfg.get("climate") else None
             climate_fresh = _fresh(climate, now, _CLIMATE_GAP)
             climate_attrs = getattr(climate, "attributes", {}) or {}
-            demand, valve = None, None
+            climate_unit = (
+                climate_attrs.get("temperature_unit") or climate_temperature_unit
+            )
+            raw_setpoint = climate_attrs.get("temperature")
+            setpoint = (
+                safe_float(raw_setpoint, -100, 200)
+                if climate_fresh and not isinstance(raw_setpoint, bool)
+                else None
+            )
+            demand, valve, demand_source, valve_source = None, None, None, None
             if climate_fresh:
                 action = climate_attrs.get("hvac_action")
+                explicit = []
                 for key in ("pi_heating_demand", "valve_position", "heating_demand"):
-                    valve = safe_float(climate_attrs.get(key))
-                    if valve is not None and 0 <= valve <= 100:
-                        break
-                    valve = None
+                    raw = climate_attrs.get(key)
+                    reading = None if isinstance(raw, bool) else safe_float(raw)
+                    if reading is not None and 0 <= reading <= 100:
+                        if valve is None:
+                            valve, valve_source = reading, key
+                        if key != "valve_position":
+                            explicit.append((key, reading > 0))
                 if action == "heating":
                     demand = True
+                    demand_source = "hvac_action"
                 elif action in ("idle", "off", "cooling", "drying", "fan"):
                     demand = False
+                    demand_source = "hvac_action"
                 elif valve is not None:
                     demand = valve > 0
+                    demand_source = valve_source
+                if explicit:
+                    explicit_demand = explicit[0][1]
+                    if any(value != explicit_demand for _, value in explicit) or (
+                        demand_source == "hvac_action" and demand != explicit_demand
+                    ):
+                        demand, demand_source = None, None
+                    else:
+                        demand, demand_source = explicit_demand, explicit[0][0]
             climate_report = getattr(climate, "last_reported", None)
             if (
                 isinstance(climate_report, datetime)
@@ -325,12 +599,20 @@ class ExtraZones:
                 events.update({e: False for e in _EVENTS})
                 zone["episode"] = False
                 zone["recovery_pending"] = False
+                zone["episode_notified"] = False
+                zone["resolved"] = False
                 zone["sent"].clear()
+            if not valid or value < threshold + 0.5:
+                zone["resolved"] = False
             if zone["recovery_pending"] and (not valid or value < threshold + 0.5):
                 zone["recovery_pending"] = False
                 zone["episode"] = enabled
             current = any(events.values())
             if enabled and current:
+                if not zone["episode"] and not zone["recovery_pending"]:
+                    zone["episode_serial"] += 1
+                    zone["episode_notified"] = False
+                zone["resolved"] = False
                 zone["episode"] = True
                 zone["recovery_pending"] = False
                 zone["sent"]["recovery"] = False
@@ -344,12 +626,14 @@ class ExtraZones:
             )
             if recovered:
                 zone["episode"] = False
-                zone["recovery_pending"] = True
+                zone["resolved"] = True
+                zone["recovery_pending"] = zone["episode_notified"]
                 zone["last_event"] = "recovery"
                 zone["last_event_at"] = now.isoformat()
             for event in _EVENTS:
                 if not events[event]:
                     zone["sent"][event] = False
+            slot_alert_start = len(alerts)
             for event in (*_EVENTS, "recovery"):
                 raised = (
                     events.get(event, False)
@@ -360,7 +644,12 @@ class ExtraZones:
                     raised = False
                 if event == "forecast" and eta is None:
                     raised = False
-                if event == "heat_shortage" and demand is not True:
+                if event == "heat_shortage" and (
+                    demand is not True
+                    or heat_trend is None
+                    or heat_fit is None
+                    or heat_fit < 0.8
+                ):
                     raised = False
                 if raised and event != "recovery" and not previous[event]:
                     zone["last_event"] = event
@@ -369,14 +658,40 @@ class ExtraZones:
                     alerts.append(
                         {
                             "generation": zone["generation"],
+                            "episode_serial": zone["episode_serial"],
                             "slot": slot,
                             "name": cfg.get("name") or entity,
                             "event": event,
                             "temperature": value if valid else None,
                             "threshold": threshold,
                             "estimated_hours": eta,
+                            "trend_c_per_hour": trend
+                            if valid and fit is not None and fit >= 0.8 and consistent
+                            else None,
+                            "climate_setpoint": setpoint,
+                            "climate_temperature_unit": climate_unit,
+                            "climate_configured": bool(cfg.get("climate")),
+                            "heat_demand": demand,
+                            "heat_demand_source": demand_source,
+                            "heat_response_qualified": bool(
+                                events["heat_shortage"]
+                                and demand is True
+                                and heat_trend is not None
+                                and heat_fit is not None
+                                and heat_fit >= 0.8
+                            ),
                         }
                     )
+            slot_alerts = alerts[slot_alert_start:]
+            temperature_alert = next(
+                (a for a in slot_alerts if a["event"] == "temperature"), None
+            )
+            heat_alert = next(
+                (a for a in slot_alerts if a["event"] == "heat_shortage"), None
+            )
+            if temperature_alert is not None and heat_alert is not None:
+                temperature_alert["related_events"] = ["heat_shortage"]
+                alerts.remove(heat_alert)
             status = (
                 "disabled"
                 if not enabled
@@ -423,6 +738,7 @@ class ExtraZones:
                 "notification_sent": zone["sent"].get("temperature", False),
                 "notifications_sent": dict(zone["sent"]),
                 "episode_active": zone["episode"],
+                "episode_notified": zone["episode_notified"],
                 "recovery_pending": zone["recovery_pending"],
                 "last_event": zone["last_event"],
                 "last_event_at": zone["last_event_at"],

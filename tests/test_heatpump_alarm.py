@@ -104,3 +104,20 @@ def test_restored_active_fault_is_not_new_evidence():
         state="on", attributes={"restored": True}, last_reported=now
     )
     assert monitor.observe(now, state)[1] is None
+
+
+def test_prestart_active_report_does_not_clear_recovery_start_barrier():
+    now = datetime(2026, 11, 1, tzinfo=timezone.utc)
+    monitor = HeatPumpAlarm(
+        "binary_sensor.fault",
+        {"entity": "binary_sensor.fault", "active": True, "sent": True},
+        started_at=now,
+    )
+    state = SimpleNamespace(
+        state="on", attributes={}, last_reported=now - timedelta(seconds=1)
+    )
+    assert monitor.observe(now, state)[1] is None
+    state.state = "off"
+    assert monitor.observe(now, state)[1] is None
+    state.last_reported = now + timedelta(seconds=1)
+    assert monitor.observe(state.last_reported, state)[1] == "recovery"

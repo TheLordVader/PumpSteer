@@ -85,7 +85,7 @@
       },
       "zones": {
         "title": "Extra temperature zones",
-        "description": "Choose a zone to edit. Zones are optional and do not affect heat control.",
+        "description": "Choose a zone. It monitors room temperature and trends and can flag suspected heat shortage when there is enough evidence. Zones do not control heating.",
         "menu_options": {
           "zone_1": "Zone 1",
           "zone_2": "Zone 2",
@@ -147,7 +147,7 @@
       },
       "zone_1": {
         "title": "Zone 1",
-        "description": "Optional monitoring without control. The zone can be monitored with alarms off. The thermostat setpoint is not the alarm threshold; a sensor near a radiator may differ from room temperature.",
+        "description": "Monitoring only, even with alerts enabled. The zone does not change a thermostat setpoint or valve opening and does not control central heat production. A cold zone does not affect the shared PI controller.",
         "data": {
           "zone_1_name": "Zone 1 – name",
           "zone_1_entity": "Zone 1 – temperature sensor",
@@ -160,13 +160,20 @@
           "zone_1_alarm_delay_minutes": "Zone 1 – Alarm delay (minutes)"
         },
         "data_description": {
+          "zone_1_name": "The name appears in diagnostics and zone notifications.",
+          "zone_1_entity": "Choose a room temperature sensor in °C. A sensor near a radiator can read differently from the room.",
+          "zone_1_enabled": "Off by default. When enabled, the zone can alert on low temperature, a forecast, suspected heat shortage and sensor faults. Temperature remains monitored with alerts off.",
+          "zone_1_profile": "Choose manually which of the two zone temperature thresholds is used.",
+          "zone_1_threshold": "Temperature threshold for Maintenance heat. Default 5 °C. Used only when this profile is selected.",
+          "zone_1_comfort_threshold": "Temperature threshold for Comfort. Default 18 °C. Used only when this profile is selected.",
+          "zone_1_climate": "Optional and read-only. Room temperature monitoring still works without a thermostat, but thermostat diagnostics and heat-shortage analysis are limited. Its setpoint is not the zone alarm threshold.",
           "zone_1_notify_service": "Optional override. Empty uses the shared zone recipient; if that is also empty no push is sent.",
-          "zone_1_alarm_delay_minutes": "Default 15 minutes. An alarm requires at least two separate low reports."
+          "zone_1_alarm_delay_minutes": "Default 15 minutes, configurable from 1 to 240. A low-temperature alert requires at least two separate below-threshold reports spanning the delay. Other alerts have their own evidence requirements."
         }
       },
       "zone_2": {
         "title": "Zone 2",
-        "description": "Optional monitoring without control. The zone can be monitored with alarms off. The thermostat setpoint is not the alarm threshold; a sensor near a radiator may differ from room temperature.",
+        "description": "Monitoring only, even with alerts enabled. The zone does not change a thermostat setpoint or valve opening and does not control central heat production. A cold zone does not affect the shared PI controller.",
         "data": {
           "zone_2_name": "Zone 2 – name",
           "zone_2_entity": "Zone 2 – temperature sensor",
@@ -179,13 +186,20 @@
           "zone_2_alarm_delay_minutes": "Zone 2 – Alarm delay (minutes)"
         },
         "data_description": {
+          "zone_2_name": "The name appears in diagnostics and zone notifications.",
+          "zone_2_entity": "Choose a room temperature sensor in °C. A sensor near a radiator can read differently from the room.",
+          "zone_2_enabled": "Off by default. When enabled, the zone can alert on low temperature, a forecast, suspected heat shortage and sensor faults. Temperature remains monitored with alerts off.",
+          "zone_2_profile": "Choose manually which of the two zone temperature thresholds is used.",
+          "zone_2_threshold": "Temperature threshold for Maintenance heat. Default 5 °C. Used only when this profile is selected.",
+          "zone_2_comfort_threshold": "Temperature threshold for Comfort. Default 18 °C. Used only when this profile is selected.",
+          "zone_2_climate": "Optional and read-only. Room temperature monitoring still works without a thermostat, but thermostat diagnostics and heat-shortage analysis are limited. Its setpoint is not the zone alarm threshold.",
           "zone_2_notify_service": "Optional override. Empty uses the shared zone recipient; if that is also empty no push is sent.",
-          "zone_2_alarm_delay_minutes": "Default 15 minutes. An alarm requires at least two separate low reports."
+          "zone_2_alarm_delay_minutes": "Default 15 minutes, configurable from 1 to 240. A low-temperature alert requires at least two separate below-threshold reports spanning the delay. Other alerts have their own evidence requirements."
         }
       },
       "zone_3": {
         "title": "Zone 3",
-        "description": "Optional monitoring without control. The zone can be monitored with alarms off. The thermostat setpoint is not the alarm threshold; a sensor near a radiator may differ from room temperature.",
+        "description": "Monitoring only, even with alerts enabled. The zone does not change a thermostat setpoint or valve opening and does not control central heat production. A cold zone does not affect the shared PI controller.",
         "data": {
           "zone_3_name": "Zone 3 – name",
           "zone_3_entity": "Zone 3 – temperature sensor",
@@ -198,13 +212,20 @@
           "zone_3_alarm_delay_minutes": "Zone 3 – Alarm delay (minutes)"
         },
         "data_description": {
+          "zone_3_name": "The name appears in diagnostics and zone notifications.",
+          "zone_3_entity": "Choose a room temperature sensor in °C. A sensor near a radiator can read differently from the room.",
+          "zone_3_enabled": "Off by default. When enabled, the zone can alert on low temperature, a forecast, suspected heat shortage and sensor faults. Temperature remains monitored with alerts off.",
+          "zone_3_profile": "Choose manually which of the two zone temperature thresholds is used.",
+          "zone_3_threshold": "Temperature threshold for Maintenance heat. Default 5 °C. Used only when this profile is selected.",
+          "zone_3_comfort_threshold": "Temperature threshold for Comfort. Default 18 °C. Used only when this profile is selected.",
+          "zone_3_climate": "Optional and read-only. Room temperature monitoring still works without a thermostat, but thermostat diagnostics and heat-shortage analysis are limited. Its setpoint is not the zone alarm threshold.",
           "zone_3_notify_service": "Optional override. Empty uses the shared zone recipient; if that is also empty no push is sent.",
-          "zone_3_alarm_delay_minutes": "Default 15 minutes. An alarm requires at least two separate low reports."
+          "zone_3_alarm_delay_minutes": "Default 15 minutes, configurable from 1 to 240. A low-temperature alert requires at least two separate below-threshold reports spanning the delay. Other alerts have their own evidence requirements."
         }
       },
       "zone_4": {
         "title": "Zone 4",
-        "description": "Optional monitoring without control. The zone can be monitored with alarms off. The thermostat setpoint is not the alarm threshold; a sensor near a radiator may differ from room temperature.",
+        "description": "Monitoring only, even with alerts enabled. The zone does not change a thermostat setpoint or valve opening and does not control central heat production. A cold zone does not affect the shared PI controller.",
         "data": {
           "zone_4_name": "Zone 4 – name",
           "zone_4_entity": "Zone 4 – temperature sensor",
@@ -217,8 +238,15 @@
           "zone_4_alarm_delay_minutes": "Zone 4 – Alarm delay (minutes)"
         },
         "data_description": {
+          "zone_4_name": "The name appears in diagnostics and zone notifications.",
+          "zone_4_entity": "Choose a room temperature sensor in °C. A sensor near a radiator can read differently from the room.",
+          "zone_4_enabled": "Off by default. When enabled, the zone can alert on low temperature, a forecast, suspected heat shortage and sensor faults. Temperature remains monitored with alerts off.",
+          "zone_4_profile": "Choose manually which of the two zone temperature thresholds is used.",
+          "zone_4_threshold": "Temperature threshold for Maintenance heat. Default 5 °C. Used only when this profile is selected.",
+          "zone_4_comfort_threshold": "Temperature threshold for Comfort. Default 18 °C. Used only when this profile is selected.",
+          "zone_4_climate": "Optional and read-only. Room temperature monitoring still works without a thermostat, but thermostat diagnostics and heat-shortage analysis are limited. Its setpoint is not the zone alarm threshold.",
           "zone_4_notify_service": "Optional override. Empty uses the shared zone recipient; if that is also empty no push is sent.",
-          "zone_4_alarm_delay_minutes": "Default 15 minutes. An alarm requires at least two separate low reports."
+          "zone_4_alarm_delay_minutes": "Default 15 minutes, configurable from 1 to 240. A low-temperature alert requires at least two separate below-threshold reports spanning the delay. Other alerts have their own evidence requirements."
         }
       },
       "zone_notifications": {
@@ -319,7 +347,9 @@
           "thermal_brine_in_entity": "Brine inlet",
           "thermal_brine_out_entity": "Brine outlet",
           "thermal_aux_heat_entity": "Auxiliary electric heat",
-          "thermal_alarm_entity": "Active heat pump fault"
+          "thermal_alarm_entity": "Active heat pump fault",
+          "thermal_alarm_numeric_normal": "Normal value for numeric fault",
+          "thermal_alarm_numeric_verified": "I verified the numeric fault meaning"
         },
         "data_description": {
           "thermal_balance_entity": "Select a numeric sensor if available. No scale or sign convention is assumed.",
@@ -330,7 +360,9 @@
           "thermal_brine_in_entity": "Temperature sensor for incoming brine.",
           "thermal_brine_out_entity": "Temperature sensor for outgoing brine.",
           "thermal_aux_heat_entity": "Binary signal for active auxiliary electric heat.",
-          "thermal_alarm_entity": "Binary active fault signal. Uses the regular PumpSteer recipient independently of price notification filters. If no recipient is configured or delivery fails, a persistent HA notification is used. Recovery is also reported."
+          "thermal_alarm_entity": "Choose a binary or numeric fault signal. A numeric signal stays inactive until you verify its normal value and that every other finite value means an active fault. Notifications use the regular recipient or a persistent HA notification.",
+          "thermal_alarm_numeric_normal": "For a numeric sensor only: enter the verified normal value. Use 0 only if your heat pump documentation confirms it. Empty means an unknown fault state.",
+          "thermal_alarm_numeric_verified": "For a numeric sensor only: confirm that the chosen value is normal and every other finite value means an active fault. A changed sensor or normal value requires confirmation again."
         }
       },
       "extended_control": {
@@ -380,7 +412,8 @@
       "heat_signal_alias": "The heat signal must be a separate radiator heat indicator.",
       "invalid_balance_kind": "Choose a valid heat balance type.",
       "control_signals_required": "Select the required operation sensors and verify their meanings and observation timestamp attribute. A shared changeover valve requires verified inversion of the radiator mode.",
-      "control_balance_required": "Select a heat balance sensor and verify normalization. Scale must be nonzero, offset explicit, and 0 < first limit < maximum limit."
+      "control_balance_required": "Select a heat balance sensor and verify normalization. Scale must be nonzero, offset explicit, and 0 < first limit < maximum limit.",
+      "invalid_numeric_alarm": "Enter a valid numeric normal value before confirming its meaning."
     }
   },
   "entity": {
