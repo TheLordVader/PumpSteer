@@ -2,6 +2,9 @@
 
 import asyncio
 from types import SimpleNamespace
+
+import pytest
+
 from custom_components.pumpsteer.options_flow import PumpSteerOptionsFlowHandler
 
 
@@ -591,6 +594,158 @@ def test_control_activation_requires_verified_signals_and_valid_normalization():
         assert errors["control_balance_brake_limit"] == "control_balance_required"
     errors = flow._validate_entities({**base, "control_measurement_time_attribute": ""})
     assert errors["control_aux_preheat_limit"] == "control_signals_required"
+
+
+def test_balance_can_be_enabled_with_mode_and_balance_but_no_compressor():
+    flow = _control_options_flow()
+    # Legacy sensors in data must combine with newly saved options.
+    flow.config_entry.data = {
+        "thermal_heating_mode_entity": "binary_sensor.heating",
+        "thermal_hot_water_mode_entity": "binary_sensor.water",
+        "thermal_balance_entity": "sensor.balance",
+    }
+    flow.config_entry.options = {
+        "control_signals_verified": True,
+        "control_measurement_time_attribute": "measured_at",
+    }
+    merged = {
+        **flow.config_entry.data,
+        **flow.config_entry.options,
+        "control_balance_brake_limit": True,
+        "control_balance_verified": True,
+        "control_balance_scale": -1,
+        "control_balance_offset": 0,
+        "control_balance_deficit_threshold": 100,
+        "control_balance_deficit_full": 300,
+    }
+    assert "control_balance_brake_limit" not in flow._validate_entities(merged)
+    result = asyncio.run(
+        flow.async_step_advanced_control(
+            {
+                "control_balance_brake_limit": True,
+                "control_balance_verified": True,
+                "control_balance_scale": -1,
+                "control_balance_offset": 0,
+                "control_balance_deficit_threshold": 100,
+                "control_balance_deficit_full": 300,
+            }
+        )
+    )
+    assert result["type"] == "create_entry", result
+    assert result["data"]["control_balance_brake_limit"] is True
+
+
+@pytest.mark.parametrize(
+    "missing", ["thermal_heating_mode_entity", "thermal_hot_water_mode_entity"]
+)
+def test_balance_still_requires_verified_heating_and_hot_water_mode(missing):
+    flow = _control_options_flow()
+    cfg = {
+        "control_balance_brake_limit": True,
+        "control_balance_verified": True,
+        "control_signals_verified": True,
+        "control_balance_scale": -1,
+        "control_balance_offset": 0,
+        "control_balance_deficit_threshold": 100,
+        "control_balance_deficit_full": 300,
+        "thermal_heating_mode_entity": "binary_sensor.heating",
+        "thermal_hot_water_mode_entity": "binary_sensor.water",
+        "thermal_balance_entity": "sensor.balance",
+    }
+    cfg.pop(missing)
+    assert (
+        flow._validate_entities(cfg)["control_balance_brake_limit"]
+        == "control_signals_required"
+    )
+
+
+@pytest.mark.parametrize(
+    "missing", ["thermal_compressor_entity", "thermal_aux_heat_entity"]
+)
+def test_auxiliary_control_requires_its_own_drift_sensors(missing):
+    flow = _control_options_flow()
+    cfg = {
+        "control_aux_preheat_limit": True,
+        "control_signals_verified": True,
+        "thermal_compressor_entity": "binary_sensor.compressor",
+        "thermal_heating_mode_entity": "binary_sensor.heating",
+        "thermal_hot_water_mode_entity": "binary_sensor.water",
+        "thermal_aux_heat_entity": "binary_sensor.aux",
+    }
+    cfg.pop(missing)
+    assert (
+        flow._validate_entities(cfg)["control_aux_preheat_limit"]
+        == "control_signals_required"
+    )
+
+
+@pytest.mark.parametrize("inverted,valid", [(True, True), (False, False)])
+def test_shared_valve_requires_verified_complementary_polarity(inverted, valid):
+    flow = _control_options_flow()
+    cfg = {
+        "control_balance_brake_limit": True,
+        "control_aux_preheat_limit": True,
+        "control_balance_verified": True,
+        "control_signals_verified": True,
+        "control_balance_scale": -1,
+        "control_balance_offset": 0,
+        "control_balance_deficit_threshold": 100,
+        "control_balance_deficit_full": 300,
+        "thermal_compressor_entity": "binary_sensor.compressor",
+        "thermal_heating_mode_entity": "binary_sensor.valve",
+        "thermal_hot_water_mode_entity": "binary_sensor.valve",
+        "thermal_heating_mode_inverted": inverted,
+        "thermal_aux_heat_entity": "binary_sensor.aux",
+        "thermal_balance_entity": "sensor.balance",
+    }
+    errors = flow._validate_entities(cfg)
+    assert ("control_balance_brake_limit" not in errors) is valid
+    assert ("control_aux_preheat_limit" not in errors) is valid
+
+
+@pytest.mark.parametrize(
+    "alias", ["thermal_aux_heat_entity", "thermal_brine_pump_entity"]
+)
+def test_auxiliary_control_rejects_aliased_compressor_evidence(alias):
+    flow = _control_options_flow()
+    cfg = {
+        "control_aux_preheat_limit": True,
+        "control_signals_verified": True,
+        "thermal_compressor_entity": "binary_sensor.compressor",
+        "thermal_heating_mode_entity": "binary_sensor.heating",
+        "thermal_hot_water_mode_entity": "binary_sensor.water",
+        "thermal_aux_heat_entity": "binary_sensor.aux",
+    }
+    cfg[alias] = cfg["thermal_compressor_entity"]
+    assert (
+        flow._validate_entities(cfg)["control_aux_preheat_limit"]
+        == "control_signals_required"
+    )
+
+
+def test_cross_page_switch_to_shared_valve_revokes_previous_verification():
+    flow = _control_options_flow()
+    flow.config_entry.data = {
+        "thermal_heating_mode_entity": "binary_sensor.radiator",
+        "thermal_hot_water_mode_entity": "binary_sensor.valve",
+    }
+    flow.config_entry.options = {
+        "control_signals_verified": True,
+        "control_balance_verified": True,
+        "zone_1_entity": "sensor.room",
+    }
+    result = asyncio.run(
+        flow.async_step_heat_sensors(
+            {
+                "thermal_heating_mode_entity": "binary_sensor.valve",
+                "thermal_heating_mode_inverted": True,
+            }
+        )
+    )
+    assert result["type"] == "create_entry"
+    assert result["data"]["control_signals_verified"] is False
+    assert result["data"]["control_balance_verified"] is True
+    assert result["data"]["zone_1_entity"] == "sensor.room"
 
 
 def test_disabling_control_clears_optional_legacy_calibration_only_on_own_page():

@@ -32,8 +32,8 @@ def _timestamp(value):
     return _number(value)
 
 
-def evaluate_limits(now, cfg, states):
-    """Require independently verified measurement time; HA republishing is insufficient."""
+def evaluate_limits(now, cfg, states, *, measured_after=None):
+    """Require a verified measurement or source-message time, not a HA republish."""
     enabled_aux = cfg.get("control_aux_preheat_limit") is True
     enabled_balance = cfg.get("control_balance_brake_limit") is True
     result = {
@@ -57,6 +57,9 @@ def evaluate_limits(now, cfg, states):
     instant = _timestamp(now)
     if instant is None:
         return result
+    cutoff = _timestamp(measured_after) if measured_after is not None else None
+    if measured_after is not None and cutoff is None:
+        return result
 
     def value(key):
         entity = cfg.get(SIGNALS[key])
@@ -72,55 +75,62 @@ def evaluate_limits(now, cfg, states):
             or not 0 <= instant - report <= 300
             or not 0 <= instant - measured <= 300
             or measured > report
+            or (cutoff is not None and measured <= cutoff)
         ):
             return None
         return state.state
 
-    required = [cfg.get(SIGNALS[k]) for k in ("compressor", "heating", "hot_water")]
-    if cfg.get(SIGNALS["brine"]):
-        required.append(cfg[SIGNALS["brine"]])
-    if len(set(required)) != len(required):
-        result.update(
-            aux_reason="signal_alias" if enabled_aux else "disabled",
-            balance_reason="signal_alias" if enabled_balance else "disabled",
-        )
-        return result
+    def invalid_alias(roles):
+        """One verified changeover valve can represent both complementary modes."""
+        used = {}
+        for role in roles:
+            entity = cfg.get(SIGNALS[role])
+            if not entity:
+                continue
+            previous = used.get(entity)
+            if previous is not None and not (
+                {previous, role} == {"heating", "hot_water"}
+                and cfg.get("thermal_heating_mode_inverted") is True
+            ):
+                return True
+            used[entity] = role
+        return False
+
     heating = value("heating")
     if cfg.get("thermal_heating_mode_inverted") is True and heating in ("on", "off"):
         heating = "off" if heating == "on" else "on"
-    context = (
-        value("compressor") == "on"
-        and heating == "on"
-        and value("hot_water") == "off"
-        and (not cfg.get(SIGNALS["brine"]) or value("brine") == "on")
-    )
-    if not context:
-        if enabled_aux:
-            result["aux_reason"] = "operation_unverified"
-        if enabled_balance:
-            result["balance_reason"] = "operation_unverified"
-        return result
+    radiator_mode = heating == "on" and value("hot_water") == "off"
     if enabled_aux:
-        aux = (
-            value("auxiliary")
-            if cfg.get(SIGNALS["auxiliary"]) not in required
-            else None
-        )
-        result["aux_reason"] = (
-            "auxiliary_active"
-            if aux == "on"
-            else "auxiliary_inactive"
-            if aux == "off"
-            else "signal_unavailable"
-        )
-        if aux == "on":
-            result["preheat_multiplier"] = 0.0
+        roles = ("compressor", "heating", "hot_water", "brine", "auxiliary")
+        if invalid_alias(roles):
+            result["aux_reason"] = "signal_alias"
+        elif not (
+            radiator_mode
+            and value("compressor") == "on"
+            and (not cfg.get(SIGNALS["brine"]) or value("brine") == "on")
+        ):
+            result["aux_reason"] = "operation_unverified"
+        else:
+            aux = value("auxiliary")
+            result["aux_reason"] = (
+                "auxiliary_active"
+                if aux == "on"
+                else "auxiliary_inactive"
+                if aux == "off"
+                else "signal_unavailable"
+            )
+            if aux == "on":
+                result["preheat_multiplier"] = 0.0
     if enabled_balance:
         scale = _number(cfg.get("control_balance_scale"))
         offset = _number(cfg.get("control_balance_offset"))
         threshold = _number(cfg.get("control_balance_deficit_threshold"))
         full = _number(cfg.get("control_balance_deficit_full"))
-        if (
+        if invalid_alias(("heating", "hot_water", "balance")):
+            result["balance_reason"] = "signal_alias"
+        elif not radiator_mode:
+            result["balance_reason"] = "operation_unverified"
+        elif (
             cfg.get("control_balance_verified") is True
             and scale is not None
             and scale != 0

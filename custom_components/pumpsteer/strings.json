@@ -335,21 +335,21 @@
       },
       "extended_control": {
         "title": "Extended control",
-        "description": "Base applies when these functions are off. The limiter needs verified compressor, radiator heating, hot-water and auxiliary heat signals. Compressor and radiator heating must be on, hot water off. A selected brine pump must also report running. Every participating signal needs a physical measurement timestamp no older than five minutes; the HA report time alone is insufficient. Missing or conflicting data immediately returns control to Base.If a previously verified source, timestamp setting or balance calibration changes, verification must be confirmed again after saving the change. Base applies meanwhile.",
+        "description": "Base applies when the limiter is off. It needs verified compressor, radiator-mode, hot-water-mode and auxiliary-heat signals. Compressor and radiator mode must be on, hot water off; a selected brine pump must also be on. Every participating signal needs a verified observation timestamp no older than five minutes. A single changeover-valve signal can serve both modes when radiator mode is verified inverted. Old values are not used; the output returns toward Base using the existing ramp times. A changed verified source or timestamp setting requires confirmation again.",
         "data": {
           "control_aux_preheat_limit": "Limit extra preheating during auxiliary heat",
-          "control_signals_verified": "I have verified operation signal meanings and measurement times",
-          "control_measurement_time_attribute": "Physical measurement timestamp attribute"
+          "control_signals_verified": "I have verified signal meanings and observation times",
+          "control_measurement_time_attribute": "Verified observation timestamp attribute"
         },
         "data_description": {
           "control_aux_preheat_limit": "Off by default. Removes only the extra preheat boost when auxiliary heat is verified active for radiator heating. Does not change the pump’s auxiliary or emergency heating and does not guarantee energy savings.",
-          "control_signals_verified": "Confirm only after checking what on/off means and that the timestamp comes from a physical measurement, not MQTT republication or an HA update. This checkbox does not create verified data. Applies to both control limiters.",
-          "control_measurement_time_attribute": "The same attribute name is read on every participating sensor. Its value must be a timezone-aware ISO timestamp or Unix seconds. If it is absent, only Base applies; do not create a synthetic measurement time."
+          "control_signals_verified": "Confirm only after verifying signal meanings and observation times. The time must be a physical measurement time or the receipt time of a new measurement message whose link to that specific value is verified by the source documentation. Receipt time is not physical measurement time. HA last_reported, MQTT republication and online status are not sufficient by themselves. Applies to both limiters.",
+          "control_measurement_time_attribute": "The same attribute is read from every participating sensor. Its value must be a verified observation time as a timezone-aware ISO timestamp or Unix seconds. Without reliable source evidence the intervention cannot activate; do not copy HA report time into another attribute."
         }
       },
       "advanced_control": {
         "title": "Advanced control – heat balance",
-        "description": "Off by default. Can release at most half of price braking during a verified heat deficit. Uses the same operation and timestamp requirements as Extended. Normalization: deficit = raw value × scale + offset. Positive values must mean a larger heat deficit. Verify decoding, sign, units and limits against manufacturer documentation or simultaneous physical readings. A register name or isolated degree-minute values are insufficient. Without this evidence, leave the function off; raw values and trends remain available.If a previously verified source, timestamp setting or balance calibration changes, verification must be confirmed again after saving the change. Base applies meanwhile.",
+        "description": "Off by default. Can release at most half of price braking during a verified heat deficit. Requires fresh, verifiably timestamped heat-balance, radiator-mode and hot-water-mode signals, but not compressor operation or a brine pump. One changeover-valve signal can serve both modes if radiator mode is verified inverted. Normalization: deficit = raw value × scale + offset. Positive values must mean a larger deficit. Verify decoding, sign, unit and limits; a register name or isolated degree-minute values are insufficient. Without evidence, leave it off; raw values and trends remain available. A changed source, timestamp setting or balance calibration requires confirmation again.",
         "data": {
           "control_balance_brake_limit": "Limit price braking using verified heat balance",
           "control_balance_verified": "I have verified normalization and deficit limits",
@@ -359,7 +359,7 @@
           "control_balance_deficit_full": "Deficit for maximum brake limitation"
         },
         "data_description": {
-          "control_balance_brake_limit": "Changes only existing price braking, not PI or the pump’s internal controller. Unreliable data returns control to Base without reusing an old intervention.",
+          "control_balance_brake_limit": "Changes only existing price braking, not PI or the heat pump’s own controller. A deficit does not prove current heat delivery. Old data is not used; the output returns toward Base using the existing ramp times.",
           "control_balance_verified": "Confirm only with verified evidence for your sensor and heat pump. No decoding or universal sign convention is assumed automatically.",
           "control_balance_scale": "No guessed default. Must be finite and nonzero; may be negative according to the verified sign convention.",
           "control_balance_offset": "Enter explicitly even if the verified offset is zero. Uses the same unit as the normalized deficit.",
@@ -379,7 +379,7 @@
       "invalid_detection_method": "Invalid heating detection method.",
       "heat_signal_alias": "The heat signal must be a separate radiator heat indicator.",
       "invalid_balance_kind": "Choose a valid heat balance type.",
-      "control_signals_required": "Select the required operation sensors and verify their meanings and physical measurement timestamp attribute before activation.",
+      "control_signals_required": "Select the required operation sensors and verify their meanings and observation timestamp attribute. A shared changeover valve requires verified inversion of the radiator mode.",
       "control_balance_required": "Select a heat balance sensor and verify normalization. Scale must be nonzero, offset explicit, and 0 < first limit < maximum limit."
     }
   },

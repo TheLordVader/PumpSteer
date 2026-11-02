@@ -1831,7 +1831,6 @@ async def test_native_control_options_and_verified_brake_limit(
         "real_outdoor_entity": "sensor.outside",
         "electricity_price_entity": "sensor.price",
         "price_tomorrow_entity": "sensor.price",
-        "thermal_compressor_entity": "binary_sensor.compressor",
         "thermal_heating_mode_entity": "binary_sensor.heating",
         "thermal_hot_water_mode_entity": "binary_sensor.water",
         "thermal_balance_entity": "sensor.balance",
@@ -1848,7 +1847,6 @@ async def test_native_control_options_and_verified_brake_limit(
     ):
         hass.states.async_set(entity, value, {"unit_of_measurement": "°C"})
     for entity, value in (
-        ("binary_sensor.compressor", "on"),
         ("binary_sensor.heating", "on"),
         ("binary_sensor.water", "off"),
         ("binary_sensor.aux", "on"),
@@ -1926,10 +1924,36 @@ async def test_native_control_options_and_verified_brake_limit(
     assert saved["type"] == "create_entry", saved
     await hass.async_block_till_done()
     controller._brake_ramp = 1
+    # A physically timestamped report at or before integration startup is
+    # insufficient, even if the HA entity is otherwise live and available.
+    startup_measurement = hass.states.get("sensor.balance").attributes[
+        "measurement_time"
+    ]
+    assert (
+        dt_util.parse_datetime(startup_measurement)
+        <= controller._temperature_reported_after
+    )
     await controller.async_update()
+    assert controller.extra_state_attributes["control_intelligence"]["active"] is False
+    activated_outputs = []
+    for _ in range(20):
+        freezer.tick(timedelta(minutes=1))
+        for entity, value in (("sensor.room", "20.8"), ("sensor.outside", "0")):
+            hass.states.async_set(entity, value, {"unit_of_measurement": "°C"})
+        for entity, value in (
+            ("binary_sensor.heating", "on"),
+            ("binary_sensor.water", "off"),
+            ("sensor.balance", "-300"),
+        ):
+            hass.states.async_set(
+                entity, value, {"measurement_time": dt_util.utcnow().isoformat()}
+            )
+        await controller.async_update()
+        activated_outputs.append(controller.state)
     assert controller.extra_state_attributes["mode"] == "braking"
     assert controller.state < base
     assert controller.extra_state_attributes["brake_factor"] == pytest.approx(0.5)
+    assert activated_outputs == sorted(activated_outputs, reverse=True)
     # Re-publication without a new physical measurement must lose the modifier.
     freezer.tick(timedelta(minutes=6))
     for entity, value in (("sensor.room", "20.8"), ("sensor.outside", "0")):
@@ -1938,5 +1962,201 @@ async def test_native_control_options_and_verified_brake_limit(
     hass.states.async_set("sensor.balance", "-300", {"measurement_time": old_physical})
     controller._brake_ramp = 1
     await controller.async_update()
+    first_recovery = controller.state
+    assert activated_outputs[-1] < first_recovery < base
+    assert controller.extra_state_attributes["control_intelligence"]["active"] is False
+    assert (
+        controller.extra_state_attributes["control_intelligence"]["transition"]
+        == "returning_to_base"
+    )
+    recovery_outputs = [first_recovery]
+    for _ in range(20):
+        freezer.tick(timedelta(minutes=1))
+        for entity, value in (("sensor.room", "20.8"), ("sensor.outside", "0")):
+            hass.states.async_set(entity, value, {"unit_of_measurement": "°C"})
+        await controller.async_update()
+        recovery_outputs.append(controller.state)
+    assert recovery_outputs == sorted(recovery_outputs)
     assert controller.state == pytest.approx(base)
     assert controller.extra_state_attributes["brake_factor"] == pytest.approx(1)
+
+
+@pytest.mark.enable_socket
+@pytest.mark.allow_hosts(["127.0.0.1", "::1"])
+async def test_native_rest_ebusd_message_timestamp_is_not_refreshed_by_http(
+    hass, aiohttp_server, freezer
+):
+    """Synthetic ebusd-shaped JSON through real HA REST and Template integrations.
+
+    EnergyIntegral and ValveMode are invented fixture messages, not claims about a
+    supported heat pump. An actual source must separately prove that message
+    `lastup` corresponds to a valid new measurement; HTTP/global time cannot.
+    ebusd JSON format: https://github.com/john30/ebusd/wiki/3.2.-HTTP-client
+    """
+    from aiohttp import web
+
+    from custom_components.pumpsteer.control_intelligence import evaluate_limits
+    from homeassistant.components.rest.const import COORDINATOR, REST_DATA
+
+    freezer.move_to("2026-11-02T08:00:00+00:00")
+    stamp = int(dt_util.utcnow().timestamp())
+    response = {"global": stamp, "balance": stamp, "valve": stamp, "mode": "radiator"}
+    requests = []
+
+    async def read_data(request):
+        requests.append(str(request.rel_url))
+        assert str(request.rel_url) == "/data/mc"  # no poll, required or maxage
+        return web.json_response(
+            {
+                "mc": {
+                    "messages": {
+                        "EnergyIntegral": {
+                            "name": "EnergyIntegral",
+                            "lastup": response["balance"],
+                            "fields": {"value": {"value": -300}},
+                        },
+                        "ValveMode": {
+                            "name": "ValveMode",
+                            "lastup": response["valve"],
+                            "fields": {"mode": {"value": response["mode"]}},
+                        },
+                    }
+                },
+                "global": {"signal": True, "lastup": response["global"]},
+            }
+        )
+
+    app = web.Application()
+    app.router.add_get("/data/mc", read_data)
+    server = await aiohttp_server(app)
+    rest_config = {
+        "rest": [
+            {
+                "resource": str(server.make_url("/data/mc")),
+                "scan_interval": timedelta(hours=1),
+                "sensor": [
+                    {
+                        "name": "Ebus Energy Integral",
+                        "value_template": "{{ value_json.mc.messages.EnergyIntegral.fields.value.value }}",
+                        "json_attributes_path": "$.mc.messages.EnergyIntegral",
+                        "json_attributes": ["lastup"],
+                    },
+                    {
+                        "name": "Ebus Valve Raw",
+                        "value_template": "{{ value_json.mc.messages.ValveMode.fields.mode.value }}",
+                        "json_attributes_path": "$.mc.messages.ValveMode",
+                        "json_attributes": ["lastup"],
+                    },
+                ],
+            }
+        ]
+    }
+    template_config = {
+        "template": [
+            {
+                "triggers": [
+                    {"trigger": "state", "entity_id": "sensor.ebus_valve_raw"}
+                ],
+                "binary_sensor": [
+                    {
+                        "name": "Ebus Valve",
+                        # One adapter represents the physical valve once. Both
+                        # fields use the same immutable event state snapshot.
+                        "state": "{{ (trigger.to_state.state == 'water') if trigger.to_state and trigger.to_state.state in ['water', 'radiator'] else none }}",
+                        "availability": "{{ trigger.to_state is not none and trigger.to_state.state in ['water', 'radiator'] and trigger.to_state.attributes.get('lastup') is not none }}",
+                        "attributes": {
+                            "lastup": "{{ trigger.to_state.attributes.get('lastup') if trigger.to_state else none }}"
+                        },
+                    }
+                ],
+            }
+        ]
+    }
+    await hass.async_start()
+    assert await async_setup_component(hass, "template", template_config)
+    await hass.async_block_till_done()
+    assert await async_setup_component(hass, "rest", rest_config)
+    await hass.async_block_till_done()
+    cfg = {
+        "control_balance_brake_limit": True,
+        "control_balance_verified": True,
+        "control_signals_verified": True,
+        "control_measurement_time_attribute": "lastup",
+        "control_balance_scale": -1,
+        "control_balance_offset": 0,
+        "control_balance_deficit_threshold": 100,
+        "control_balance_deficit_full": 300,
+        "thermal_balance_entity": "sensor.ebus_energy_integral",
+        "thermal_heating_mode_entity": "binary_sensor.ebus_valve",
+        "thermal_hot_water_mode_entity": "binary_sensor.ebus_valve",
+        "thermal_heating_mode_inverted": True,
+    }
+
+    def evaluate():
+        states = {
+            entity: hass.states.get(entity)
+            for entity in ("sensor.ebus_energy_integral", "binary_sensor.ebus_valve")
+        }
+        return evaluate_limits(dt_util.utcnow(), cfg, states)
+
+    initial = hass.states.get("sensor.ebus_energy_integral")
+    assert initial is not None and initial.state == "-300"
+    assert int(initial.attributes["lastup"]) == stamp
+    initial_ha_report_time = initial.last_reported
+    assert evaluate()["brake_multiplier"] == 0.5
+
+    # A new HTTP response and global bus update must not make an unchanged
+    # cached EnergyIntegral message look newly measured.
+    freezer.tick(timedelta(minutes=6))
+    response["global"] = response["valve"] = int(dt_util.utcnow().timestamp())
+    coordinator = hass.data["rest"][REST_DATA][0][COORDINATOR]
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    cached = hass.states.get("sensor.ebus_energy_integral")
+    assert cached.state == "-300" and int(cached.attributes["lastup"]) == stamp
+    assert cached.last_reported > initial_ha_report_time
+    assert evaluate()["brake_multiplier"] == 1.0
+    assert evaluate()["balance_reason"] == "signal_unavailable"
+
+    # Only our synthetic new message changes its own lastup with that value.
+    freezer.tick(timedelta(seconds=1))
+    response["global"] = response["balance"] = response["valve"] = int(
+        dt_util.utcnow().timestamp()
+    )
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    fresh = hass.states.get("sensor.ebus_energy_integral")
+    assert (
+        fresh.state == "-300" and int(fresh.attributes["lastup"]) == response["balance"]
+    )
+    assert evaluate()["brake_multiplier"] == 0.5
+
+    # The adapted valve mode and its timestamp come from the same trigger
+    # state, and changing to water must immediately suppress the limiter.
+    freezer.tick(timedelta(seconds=1))
+    response["mode"] = "water"
+    response["global"] = response["valve"] = int(dt_util.utcnow().timestamp())
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    valve = hass.states.get("binary_sensor.ebus_valve")
+    assert valve.state == "on" and int(valve.attributes["lastup"]) == response["valve"]
+    assert evaluate()["brake_multiplier"] == 1.0
+    freezer.tick(timedelta(seconds=1))
+    response["mode"] = "radiator"
+    response["global"] = response["valve"] = int(dt_util.utcnow().timestamp())
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    valve = hass.states.get("binary_sensor.ebus_valve")
+    assert valve.state == "off" and int(valve.attributes["lastup"]) == response["valve"]
+    assert evaluate()["brake_multiplier"] == 0.5
+    freezer.tick(timedelta(seconds=1))
+    response["mode"] = "invalid"
+    response["global"] = response["valve"] = int(dt_util.utcnow().timestamp())
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    assert hass.states.get("binary_sensor.ebus_valve").state in (
+        "unknown",
+        "unavailable",
+    )
+    assert evaluate()["brake_multiplier"] == 1.0
+    assert len(requests) >= 3 and all(path == "/data/mc" for path in requests)

@@ -1198,6 +1198,9 @@ class PumpSteerSensor(RestoreEntity):
         outdoor: Optional[float],
         now: datetime,
     ) -> None:
+        self._control_modifier_state = None
+        self._control_signal_snapshot = {}
+        self._control_applied_kind = None
         self._pilot_plan = self._unavailable_pilot_plan("safe_mode")
         self._pilot_detector = None
         self._pilot_detection_after = now
@@ -1478,41 +1481,27 @@ class PumpSteerSensor(RestoreEntity):
     async def _push_validated_temperature(self, fake_temp, cfg, expected) -> None:
         if not cfg.get("ohmigo_entity") and not cfg.get("modbus_service"):
             return
-        interrupted = False
+        temperature_interrupted = False
+        optional_interrupted = False
         signal_snapshot = getattr(self, "_control_signal_snapshot", {})
-        signal_attribute = cfg.get(
-            "control_measurement_time_attribute", "measurement_time"
-        )
 
-        def signals_match():
+        def signals_match(override=None):
             if not signal_snapshot:
                 return True
             from .control_intelligence import SIGNALS, evaluate_limits
 
             states = {
-                entity: self.hass.states.get(entity) for entity in signal_snapshot
+                cfg[key]: self.hass.states.get(cfg[key])
+                for key in SIGNALS.values()
+                if cfg.get(key)
             }
-            for entity, expected_signal in signal_snapshot.items():
-                state = states[entity]
-                attrs = getattr(state, "attributes", {}) or {}
-                if (
-                    state is None
-                    or (
-                        state.state,
-                        getattr(state, "last_reported", None),
-                        attrs.get(signal_attribute),
-                    )
-                    != expected_signal
-                ):
-                    return False
+            if override is not None:
+                states[override[0]] = override[1]
             current = evaluate_limits(
                 dt_util.now(),
                 cfg,
-                {
-                    cfg[key]: self.hass.states.get(cfg[key])
-                    for key in SIGNALS.values()
-                    if cfg.get(key)
-                },
+                states,
+                measured_after=getattr(self, "_temperature_reported_after", None),
             )
             applied = getattr(self, "_control_applied_kind", None)
             return (
@@ -1521,13 +1510,22 @@ class PumpSteerSensor(RestoreEntity):
             )
 
         def check():
-            nonlocal interrupted
-            interrupted = (
-                interrupted
+            nonlocal temperature_interrupted, optional_interrupted
+            temperature_interrupted = (
+                temperature_interrupted
                 or not self._temperature_inputs_match(cfg, expected)
-                or not signals_match()
             )
-            return not interrupted
+            optional_interrupted = optional_interrupted or not signals_match()
+            return not temperature_interrupted and not optional_interrupted
+
+        @callback
+        def optional_changed(event):
+            nonlocal optional_interrupted
+            entity = event.data.get("entity_id")
+            if entity in signal_snapshot:
+                optional_interrupted = optional_interrupted or not signals_match(
+                    (entity, event.data.get("new_state"))
+                )
 
         if check():
             indoor = self._temperature_state(cfg, "indoor_temp_entity")
@@ -1545,17 +1543,33 @@ class PumpSteerSensor(RestoreEntity):
             outside_id = self._temperature_identity(cfg)[1]
             if outside_id:
                 sources.append(outside_id)
-            sources.extend(signal_snapshot)
-            self._ohmigo_last_push = await async_push_ohmigo(
-                self.hass,
-                self._config_entry,
-                fake_temp,
-                self._ohmigo_last_push,
-                temperature_check=check,
-                temperature_sources=sources,
-            )
-        if not check():
+            if signal_snapshot:
+                from homeassistant.helpers.event import async_track_state_change_event
+
+                unsubscribe = async_track_state_change_event(
+                    self.hass, list(signal_snapshot), optional_changed
+                )
+            else:
+                unsubscribe = lambda: None
+            try:
+                self._ohmigo_last_push = await async_push_ohmigo(
+                    self.hass,
+                    self._config_entry,
+                    fake_temp,
+                    self._ohmigo_last_push,
+                    temperature_check=check,
+                    temperature_sources=sources,
+                )
+            finally:
+                unsubscribe()
+        check()
+        if temperature_interrupted:
             await self._temperature_interrupted(cfg)
+        elif optional_interrupted:
+            # This command was based on an observation that no longer supports
+            # it. Keep normal PI/ramp state; the next regular cycle recalculates.
+            self._attributes["control_signal_status"] = "interrupted"
+            self._attributes["receiver_state"] = "unverified"
 
     def _update_brake_ramp(
         self,
@@ -1604,6 +1618,55 @@ class PumpSteerSensor(RestoreEntity):
             max_dt_seconds=_PREHEAT_RAMP_MAX_DT_SECONDS,
         )
         return self._preheat_ramp
+
+    def _control_modifier_multiplier(
+        self, now, kind, target, enabled, ramp_in, ramp_out
+    ):
+        """Ramp only the optional correction; stale observations are never reused."""
+        history = dict(getattr(self, "_control_modifier_state", None) or {})
+        previous_kind = history.get("_last_kind")
+        if not enabled:
+            history.pop(kind, None)
+            if history:
+                history["_last_kind"] = kind
+            self._control_modifier_state = history or None
+            return 1.0
+        previous = history.get(kind)
+        maximum = 0.5 if kind == "brake" else 1.0
+        requested = max(0.0, min(maximum, 1.0 - target))
+        if previous is None:
+            current, elapsed = 0.0, 60.0
+            previous_time = now
+        else:
+            current, previous_time = previous
+            gap = max(0.0, now.timestamp() - previous_time.timestamp())
+            # A correction from a previous phase is no longer output history
+            # after a full ramp-out period spent in another phase.
+            if previous_kind != kind and gap >= max(float(ramp_out), 10.0) * 60.0:
+                current = 0.0
+            elapsed = min(60.0, gap)
+        duration = ramp_in if requested > current else ramp_out
+        step = maximum * elapsed / (max(float(duration), 10.0) * 60.0)
+        current = (
+            min(requested, current + step)
+            if requested > current
+            else max(requested, current - step)
+        )
+        timestamp = (
+            now if now.timestamp() >= previous_time.timestamp() else previous_time
+        )
+        history[kind] = (current, timestamp)
+        history["_last_kind"] = kind
+        self._control_modifier_state = history
+        if getattr(self, "_control_intelligence", None) is not None:
+            self._control_intelligence["transition"] = (
+                "returning_to_base"
+                if requested == 0 and current > 0
+                else "ramping"
+                if abs(current - requested) > 1e-9
+                else "settled"
+            )
+        return 1.0 - current
 
     def _pi_output(
         self,
@@ -2187,7 +2250,12 @@ class PumpSteerSensor(RestoreEntity):
                     for key in SIGNALS.values()
                     if cfg.get(key)
                 }
-            limits = evaluate_limits(now, cfg, states)
+            limits = evaluate_limits(
+                now,
+                cfg,
+                states,
+                measured_after=getattr(self, "_temperature_reported_after", None),
+            )
             self._control_intelligence = limits
             attribute = cfg.get(
                 "control_measurement_time_attribute", "measurement_time"
@@ -2212,6 +2280,9 @@ class PumpSteerSensor(RestoreEntity):
         common_sources = {
             cfg.get(SIGNALS[k]) for k in ("compressor", "heating", "hot_water", "brine")
         }
+        balance_sources = {
+            cfg.get(SIGNALS[k]) for k in ("heating", "hot_water", "balance")
+        }
         preheat_snapshot = (
             {
                 k: v
@@ -2222,11 +2293,7 @@ class PumpSteerSensor(RestoreEntity):
             else {}
         )
         brake_snapshot = (
-            {
-                k: v
-                for k, v in signal_snapshot.items()
-                if k in common_sources or k == cfg.get(SIGNALS["balance"])
-            }
+            {k: v for k, v in signal_snapshot.items() if k in balance_sources}
             if limits.get("active")
             else {}
         )
@@ -2235,6 +2302,7 @@ class PumpSteerSensor(RestoreEntity):
 
         # 1. Summer mode.
         if outdoor >= summer_threshold:
+            self._control_modifier_state = None
             self._update_thermal_learning(
                 active=False,
                 reason="summer_mode",
@@ -2272,6 +2340,7 @@ class PumpSteerSensor(RestoreEntity):
 
         # 2. Precool.
         if self._should_precool(summer_threshold, forecast_temps):
+            self._control_modifier_state = None
             self._update_thermal_learning(
                 active=False,
                 reason="precool",
@@ -2313,6 +2382,7 @@ class PumpSteerSensor(RestoreEntity):
 
         # 3. Aggressiveness 0 -> pure PI, no price logic.
         if aggressiveness == 0:
+            self._control_modifier_state = None
             self._update_thermal_learning(
                 active=False,
                 reason="price_control_disabled",
@@ -2387,7 +2457,15 @@ class PumpSteerSensor(RestoreEntity):
             if factor > 0 and limits["brake_multiplier"] < 1:
                 self._control_signal_snapshot = brake_snapshot
                 self._control_applied_kind = "brake_multiplier"
-            factor *= limits["brake_multiplier"]
+            multiplier = self._control_modifier_multiplier(
+                now,
+                "brake",
+                limits["brake_multiplier"],
+                cfg.get("control_balance_brake_limit") is True,
+                ramp_in,
+                ramp_out,
+            )
+            factor *= multiplier
             if factor > 0.0:
                 pi_demand = self._pi_output(
                     target,
@@ -2402,7 +2480,7 @@ class PumpSteerSensor(RestoreEntity):
                 # Ramp-in, comfort-floor release and precooling are not training.
                 learning_active = (
                     brake_requested
-                    and limits["brake_multiplier"] == 1.0
+                    and multiplier == 1.0
                     and factor >= 0.75
                     and outdoor <= summer_threshold - 2.0
                     and indoor - outdoor >= 2.0
@@ -2535,7 +2613,15 @@ class PumpSteerSensor(RestoreEntity):
                 if factor > 0 and limits["brake_multiplier"] < 1:
                     self._control_signal_snapshot = brake_snapshot
                     self._control_applied_kind = "brake_multiplier"
-                factor *= limits["brake_multiplier"]
+                multiplier = self._control_modifier_multiplier(
+                    now,
+                    "brake",
+                    limits["brake_multiplier"],
+                    cfg.get("control_balance_brake_limit") is True,
+                    ramp_in,
+                    ramp_out,
+                )
+                factor *= multiplier
                 pi_demand = self._pi_output(
                     target,
                     indoor,
@@ -2601,6 +2687,8 @@ class PumpSteerSensor(RestoreEntity):
                 # Preheat replaces the brake output, so the old phase is over.
                 # Do not let its hidden ramp revive as a later short-dip hold.
                 self._brake_ramp = 0.0
+                if getattr(self, "_control_modifier_state", None):
+                    self._control_modifier_state.pop("brake", None)
                 self._brake_last_t = None
                 self._brake_last_expensive_t = None
                 if self._was_braking_last_cycle:
@@ -2625,7 +2713,15 @@ class PumpSteerSensor(RestoreEntity):
                 if boost > 0 and limits["preheat_multiplier"] < 1:
                     self._control_signal_snapshot = preheat_snapshot
                     self._control_applied_kind = "preheat_multiplier"
-                boost *= limits["preheat_multiplier"]
+                multiplier = self._control_modifier_multiplier(
+                    now,
+                    "preheat",
+                    limits["preheat_multiplier"],
+                    cfg.get("control_aux_preheat_limit") is True,
+                    ramp_in,
+                    ramp_out,
+                )
+                boost *= multiplier
                 boosted_demand = base_demand + boost
                 fake_temp = max(
                     MIN_FAKE_TEMP,
@@ -2688,6 +2784,8 @@ class PumpSteerSensor(RestoreEntity):
             ramp_out=max(ramp_out, 10.0),
             dt_seconds=preheat_dt_seconds,
         )
+        if self._preheat_ramp <= 0 and getattr(self, "_control_modifier_state", None):
+            self._control_modifier_state.pop("preheat", None)
 
         preheat_headroom = self._preheat_headroom(aggressiveness)
         preheat_ceiling = target + preheat_headroom
@@ -2716,7 +2814,15 @@ class PumpSteerSensor(RestoreEntity):
         if factor > 0 and limits["brake_multiplier"] < 1:
             self._control_signal_snapshot = brake_snapshot
             self._control_applied_kind = "brake_multiplier"
-        factor *= limits["brake_multiplier"]
+        multiplier = self._control_modifier_multiplier(
+            now,
+            "brake",
+            limits["brake_multiplier"],
+            cfg.get("control_balance_brake_limit") is True,
+            ramp_in,
+            ramp_out,
+        )
+        factor *= multiplier
 
         # Hold and ramp-out still limit heating through the brake overlay.
         # Resume integration only once that overlay has fully released.

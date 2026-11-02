@@ -330,21 +330,21 @@
       },
       "extended_control": {
         "title": "Utökad styrning",
-        "description": "Bas gäller när funktionerna är avstängda. Begränsaren behöver verifierad kompressordrift, radiatorvärmeläge, varmvattenläge och eltillskott. Kompressor och radiatorvärme måste vara på, varmvatten av. En vald köldbärarpump måste också rapportera drift. Alla deltagande signaler behöver verklig mättid som är högst fem minuter gammal; HA:s rapporttid räcker inte. Saknade eller motsägelsefulla uppgifter ger omedelbart Bas. Om en tidigare verifierad källa, mättidsinställning eller balanskalibrering ändras behöver verifieringen bekräftas på nytt efter att ändringen sparats. Under tiden används Bas.",
+        "description": "Bas gäller när begränsaren är avstängd. Den kräver verifierade signaler för kompressor, radiatorläge, varmvattenläge och eltillskott. Kompressor och radiatorläge ska vara på och varmvatten av; en vald köldbärarpump ska också vara på. Varje deltagande signal behöver en verifierad observationstid högst fem minuter gammal. En gemensam växelventilsignal kan användas för båda lägena när radiatorläget är verifierat inverterat. Ett gammalt värde används inte; utgången återgår mot Bas med befintliga ramptider. En ändrad verifierad källa eller tidsinställning kräver ny bekräftelse.",
         "data": {
           "control_aux_preheat_limit": "Begränsa extra förvärmning vid eltillskott",
-          "control_signals_verified": "Jag har verifierat driftgivarnas betydelse och mättider",
-          "control_measurement_time_attribute": "Attribut för fysisk mättid"
+          "control_signals_verified": "Jag har verifierat signalernas betydelse och observationstider",
+          "control_measurement_time_attribute": "Attribut för verifierad observationstid"
         },
         "data_description": {
           "control_aux_preheat_limit": "Av som standard. Tar bara bort den extra förvärmningshöjningen när eltillskott är verifierat aktivt för radiatorvärme. Ändrar inte pumpens egna tillskott eller nödvärme och garanterar ingen energibesparing.",
-          "control_signals_verified": "Bekräfta först efter kontroll av vad on/off betyder och att mättiden kommer från en fysisk avläsning, inte MQTT-återpublicering eller HA-uppdatering. Kryssrutan skapar inga verifierade data. Gäller båda styrbegränsarna.",
-          "control_measurement_time_attribute": "Samma attributnamn används på varje deltagande givare. Värdet ska vara en tidszonsangiven ISO-tid eller Unix-tid i sekunder. Om attributet saknas används bara Bas; skapa inte en syntetisk mättid."
+          "control_signals_verified": "Bekräfta först när signalernas betydelse och observationstider är verifierade. Tiden ska vara en fysisk mättid eller en mottagningstid för ett nytt mätmeddelande där källans dokumentation verifierar kopplingen till just värdet. En mottagningstid är inte en fysisk mättid. HA:s last_reported, MQTT-återpublicering och online-status räcker inte i sig. Gäller båda begränsarna.",
+          "control_measurement_time_attribute": "Samma attributnamn läses från varje deltagande givare. Värdet ska vara en verifierad observationstid som tidszonsangiven ISO-tid eller Unix-sekunder. Saknas tillförlitligt källunderlag kan ingreppet inte aktiveras; kopiera inte HA:s rapporttid till ett nytt attribut."
         }
       },
       "advanced_control": {
         "title": "Avancerad styrning – värmebalans",
-        "description": "Av som standard. Kan släppa högst hälften av prisbromsningen vid verifierat värmeunderskott. Använder samma drift- och mättidskrav som Utökad. Normalisering: underskott = råvärde × skala + offset. Positiva värden måste betyda större värmeunderskott. Verifiera avkodning, tecken, enhet och gränser mot tillverkardokumentation eller samtidiga fysiska avläsningar. Ett registernamn eller några enstaka gradminutvärden räcker inte. Utan detta ska funktionen förbli avstängd; råvärde och trend kan fortfarande visas. Om en tidigare verifierad källa, mättidsinställning eller balanskalibrering ändras behöver verifieringen bekräftas på nytt efter att ändringen sparats. Under tiden används Bas.",
+        "description": "Av som standard. Kan släppa högst hälften av prisbromsningen vid verifierat värmeunderskott. Kräver färska och verifierat tidsatta signaler för värmebalans, radiatorläge och varmvattenläge, men inte kompressordrift eller köldbärarpump. En gemensam växelventilsignal kan användas om radiatorläget är verifierat inverterat. Normalisering: underskott = råvärde × skala + offset. Positivt värde ska betyda större underskott. Verifiera avkodning, tecken, enhet och gränser; enbart ett registernamn eller enstaka gradminutvärden räcker inte. Saknas underlag, lämna avstängt; råvärde och trend kan visas. Ändrad källa, tidsinställning eller balanskalibrering kräver ny verifiering.",
         "data": {
           "control_balance_brake_limit": "Begränsa prisbromsning med verifierad värmebalans",
           "control_balance_verified": "Jag har verifierat normalisering och underskottsgränser",
@@ -354,7 +354,7 @@
           "control_balance_deficit_full": "Underskott för maximal bromsbegränsning"
         },
         "data_description": {
-          "control_balance_brake_limit": "Ändrar bara befintlig prisbromsning, inte PI eller pumpens interna reglering. Vid otillförlitliga data återgår styrningen till Bas och använder inte ett gammalt ingrepp.",
+          "control_balance_brake_limit": "Ändrar bara befintlig prisbromsning, inte PI eller värmepumpens egen reglering. Ett underskott är inte bevis för pågående värmeleverans. Gamla data används inte; utgången återgår mot Bas med befintliga ramptider.",
           "control_balance_verified": "Bekräfta bara med verifierat underlag för just din givare och värmepump. Ingen avkodning eller generell teckenkonvention antas automatiskt.",
           "control_balance_scale": "Ingen gissad standard. Måste vara ändlig och skild från noll; kan vara negativ beroende på verifierad teckenkonvention.",
           "control_balance_offset": "Ange uttryckligen även om den verifierade offseten är noll. Samma enhet som det normaliserade underskottet.",
@@ -372,7 +372,7 @@
       "invalid_detection_method": "Ogiltig metod för värmedetektering.",
       "heat_signal_alias": "Värmesignalen måste vara en separat indikator för radiatorvärme.",
       "invalid_balance_kind": "Välj en giltig typ av värmebalans.",
-      "control_signals_required": "Välj nödvändiga driftgivare på givarsidorna och verifiera deras betydelse samt attributet för fysisk mättid innan aktivering.",
+      "control_signals_required": "Välj nödvändiga driftgivare och verifiera deras betydelse samt attributet för observationstid. En gemensam växelventil kräver verifierad invertering av radiatorläget.",
       "control_balance_required": "Välj värmebalansgivare och verifiera normalisering. Skalan måste vara skild från noll, offset angiven och 0 < första gränsen < maximalgränsen."
     }
   },

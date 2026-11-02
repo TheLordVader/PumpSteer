@@ -35,6 +35,7 @@ class ControlReplayState:
     was_braking_last_cycle: bool = False
     prev_aggressiveness: int | None = None
     bridge_short_dip_active: bool = False
+    control_modifier_state: dict | None = None
     thermal_pending_samples: int = 0
     thermal_should_refit: bool | None = None
 
@@ -52,6 +53,9 @@ class ControlReplayState:
             was_braking_last_cycle=sensor._was_braking_last_cycle,
             prev_aggressiveness=sensor._prev_aggressiveness,
             bridge_short_dip_active=sensor._bridge_short_dip_active,
+            control_modifier_state=copy.deepcopy(
+                getattr(sensor, "_control_modifier_state", None)
+            ),
             thermal_pending_samples=sensor._thermal_model.pending_samples,
             thermal_should_refit=sensor._thermal_model.should_refit(),
         )
@@ -120,6 +124,7 @@ class _Scratch:
     _minutes_until_expensive = PumpSteerSensor._minutes_until_expensive
     _upcoming_expensive = PumpSteerSensor._upcoming_expensive
     _close_short_dip = PumpSteerSensor._close_short_dip
+    _control_modifier_multiplier = PumpSteerSensor._control_modifier_multiplier
 
     def __init__(self, state, inputs):
         self._control_passive = True
@@ -136,6 +141,7 @@ class _Scratch:
         self._was_braking_last_cycle = state.was_braking_last_cycle
         self._prev_aggressiveness = state.prev_aggressiveness
         self._bridge_short_dip_active = state.bridge_short_dip_active
+        self._control_modifier_state = copy.deepcopy(state.control_modifier_state)
         self._last_outlook = inputs.outlook
         self._preheat_allowed = inputs.preheat_enabled
         self._intentions = []
@@ -198,6 +204,7 @@ class _Scratch:
             was_braking_last_cycle=self._was_braking_last_cycle,
             prev_aggressiveness=self._prev_aggressiveness,
             bridge_short_dip_active=self._bridge_short_dip_active,
+            control_modifier_state=copy.deepcopy(self._control_modifier_state),
             thermal_pending_samples=self._thermal_model.pending_samples,
             thermal_should_refit=self._thermal_model._should_refit,
         )
@@ -255,6 +262,7 @@ def replay_control_step(state, inputs):
             context._brake_last_expensive_t
         ) = None
         context._was_braking_last_cycle = False
+        context._control_modifier_state = None
         return context.state(), ControlReplayDecision(
             outdoor,
             MODE_SAFE,

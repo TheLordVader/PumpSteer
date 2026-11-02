@@ -1007,8 +1007,7 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
             if user_input.get(key) is True
         ]
         if active:
-            required_signals = (
-                "thermal_compressor_entity",
+            mode_signals = (
                 "thermal_heating_mode_entity",
                 "thermal_hot_water_mode_entity",
             )
@@ -1021,17 +1020,41 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
                 and bool(attribute.strip())
                 and all(
                     user_input.get(key) and self._entity_exists(user_input[key])
-                    for key in required_signals
+                    for key in mode_signals
+                )
+                and (
+                    user_input.get(mode_signals[0]) != user_input.get(mode_signals[1])
+                    or user_input.get("thermal_heating_mode_inverted") is True
                 )
             )
             for key in active:
                 if not signals_ready:
                     errors[key] = "control_signals_required"
-            if "control_aux_preheat_limit" in active and not (
-                user_input.get("thermal_aux_heat_entity")
-                and self._entity_exists(user_input["thermal_aux_heat_entity"])
-            ):
-                errors["control_aux_preheat_limit"] = "control_signals_required"
+            if "control_aux_preheat_limit" in active:
+                extra_signals = ("thermal_compressor_entity", "thermal_aux_heat_entity")
+                extras_ready = all(
+                    user_input.get(key) and self._entity_exists(user_input[key])
+                    for key in extra_signals
+                )
+                brine = user_input.get("thermal_brine_pump_entity")
+                if brine and not self._entity_exists(brine):
+                    extras_ready = False
+                # Distinct physical roles are required, except a verified
+                # complementary radiator/hot-water changeover signal.
+                other = [user_input.get(key) for key in (*extra_signals, *mode_signals)]
+                if brine:
+                    other.append(brine)
+                ids = [value for value in other if value]
+                valid_shared = (
+                    user_input.get(mode_signals[0])
+                    and user_input.get(mode_signals[0])
+                    == user_input.get(mode_signals[1])
+                    and user_input.get("thermal_heating_mode_inverted") is True
+                )
+                if len(ids) - len(set(ids)) > (1 if valid_shared else 0):
+                    extras_ready = False
+                if not extras_ready:
+                    errors["control_aux_preheat_limit"] = "control_signals_required"
             if "control_balance_brake_limit" in active:
                 scale = safe_float(user_input.get("control_balance_scale"))
                 offset = safe_float(user_input.get("control_balance_offset"))

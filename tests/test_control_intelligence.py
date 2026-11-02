@@ -78,10 +78,13 @@ def inputs(cfg=None, *, expensive=False, observations=None):
 
 def test_auxiliary_removes_only_extra_preheat_without_freezing_pi():
     initial = replay.ControlReplayState(preheat_ramp=1, prev_aggressiveness=3)
-    base, a = replay.replay_control_step(initial, inputs())
-    enhanced, b = replay.replay_control_step(
-        initial, inputs(config(), observations=states())
-    )
+    base = enhanced = initial
+    for minute in range(20):
+        now = NOW + timedelta(minutes=minute)
+        base, a = replay.replay_control_step(base, replace(inputs(), now=now))
+        enhanced, b = replay.replay_control_step(
+            enhanced, replace(inputs(config(), observations=states(now)), now=now)
+        )
     assert a.mode == b.mode == "preheating"
     assert b.fake_temp > a.fake_temp
     assert b.attributes["preheat_boost_c"] == 0
@@ -93,10 +96,18 @@ def test_auxiliary_removes_only_extra_preheat_without_freezing_pi():
 
 def test_verified_balance_releases_half_brake_but_preserves_integral_and_ramp():
     initial = replay.ControlReplayState(brake_ramp=1, prev_aggressiveness=3)
-    base, a = replay.replay_control_step(initial, inputs(expensive=True))
-    enhanced, b = replay.replay_control_step(
-        initial, inputs(config(), expensive=True, observations=states())
-    )
+    base = enhanced = initial
+    for minute in range(20):
+        now = NOW + timedelta(minutes=minute)
+        base, a = replay.replay_control_step(
+            base, replace(inputs(expensive=True), now=now)
+        )
+        enhanced, b = replay.replay_control_step(
+            enhanced,
+            replace(
+                inputs(config(), expensive=True, observations=states(now)), now=now
+            ),
+        )
     assert a.mode == b.mode == "braking"
     assert b.fake_temp < a.fake_temp
     assert b.attributes["brake_factor"] == 0.5
@@ -158,7 +169,11 @@ def test_bad_or_unverified_signals_revert_to_base_output(failure):
         enhanced, b = replay.replay_control_step(
             initial, inputs(cfg, expensive=expensive, observations=obs)
         )
-        assert a.fake_temp == b.fake_temp
+        if failure in ("compressor", "brine") and expensive:
+            # Balance is independent of proof of current compressor operation.
+            assert b.fake_temp < a.fake_temp
+        else:
+            assert a.fake_temp == b.fake_temp
         assert base.pi._integral == enhanced.pi._integral
 
 
@@ -364,3 +379,99 @@ def test_verified_inverted_heating_mode_uses_existing_semantics(raw, expected):
     assert limits["active"] is expected
     assert (limits["preheat_multiplier"] < 1) is expected
     assert (limits["brake_multiplier"] < 1) is expected
+
+
+@pytest.mark.parametrize(
+    "raw,expected_active",
+    [("off", True), ("on", False), ("unknown", False), ("unavailable", False)],
+)
+def test_verified_shared_changeover_valve_distinguishes_radiators_and_hot_water(
+    raw, expected_active
+):
+    cfg, obs = config(), states()
+    cfg["thermal_heating_mode_entity"] = cfg["thermal_hot_water_mode_entity"]
+    cfg["thermal_heating_mode_inverted"] = True
+    obs["binary_sensor.water"].state = raw
+    actual = evaluate_limits(NOW, cfg, obs)
+    assert (actual["preheat_multiplier"] == 0.0) is expected_active
+    assert (actual["brake_multiplier"] == 0.5) is expected_active
+
+
+def test_shared_valve_without_verified_complementary_polarity_is_rejected():
+    cfg, obs = config(), states()
+    cfg["thermal_heating_mode_entity"] = cfg["thermal_hot_water_mode_entity"]
+    actual = evaluate_limits(NOW, cfg, obs)
+    assert not actual["active"]
+    assert actual["aux_reason"] == actual["balance_reason"] == "signal_alias"
+
+
+@pytest.mark.parametrize(
+    "alias", ["thermal_heating_mode_entity", "thermal_hot_water_mode_entity"]
+)
+def test_balance_cannot_alias_mode_signal(alias):
+    cfg, obs = config(), states()
+    cfg["thermal_balance_entity"] = cfg[alias]
+    actual = evaluate_limits(NOW, cfg, obs)
+    assert actual["brake_multiplier"] == 1.0
+    assert actual["balance_reason"] == "signal_alias"
+
+
+def test_shared_valve_does_not_allow_a_third_aliased_auxiliary_signal():
+    cfg, obs = config(), states()
+    cfg["thermal_heating_mode_entity"] = cfg["thermal_hot_water_mode_entity"]
+    cfg["thermal_heating_mode_inverted"] = True
+    cfg["thermal_aux_heat_entity"] = cfg["thermal_hot_water_mode_entity"]
+    actual = evaluate_limits(NOW, cfg, obs)
+    assert actual["preheat_multiplier"] == 1.0
+    assert actual["aux_reason"] == "signal_alias"
+    assert actual["brake_multiplier"] == 0.5
+
+
+@pytest.mark.parametrize(
+    "condition", ["off", "missing", "old", "brine_off", "brine_missing"]
+)
+def test_verified_balance_does_not_require_proven_compressor_or_brine_operation(
+    condition,
+):
+    cfg, obs = config(), states()
+    if condition == "off":
+        obs["binary_sensor.compressor"].state = "off"
+    elif condition == "missing":
+        obs.pop("binary_sensor.compressor")
+    elif condition == "old":
+        obs["binary_sensor.compressor"].attributes["measurement_time"] = (
+            NOW - timedelta(minutes=6)
+        ).isoformat()
+    elif condition == "brine_off":
+        cfg["thermal_brine_pump_entity"] = "binary_sensor.brine"
+        obs["binary_sensor.brine"] = SimpleNamespace(
+            state="off",
+            last_reported=NOW,
+            attributes={"measurement_time": NOW.isoformat()},
+        )
+    else:
+        cfg["thermal_brine_pump_entity"] = "binary_sensor.brine"
+    actual = evaluate_limits(NOW, cfg, obs)
+    assert actual["brake_multiplier"] == 0.5
+    assert actual["preheat_multiplier"] == 1.0
+
+
+@pytest.mark.parametrize("unsafe_mode", ["water", "heating", "missing", "stale"])
+def test_balance_cannot_override_absent_contradictory_or_stale_valve_context(
+    unsafe_mode,
+):
+    cfg, obs = config(), states()
+    obs["binary_sensor.compressor"].state = "off"
+    if unsafe_mode == "water":
+        obs["binary_sensor.water"].state = "on"
+    elif unsafe_mode == "heating":
+        obs["binary_sensor.heating"].state = "off"
+    elif unsafe_mode == "missing":
+        obs.pop("binary_sensor.water")
+    else:
+        obs["binary_sensor.water"].attributes["measurement_time"] = (
+            NOW - timedelta(minutes=6)
+        ).isoformat()
+    actual = evaluate_limits(NOW, cfg, obs)
+    assert actual["brake_multiplier"] == 1.0
+    assert actual["preheat_multiplier"] == 1.0
