@@ -2623,3 +2623,71 @@ async def test_native_external_heat_option_is_optional_and_preserves_possibility
         external_heat_status(dt_util.utcnow(), dict(entry.options), hass.states)
         == "possible_unverified"
     )
+
+
+async def test_native_safe_recovery_preheat_refreshes_adaptive_diagnostics(
+    recorder_mock, hass, enable_custom_integrations, freezer, monkeypatch
+):
+    freezer.move_to("2026-11-03T08:00:00+00:00")
+    await hass.async_start()
+    await hass.config.async_set_time_zone("UTC")
+    entry = MockConfigEntry(
+        domain="pumpsteer",
+        title="test",
+        data={},
+        options={
+            "indoor_temp_entity": "sensor.room",
+            "indoor_temp_entity_2": "sensor.room2",
+            "indoor_temp_entity_3": "sensor.room3",
+            "indoor_temp_weight_1": 70,
+            "indoor_temp_weight_2": 20,
+            "indoor_temp_weight_3": 10,
+            "real_outdoor_entity": "sensor.out",
+            "electricity_price_entity": "sensor.price",
+            "adaptive_braking_enabled": True,
+            "preheat_boost_enabled": True,
+            "target_temperature": 21,
+            "summer_threshold": 18,
+            "aggressiveness": 3,
+        },
+    )
+    entry.add_to_hass(hass)
+    assert await async_setup_component(hass, "persistent_notification", {})
+    assert await async_setup_component(hass, "pumpsteer", {})
+    await hass.async_block_till_done()
+    controller = next(
+        e for e in hass.data[SENSOR].entities if e.unique_id == entry.entry_id
+    )
+    assert controller.extra_state_attributes["mode"] == "safe_mode"
+    assert controller._adaptive_braking["reason"] == "safe_mode"
+
+    async def cold_forecast():
+        return [0.0] * 8
+
+    monkeypatch.setattr(controller, "_forecast_temps", cold_forecast)
+    freezer.tick(timedelta(seconds=1))
+    for entity, value in (
+        ("sensor.room", 21),
+        ("sensor.room2", 20.5),
+        ("sensor.room3", 20),
+        ("sensor.out", 5),
+    ):
+        hass.states.async_set(entity, value, {"unit_of_measurement": "°C"})
+    prices = [1.0] * 96
+    prices[40:48] = [10.0] * 8
+    hass.states.async_set("sensor.price", 1, {"today": prices})
+    await controller.async_update()
+    freezer.tick(timedelta(seconds=1))
+    await controller.async_update()
+    controller.async_write_ha_state()
+    await hass.async_block_till_done()
+    state = hass.states.get(controller.entity_id)
+    assert state.attributes["status"] == "ok"
+    assert state.attributes["mode"] == "preheating"
+    assert state.attributes["temperature_sources"]["indoor_coverage"] == "complete"
+    assert state.attributes["adaptive_braking"] == {
+        "state": "base",
+        "reason": "preheating",
+        "multiplier": 1.0,
+        "predicted_drop_30m_c": None,
+    }

@@ -3238,6 +3238,16 @@ class PumpSteerSensor(RestoreEntity):
                     min(MAX_FAKE_TEMP, outdoor - boosted_demand),
                 )
 
+                # Preheat does not apply adaptive braking; discard stale display
+                # status without changing the independent control/ramp state.
+                self._adaptive_braking = {
+                    "state": "base",
+                    "reason": "preheating"
+                    if cfg.get("adaptive_braking_enabled") is True
+                    else "disabled",
+                    "multiplier": 1.0,
+                    "predicted_drop_30m_c": None,
+                }
                 await self._set_state(
                     fake_temp,
                     MODE_PREHEAT,

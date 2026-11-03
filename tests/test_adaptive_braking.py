@@ -302,3 +302,87 @@ def test_delayed_report_uses_one_observation_timeline(monkeypatch):
     )
     assert sensor._thermal_model.validation_session_active
     assert sensor._thermal_model._session.last_time == sensor._adaptive_report
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_safe_recovery_preheat_does_not_publish_stale_adaptive_safe_reason(
+    monkeypatch, enabled
+):
+    sensor, states = _sensor()
+    sensor._config_entry.options.update(
+        adaptive_braking_enabled=enabled, preheat_boost_enabled=True
+    )
+    prices = [1.0] * 96
+    prices[40:48] = [10.0] * 8
+    states["sensor.price"].attributes["today"] = prices
+
+    async def cold_forecast():
+        return [0.0] * 8
+
+    monkeypatch.setattr(sensor, "_forecast_temps", cold_forecast)
+    states["sensor.indoor"].state = "unavailable"
+    assert _cycle(sensor, monkeypatch, 0)["mode"] == "safe_mode"
+    assert sensor._adaptive_braking["reason"] == "safe_mode"
+    states["sensor.indoor"].state = "20.5"
+    recovered = _cycle(sensor, monkeypatch, 1)
+    assert recovered["mode"] == "preheating"
+    assert recovered["status"] == "ok"
+    assert recovered["adaptive_braking"]["reason"] == (
+        "preheating" if enabled else "disabled"
+    )
+    assert recovered["adaptive_braking"]["state"] == "base"
+    assert recovered["adaptive_braking"]["multiplier"] == 1.0
+
+
+def test_active_adaptive_to_preheat_only_refreshes_diagnostics(monkeypatch):
+    sensor, states = _sensor()
+    sensor._config_entry.options.update(
+        adaptive_braking_enabled=True, preheat_boost_enabled=True
+    )
+    states["sensor.indoor"].state = "19.9"
+    prices = [1.0] * 96
+    prices[52:56] = [10.0] * 4
+    states["sensor.price"].attributes["today"] = prices
+
+    async def cold_forecast():
+        return [0.0] * 8
+
+    monkeypatch.setattr(sensor, "_forecast_temps", cold_forecast)
+    states["sensor.indoor"].state = "20.0"
+    _cycle(sensor, monkeypatch, 299)  # establish the genuine source context
+    sensor._thermal_model = qualified()
+    states["sensor.indoor"].state = "19.9"  # genuine changed observation
+    for minute in range(300, 307):
+        braking = _cycle(sensor, monkeypatch, minute)
+    assert braking["adaptive_braking"]["state"] == "adapting", braking[
+        "adaptive_braking"
+    ]
+    assert braking["adaptive_braking"]["multiplier"] < 1.0
+
+    # Same live state and subsequent inputs: stale display data must have no
+    # effect on the preheat command, PI, ramps or later braking decisions.
+    reference = copy.copy(sensor)
+    reference.__dict__ = copy.deepcopy(sensor.__dict__)
+    reference._adaptive_braking = {"state": "base", "multiplier": 1.0}
+    reference_states = reference.hass.states.get.__self__
+    prices = [1.0] * 96
+    prices[64:72] = [10.0] * 8
+    states["sensor.price"].attributes["today"] = prices
+    reference_states["sensor.price"].attributes["today"] = prices.copy()
+    preheat = _cycle(sensor, monkeypatch, 307)
+    expected = _cycle(reference, monkeypatch, 307)
+    assert preheat["mode"] == expected["mode"] == "preheating"
+    assert preheat["adaptive_braking"]["state"] == "base"
+    assert preheat["adaptive_braking"]["reason"] == "preheating"
+    assert preheat["adaptive_braking"]["multiplier"] == 1.0
+    assert preheat["adaptive_braking"].get("predicted_drop_30m_c") is None
+    assert sensor.state == reference.state
+    assert sensor._control_modifier_state == reference._control_modifier_state
+    assert vars(sensor._pi) == vars(reference._pi)
+    for minute in (308, 309, 480):
+        current = _cycle(sensor, monkeypatch, minute)
+        baseline = _cycle(reference, monkeypatch, minute)
+        assert sensor.state == reference.state
+        assert current["mode"] == baseline["mode"]
+        assert current["brake_factor"] == baseline["brake_factor"]
+        assert sensor._control_modifier_state == reference._control_modifier_state
