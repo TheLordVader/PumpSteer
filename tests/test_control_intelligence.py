@@ -237,7 +237,19 @@ def test_base_matches_installed_reference_control_branches(monkeypatch):
             ["git", "show", f"b273afc:custom_components/pumpsteer/{module}"], text=True
         )
         current = Path(sensor_module.__file__).with_name(module).read_text()
-        assert ast.dump(ast.parse(original)) == ast.dump(ast.parse(current))
+        reference_tree, candidate_tree = ast.parse(original), ast.parse(current)
+        if module == "settings.py":
+            # Release metadata changes do not change control behavior. Retain the
+            # full AST comparison for every control constant and this declaration.
+            for tree in (reference_tree, candidate_tree):
+                for node in tree.body:
+                    if (
+                        isinstance(node, ast.AnnAssign)
+                        and isinstance(node.target, ast.Name)
+                        and node.target.id == "PUMPSTEER_VERSION"
+                    ):
+                        node.value = ast.Constant("release metadata")
+        assert ast.dump(reference_tree) == ast.dump(candidate_tree)
     # Helpers invoked by the branch method must also be unchanged against reference.
     current_class = next(
         n

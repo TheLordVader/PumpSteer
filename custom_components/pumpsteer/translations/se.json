@@ -48,7 +48,7 @@
         },
         "data_description": {
           "thermal_intelligence_enabled": "Samlar passivt kvalificerade observationer om en verifierad värmesignal väljs. Påverkar inte värmestyrningen.",
-          "external_heat_sources": "Exempelvis braskamin eller luftvärmepump. Tillfällig extravärme kan inte identifieras säkert; inlärningsresultat förblir ovaliderade.",
+          "external_heat_sources": "Ja betyder att extra värme ibland kan förekomma, inte att den är på nu. Adaptiv bromsning kan lära från stabil temperaturrespons, förkastar tydligt störda perioder och kräver senare oberoende kontroller. Oupptäckt extra värme är fortfarande en möjlig felkälla; inget värmeflöde mäts.",
           "adaptive_braking_enabled": "Lär husets observerade temperaturrespons med dina vanliga inne- och utegivare. Efter minst tre kontroller av senare temperaturutfall kan prisbromsningen minskas försiktigt nära komfortgränsen. Avstängd vid uppgradering. Osäkra eller gamla data ger grundreglering; inga extra värmepumpsgivare krävs. Visar inte uppmätta energibesparingar."
         },
         "description": "Passiv analys och frivillig adaptiv prisbromsning är separata val. Adaptiv bromsning använder observerad temperaturrespons, inte antagen värmeeffekt. Mer avancerad verifierad modellinlärning kräver tillförlitliga värmesignaler."
@@ -58,7 +58,7 @@
         "menu_options": {
           "heat_sensors": "Analysmetod och huvudgivare",
           "energy": "El- och energimätning",
-          "heat_details": "Fler värmepumpsgivare",
+          "heat_details": "Fler givare för värme",
           "heat_pump_telemetry": "Passiv värmepumpsdiagnostik",
           "extended_control": "Utökad – frivillig styrbegränsning",
           "advanced_control": "Avancerad – verifierad värmebalans"
@@ -319,17 +319,19 @@
         "description": "Ohmigo Push skickar temperaturutgången till enheten. Reläet är den fysiska utgången; Relay Guard övervakar dess säkra återgång. Dessa val påverkar faktisk styrning."
       },
       "heat_details": {
-        "title": "Fler värmepumpsgivare",
+        "title": "Fler givare för värme",
         "description": "Valfritt för djupare passiv analys. Kompressordrift eller elförbrukning bevisar inte radiatorvärme. Lämna fälten tomma om givare saknas.",
         "data": {
           "thermal_hot_water_mode_entity": "Verifierat varmvattenläge (valfritt)",
           "thermal_compressor_entity": "Kompressorstatus (valfri)",
-          "thermal_return_temp_entity": "Returtemperatur (valfri)"
+          "thermal_return_temp_entity": "Returtemperatur (valfri)",
+          "thermal_external_heat_entity": "Verifierad drift för extra värmekälla (frivilligt)"
         },
         "data_description": {
           "thermal_hot_water_mode_entity": "På betyder verifierad varmvattenproduktion. Värmeinlärning pausas vid på eller okänt läge; okända perioder klassas inte.",
           "thermal_compressor_entity": "Kompressorstatus ensam bevisar inte radiatorvärme.",
-          "thermal_return_temp_entity": "Används endast tillsammans med andra kvalificerade signaler."
+          "thermal_return_temp_entity": "Används endast tillsammans med andra kvalificerade signaler.",
+          "thermal_external_heat_entity": "Lämna tomt utan en tillförlitlig signal. På ska betyda att den extra värmekällan faktiskt är aktiv, inte värmepumpens kompressor eller termostatens värmebegäran. Kräver en dokumenterat verifierad källtid i tidsattributet för styrsignaler (standard measurement_time), högst fem minuter gammal. HA-rapporttid eller återpublicerad MQTT-data räcker inte. Aktiv eller okänd vald signal pausar adaptiv användning och kräver nya kontroller; temperaturövervakning fungerar utan signalen."
         }
       },
       "heat_pump_telemetry": {
@@ -408,7 +410,8 @@
       "invalid_balance_kind": "Välj en giltig typ av värmebalans.",
       "control_signals_required": "Välj nödvändiga driftgivare och verifiera deras betydelse samt attributet för observationstid. En gemensam växelventil kräver verifierad invertering av radiatorläget.",
       "control_balance_required": "Välj värmebalansgivare och verifiera normalisering. Skalan måste vara skild från noll, offset angiven och 0 < första gränsen < maximalgränsen.",
-      "invalid_numeric_alarm": "Ange ett giltigt numeriskt normalvärde innan du bekräftar tolkningen."
+      "invalid_numeric_alarm": "Ange ett giltigt numeriskt normalvärde innan du bekräftar tolkningen.",
+      "external_heat_alias": "Extra värmekälla måste ha en egen driftsignal, inte värmepumpens kompressor-, tillskotts- eller värmelägessignal."
     }
   },
   "entity": {

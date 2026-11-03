@@ -93,12 +93,14 @@ class _ValidationSession:
     forecast_checked: bool = False
     adaptive_reports: bool = False
     reports: int = 1
+    screen_external_heat: bool = False
 
 
 class ThermalModel:
     """Estimate and validate observed house cooling response during braking."""
 
     def __init__(self) -> None:
+        self._external_disturbance = None
         self._adaptive_reports = False
         self._adaptive_validations = deque(maxlen=3)
         self._k: float = _FALLBACK_K
@@ -324,7 +326,7 @@ class ThermalModel:
     def adaptive_snapshot(self):
         """Tiny versioned evidence for the current fitted coefficient; no raw history."""
         return {
-            "version": 2,
+            "version": 3,
             "k": self._k,
             "validations": list(self._adaptive_validations),
         }
@@ -335,7 +337,7 @@ class ThermalModel:
         try:
             if (
                 not isinstance(saved, dict)
-                or saved.get("version") != 2
+                or saved.get("version") != 3
                 or saved.get("k") != self._k
             ):
                 return
@@ -362,6 +364,8 @@ class ThermalModel:
 
     def adaptive_reason(self, now, delta):
         """Quality gates independent of heuristic confidence and in-sample fit."""
+        if self._external_disturbance:
+            return self._external_disturbance
         if (
             not self._valid
             or self._sample_count < 20
@@ -384,6 +388,36 @@ class ThermalModel:
         ):
             return "outside_validation_range"
         return "qualified"
+
+    def mark_external_disturbance(self, reason="temperature_response_disturbed"):
+        """Reject uncertain observation periods, never identify their heat source.
+
+        Clear pending raw samples conservatively, including earlier samples from
+        this period. Keep the fitted coefficient; active use needs new holdouts.
+        """
+        self._external_disturbance = reason
+        self._samples.clear()
+        self._adaptive_validations.clear()
+        self._temp_history.clear()
+        self.cancel_validation_session()
+
+    def clear_external_disturbance(self):
+        """A later unmodified price period may collect independent evidence again."""
+        self._external_disturbance = None
+
+    def screen_possible_external_heat(self, now):
+        """Only report a disturbed response, not proof of a stove or heat delivery."""
+        session = self._session
+        if session is None or not session.screen_external_heat:
+            return self._external_disturbance is not None
+        rows = [
+            (at, value)
+            for at, value in self._temp_history
+            if session.start_time.timestamp() <= at.timestamp() <= now.timestamp()
+        ]
+        if len(rows) >= 3 and rows[-1][1] - min(value for at, value in rows) > 0.300001:
+            self.mark_external_disturbance()
+        return self._external_disturbance is not None
 
     # ── Temperature history and learning samples ───────────────────────────────
 
@@ -444,6 +478,8 @@ class ThermalModel:
 
         Returns True when a sample was accepted.
         """
+        if self._external_disturbance:
+            return False
         rate = self._compute_rate()
         if rate is None:
             return False
@@ -571,9 +607,10 @@ class ThermalModel:
         outdoor_temp: float,
         *,
         adaptive_observations: bool = False,
+        screen_external_heat: bool = False,
     ) -> None:
         """Start one relevant stable-braking validation session."""
-        if self._session is not None:
+        if self._session is not None or self._external_disturbance:
             return
 
         self._session = _ValidationSession(
@@ -585,6 +622,7 @@ class ThermalModel:
             last_time=now,
             last_indoor=indoor_temp,
             adaptive_reports=adaptive_observations,
+            screen_external_heat=screen_external_heat,
             forecast_30m=(
                 self.predict_drop(indoor_temp, outdoor_temp, 30)
                 if self._valid and adaptive_observations
@@ -631,6 +669,11 @@ class ThermalModel:
                     duration,
                 )
                 error = session.start_indoor - indoor_temp - predicted
+                if session.screen_external_heat and error < -0.2:
+                    # Unexpectedly added warmth is confounded. Extra cooling
+                    # remains a failed validation so genuine drift can refit.
+                    self.mark_external_disturbance()
+                    return True
                 self._adaptive_validations.append(
                     (
                         now.timestamp(),

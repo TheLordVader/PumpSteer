@@ -65,9 +65,11 @@ def validate_versions(
         )
 
     if tag is not None:
-        if not tag.startswith("v") or len(tag) < 2:
-            raise ValueError(f"Release tag must start with 'v': {tag!r}")
-        if tag[1:] != manifest_version:
+        # New releases use the exact manifest version. Only historical 2.x tags
+        # retain their v-prefix compatibility; 3.x and later must match exactly.
+        if tag != manifest_version and not (
+            manifest_version.startswith("2.") and tag == f"v{manifest_version}"
+        ):
             raise ValueError(
                 f"Release tag {tag!r} does not match integration version "
                 f"{manifest_version!r}"
@@ -80,7 +82,7 @@ def main() -> int:
     """Run source checks locally or validate a GitHub release tag."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--tag", help="Release tag to check against the integration (e.g. v2.2.3)"
+        "--tag", help="Release tag to check against the integration (e.g. 3.0.0-beta.1)"
     )
     args = parser.parse_args()
 

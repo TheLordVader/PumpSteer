@@ -2307,7 +2307,7 @@ async def test_native_adaptive_model_restore_and_default_off(
 
     now = dt_util.utcnow()
     evidence = {
-        "version": 2,
+        "version": 3,
         "k": 0.04,
         "validations": [
             [(now - timedelta(hours=hour)).timestamp(), 0.05, 16.0]
@@ -2435,7 +2435,7 @@ async def test_native_enabled_adaptive_startup_waits_without_erasing_experience(
     context = repr((("sensor.room", "sensor.out", None), *settings))
     configuration = repr(([("sensor.room", 1.0)], "sensor.out", backup, settings))
     evidence = {
-        "version": 2,
+        "version": 3,
         "k": 0.04,
         "validations": [
             [(now - timedelta(hours=h)).timestamp(), 0.05, 16.0] for h in (3, 2, 1)
@@ -2524,3 +2524,82 @@ async def test_native_enabled_adaptive_startup_waits_without_erasing_experience(
     assert sensor._adaptive_configuration == configuration
     assert sensor._adaptive_braking["state"] == "adapting"
     assert sensor._adaptive_braking["multiplier"] < 1
+
+
+async def test_native_external_heat_option_is_optional_and_preserves_possibility(
+    recorder_mock, hass, enable_custom_integrations
+):
+    from custom_components.pumpsteer.control_intelligence import external_heat_status
+
+    for entity, value in [
+        ("sensor.room", 21),
+        ("sensor.out", 5),
+        ("sensor.price", 1),
+        ("binary_sensor.external", "off"),
+    ]:
+        hass.states.async_set(entity, value)
+    entry = MockConfigEntry(
+        domain="pumpsteer",
+        title="test",
+        data={},
+        options={
+            "indoor_temp_entity": "sensor.room",
+            "real_outdoor_entity": "sensor.out",
+            "electricity_price_entity": "sensor.price",
+            "price_tomorrow_entity": "sensor.price",
+            "adaptive_braking_enabled": True,
+            "external_heat_sources": True,
+        },
+    )
+    entry.add_to_hass(hass)
+    assert await async_setup_component(hass, "pumpsteer", {})
+    await hass.async_block_till_done()
+    from homeassistant.loader import async_get_integration
+    from homeassistant.helpers import device_registry as dr
+
+    integration = await async_get_integration(hass, "pumpsteer")
+    assert integration.version == "3.0.0-beta.1"
+    device = dr.async_get(hass).async_get_device(
+        identifiers={("pumpsteer", entry.entry_id)}
+    )
+    assert device is not None and device.sw_version == "3.0.0-beta.1"
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"next_step_id": "telemetry"}
+    )
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"next_step_id": "heat_details"}
+    )
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"thermal_external_heat_entity": "binary_sensor.external"}
+    )
+    assert result["type"] == "create_entry"
+    assert entry.options["external_heat_sources"] is True
+    assert entry.options["adaptive_braking_enabled"] is True
+    assert (
+        external_heat_status(dt_util.utcnow(), dict(entry.options), hass.states)
+        == "unknown"
+    )
+    now = dt_util.utcnow()
+    hass.states.async_set(
+        "binary_sensor.external", "off", {"measurement_time": now.isoformat()}
+    )
+    assert (
+        external_heat_status(dt_util.utcnow(), dict(entry.options), hass.states)
+        == "verified_inactive"
+    )
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"next_step_id": "telemetry"}
+    )
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"], {"next_step_id": "heat_details"}
+    )
+    result = await hass.config_entries.options.async_configure(result["flow_id"], {})
+    assert result["type"] == "create_entry"
+    assert not entry.options.get("thermal_external_heat_entity")
+    assert entry.options["external_heat_sources"] is True
+    assert (
+        external_heat_status(dt_util.utcnow(), dict(entry.options), hass.states)
+        == "possible_unverified"
+    )

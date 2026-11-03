@@ -10,6 +10,17 @@ house response must eventually inform bounded control decisions, with automatic
 fallback when evidence is insufficient. Predictions and simulated savings must
 remain distinct from measured outcomes.
 
+## Release naming
+
+The first verified 3.x candidate is `3.0.0-beta.1`. Use SemVer
+`3.0.0-beta.N`, then `3.0.0-rc.N`, then `3.0.0`. Bump versions for verified
+release candidates/releases, not ordinary development commits. Only after an
+explicit publication GO create the Git tag exactly matching the manifest version
+(for example `3.0.0-beta.1`, without a `v` prefix). Mark betas and RCs as GitHub
+prereleases. Keep the exact commit SHA and file hashes in verification evidence;
+version names do not replace provenance. Use the existing manifest/settings
+consistency check; no separate version engine or automatic publication is added.
+
 ## Control map and existing contracts
 
 The latest production preflight verified `b273afc253ec1c102385fe6d9830024815151c64`
@@ -237,13 +248,14 @@ Activation and quality:
   least 20 new accepted samples, trigger a refit even below the older diagnostic
   0.3 C MAE threshold. A refit clears qualification and needs three later
   independent validations. SAFE resets output correction; restored correction is
-  never applied. Known intermittent extra heat disables adaptive use.
+  never applied. Possible intermittent extra heat is handled by the observational
+  screening and optional verified activity described below.
 
 `adaptive_braking` reports `collecting` (Samlar erfarenhet), `learned` (Lärt husets
 respons), `adapting` (Anpassar styrningen), `returning_to_base` (Återgår) or `base`
 (Grundreglering), together with the gate reason, applied multiplier and predicted
 30-minute drop. `adaptive_model_state` is a compact versioned RestoreEntity
-summary (policy version 2): coefficient association, source context and only three
+summary (policy version 3): coefficient association, source context and only three
 validation rows. Older qualification is discarded while the fitted coefficient
 can still be independently revalidated. For weighted room temperature, a learning
 snapshot is accepted only after every contributing indoor source has reported
@@ -275,3 +287,54 @@ Replay changes demonstrate program behavior and bounded comfort protection, not
 measured energy, compressor-start, comfort or monetary improvements. Actual benefit
 requires later prospective temperature/comfort comparison and, for cost claims,
 qualified metering and prices. The electricity accounting engine is untouched.
+
+
+### Possible extra heat and uncertain observation periods
+
+The existing yes/no question means **extra heat may sometimes occur**, not that a
+stove or other heater is currently operating. With `external_heat_sources=true`,
+stable basic-sensor observations can fit, independently qualify and adapt the same
+ThermalModel; the setting is not a blanket control prohibition. It does not prove
+that any particular observation is free from hidden extra heat.
+
+Screen only actual stable, unmodified baseline-braking observation windows.
+Earlier PI recovery/preheat/ramp history and temperature response caused by an
+adaptive correction are not baseline evidence and cannot identify extra heat.
+A rise greater than 0.3 C within such a window, or a baseline holdout reporting
+more than 0.2 C less cooling than its frozen forecast, marks the response as
+`temperature_response_disturbed`. Noise, sunlight, people, changed house behavior
+and extra heating can be indistinguishable. The label never claims a stove is on.
+Reject the uncertain period as a whole: clear pending raw samples and qualification,
+retain the fitted coefficient, and resume independent learning/checks during later
+released baseline price periods. Do not cherry-pick only downward samples. Flat
+and slightly rising observations remain in otherwise acceptable windows.
+
+Unexpected **additional cooling** remains a failed validation. Three such failed
+holdouts above 0.2 C plus at least 20 new samples still trigger the existing refit
+lifecycle, including the 0.25 C case. No quality threshold is relaxed. Persistent
+unexplained slower cooling may conservatively leave Base active until consistent
+later baseline observations qualify; absence of a detected anomaly cannot prove
+absence of external heat or identify its cause.
+
+There was no existing dedicated external-heater activity role: compressor status,
+pump auxiliary heat and thermostat demand cannot stand in for it. One optional
+`thermal_external_heat_entity` binary sensor is therefore offered on the existing
+Additional heating sensors page. It is never required. Only select a documented
+signal whose on/off meaning and source observation/new-measurement receipt time
+have been verified. It reuses the existing `control_measurement_time_attribute`
+(default `measurement_time`), five-minute freshness and startup requirements.
+HA `last_reported`, availability and MQTT republication alone do not qualify it.
+
+Diagnostics distinguish `possible_unverified`, `verified_active`,
+`verified_inactive` (only that chosen heater), `unknown` and `not_configured`.
+A configured active or unknown source rejects the uncertain observation period
+and returns existing adaptive correction toward Base through the normal ramps.
+No configured source leaves the observational path usable. The existing temporary
+output checks also watch the optional signal: a fresh same-off report is allowed,
+whereas active/unknown transitions prevent an old adaptive command from obtaining
+a new Guard activation, without resetting valid PI or ramp state.
+
+Policy version 3 discards old unscreened qualification summaries on upgrade while
+retaining compatible fitted coefficients. Three new independent holdouts are
+required before use, including for users who previously selected possible extra
+heat. No new polling, permanent listener, service, database or output path exists.

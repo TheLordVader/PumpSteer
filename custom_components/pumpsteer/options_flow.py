@@ -107,6 +107,7 @@ _GROUPS["basic_settings"] -= _GROUPS["temperature_sources"] | _GROUPS["report_ag
 _GROUPS["energy"] = {"thermal_power_entity", "thermal_energy_entities"}
 _GROUPS["heat_sensors"] -= _GROUPS["energy"]
 _GROUPS["heat_details"] = {
+    "thermal_external_heat_entity",
     "thermal_compressor_entity",
     "thermal_return_temp_entity",
     "thermal_hot_water_mode_entity",
@@ -162,6 +163,7 @@ _CLEARABLE = {
     "ohmigo_entity",
     OHMIGO_RELAY_ENTITY,
     "thermal_heat_activity_entity",
+    "thermal_external_heat_entity",
     "thermal_supply_temp_entity",
     "thermal_heating_mode_entity",
     "thermal_power_entity",
@@ -559,6 +561,12 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
                     }
                 }
             ),
+            vol.Optional(
+                "thermal_external_heat_entity",
+                description={
+                    "suggested_value": current_data.get("thermal_external_heat_entity")
+                },
+            ): selector({"entity": {"domain": "binary_sensor"}}),
             vol.Optional(
                 "thermal_compressor_entity",
                 description={
@@ -993,6 +1001,7 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
             errors["thermal_heat_activity_entity"] = "entity_not_found"
 
         for key, domain in (
+            ("thermal_external_heat_entity", "binary_sensor."),
             ("thermal_balance_entity", "sensor."),
             ("thermal_supply_target_entity", "sensor."),
             ("thermal_brine_in_entity", "sensor."),
@@ -1014,6 +1023,18 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
                 or not self._entity_exists(entity)
             ):
                 errors[key] = "entity_not_found"
+        external = user_input.get("thermal_external_heat_entity")
+        if external and any(
+            external == user_input.get(key)
+            for key in (
+                "thermal_heat_activity_entity",
+                "thermal_compressor_entity",
+                "thermal_heating_mode_entity",
+                "thermal_hot_water_mode_entity",
+                "thermal_aux_heat_entity",
+            )
+        ):
+            errors["thermal_external_heat_entity"] = "external_heat_alias"
         alarm_entity = user_input.get("thermal_alarm_entity")
         if alarm_entity and (
             not isinstance(alarm_entity, str)

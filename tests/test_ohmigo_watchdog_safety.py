@@ -628,3 +628,78 @@ def test_weighted_source_flap_during_write_revokes_guard_through_controller(
     asyncio.run(update(sensor, manager))
     assert all(call[0] == "number" for call in receiver.calls)
     assert not receiver.active
+
+
+@pytest.mark.parametrize("replacement", ["off", "on"])
+def test_external_heat_optional_report_during_dispatch_uses_semantics_not_report_tuple(
+    rig, monkeypatch, replacement
+):
+    from test_adaptive_braking import START, qualified
+    from homeassistant.helpers import event as events
+
+    sensor, states, clock, manager, receiver = rig
+    clock[0] = START + timedelta(hours=5)
+    sensor._config_entry.options.update(
+        aggressiveness=3,
+        adaptive_braking_enabled=True,
+        external_heat_sources=True,
+        thermal_external_heat_entity="binary_sensor.external",
+    )
+    states["sensor.indoor"].state = "19.9"
+    states["sensor.outdoor"].state = "5"
+    for name in ("sensor.indoor", "sensor.outdoor"):
+        states[name].last_reported = clock[0]
+    states["binary_sensor.external"] = SimpleNamespace(
+        state="off",
+        last_reported=clock[0],
+        attributes={"measurement_time": clock[0].isoformat()},
+    )
+
+    async def prices(cfg, now):
+        return [10.0] * 24, ["expensive"] * 24, 60, 0
+
+    monkeypatch.setattr(sensor, "_get_prices", prices)
+    sensor._update_outdoor_selection(sensor._cfg())
+    sensor._prepare_adaptive_observation(
+        sensor._cfg(), clock[0], sensor._temperature_identity(sensor._cfg())
+    )
+    sensor._thermal_model = qualified()
+    listeners = []
+
+    def subscribe(hass, entities, listener):
+        row = (set(entities), listener)
+        listeners.append(row)
+        return lambda: listeners.remove(row)
+
+    monkeypatch.setattr(events, "async_track_state_change_event", subscribe)
+    monkeypatch.setattr(relay_guard, "async_track_state_change_event", subscribe)
+    original = sensor.hass.services.async_call
+
+    async def dispatch(domain, service, data, blocking=False):
+        await original(domain, service, data, blocking)
+        if domain == "number":
+            clock[0] += timedelta(seconds=1)
+            changed = SimpleNamespace(
+                state=replacement,
+                last_reported=clock[0],
+                attributes={"measurement_time": clock[0].isoformat()},
+            )
+            states["binary_sensor.external"] = changed
+            for entities, listener in list(listeners):
+                if "binary_sensor.external" in entities:
+                    listener(
+                        SimpleNamespace(
+                            data={
+                                "entity_id": "binary_sensor.external",
+                                "new_state": changed,
+                            }
+                        )
+                    )
+
+    sensor.hass.services.async_call = dispatch
+    asyncio.run(update(sensor, manager))
+    assert receiver.active is (replacement == "off")
+    assert sensor.extra_state_attributes["mode"] == "braking"
+    assert sensor._brake_ramp > 0
+    assert sensor._pi._last_time is not None
+    assert listeners == []

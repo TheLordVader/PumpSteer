@@ -33,7 +33,7 @@ def test_mismatched_source_versions_are_rejected(version_files):
         validate_versions(manifest, settings)
 
 
-@pytest.mark.parametrize("tag", ["v2.2.5", "2.2.4", "v"])
+@pytest.mark.parametrize("tag", ["v2.2.5", "2.2.5", "v"])
 def test_invalid_or_mismatched_release_tags_are_rejected(version_files, tag):
     manifest, settings = version_files
     with pytest.raises(ValueError, match="Release tag"):
@@ -45,3 +45,16 @@ def test_missing_version_constant_is_rejected(version_files):
     settings.write_text("PID_KP = 2.4\n", encoding="utf-8")
     with pytest.raises(ValueError, match="PUMPSTEER_VERSION not found"):
         validate_versions(manifest, settings)
+
+
+def test_verified_three_beta_candidate_version_and_exact_tag():
+    assert validate_versions(MANIFEST_PATH, SETTINGS_PATH) == "3.0.0-beta.1"
+    assert (
+        validate_versions(MANIFEST_PATH, SETTINGS_PATH, tag="3.0.0-beta.1")
+        == "3.0.0-beta.1"
+    )
+
+
+def test_three_x_release_tag_must_exactly_equal_version_without_prefix():
+    with pytest.raises(ValueError, match="Release tag"):
+        validate_versions(MANIFEST_PATH, SETTINGS_PATH, tag="v3.0.0-beta.1")

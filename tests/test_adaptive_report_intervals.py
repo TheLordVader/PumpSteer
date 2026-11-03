@@ -17,10 +17,20 @@ from custom_components.pumpsteer.control_replay import (
 )
 
 
-def exercise(monkeypatch, interval, *, jitter=False, weighted=False, periods=None):
+def exercise(
+    monkeypatch,
+    interval,
+    *,
+    jitter=False,
+    weighted=False,
+    periods=None,
+    external_possible=False,
+    temperature_profile=None,
+    episodes=4,
+):
     sensor, states = _sensor()
     cfg = sensor._config_entry.options
-    cfg.update(adaptive_braking_enabled=True)
+    cfg.update(adaptive_braking_enabled=True, external_heat_sources=external_possible)
     if weighted:
         for n in (2, 3):
             cfg[f"indoor_temp_entity_{n}"] = f"sensor.indoor{n}"
@@ -50,10 +60,12 @@ def exercise(monkeypatch, interval, *, jitter=False, weighted=False, periods=Non
     count = {name: int(hasattr(states[name], "last_reported")) for name in sources}
     accepted = []
     last = None
-    for minute in range(4 * 720 + 1):
+    for minute in range(episodes * 720 + 1):
         now[0] = START + timedelta(minutes=minute)
         phase = minute % 720
         actual = 23 - 0.005 * min(phase, 360) if phase < 360 else 23
+        if temperature_profile is not None:
+            actual = temperature_profile(minute, actual)
         for name in sources:
             if minute >= due[name]:
                 states[name].state = str(round(actual, 1))  # ordinary 0.1 C room sensor

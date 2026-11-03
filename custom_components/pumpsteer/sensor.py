@@ -336,7 +336,10 @@ class PumpSteerSensor(RestoreEntity):
         if getattr(self, "_control_intelligence", None) is not None:
             attrs["control_intelligence"] = {
                 **self._control_intelligence,
-                "applied": bool(getattr(self, "_control_signal_snapshot", {})),
+                "applied": bool(
+                    getattr(self, "_control_applied_kind", None)
+                    and getattr(self, "_control_signal_snapshot", {})
+                ),
             }
         attrs.pop("extra_temperature_zones", None)
         attrs.pop("heat_pump_telemetry", None)
@@ -1234,6 +1237,12 @@ class PumpSteerSensor(RestoreEntity):
         """Observe stable braking without changing the heat pump control path."""
         adaptive = self._cfg().get("adaptive_braking_enabled") is True
         if adaptive and active:
+            if self._thermal_model._external_disturbance:
+                self._thermal_learning_active = False
+                self._thermal_learning_reason = (
+                    self._thermal_model._external_disturbance
+                )
+                return
             if not self._adaptive_inputs_fresh:
                 self._thermal_model.cancel_validation_session()
                 active, reason = False, "temperature_reports_unavailable"
@@ -1270,6 +1279,11 @@ class PumpSteerSensor(RestoreEntity):
                 indoor,
                 outdoor,
                 adaptive_observations=adaptive,
+                screen_external_heat=adaptive
+                and (
+                    self._cfg().get("external_heat_sources") is True
+                    or bool(self._cfg().get("thermal_external_heat_entity"))
+                ),
             )
         elif not self._thermal_model.update_validation_session(
             self._adaptive_report if adaptive else now, indoor, outdoor
@@ -1581,15 +1595,32 @@ class PumpSteerSensor(RestoreEntity):
         def signals_match(override=None):
             if not signal_snapshot:
                 return True
-            from .control_intelligence import SIGNALS, evaluate_limits
+            from .control_intelligence import (
+                SIGNALS,
+                evaluate_limits,
+                external_heat_status,
+            )
 
             states = {
                 cfg[key]: self.hass.states.get(cfg[key])
                 for key in SIGNALS.values()
                 if cfg.get(key)
             }
+            external = cfg.get("thermal_external_heat_entity")
+            if external in signal_snapshot:
+                states[external] = self.hass.states.get(external)
             if override is not None:
                 states[override[0]] = override[1]
+            external_matches = (
+                external not in signal_snapshot
+                or external_heat_status(
+                    dt_util.now(),
+                    cfg,
+                    states,
+                    measured_after=getattr(self, "_temperature_reported_after", None),
+                )
+                == "verified_inactive"
+            )
             current = evaluate_limits(
                 dt_util.now(),
                 cfg,
@@ -1597,9 +1628,10 @@ class PumpSteerSensor(RestoreEntity):
                 measured_after=getattr(self, "_temperature_reported_after", None),
             )
             applied = getattr(self, "_control_applied_kind", None)
-            return (
-                bool(applied)
-                and current[applied] == self._control_intelligence[applied]
+            return external_matches and (
+                current[applied] == self._control_intelligence[applied]
+                if applied
+                else external in signal_snapshot
             )
 
         def check():
@@ -1732,14 +1764,15 @@ class PumpSteerSensor(RestoreEntity):
             self._aggressiveness(cfg),
             cfg.get("external_heat_sources", False),
         )
-        configuration = repr(
-            (
-                configured,
-                cfg.get("real_outdoor_entity"),
-                cfg.get("outdoor_temp_entity_2"),
-                settings,
-            )
+        configured_sources = (
+            configured,
+            cfg.get("real_outdoor_entity"),
+            cfg.get("outdoor_temp_entity_2"),
+            settings,
         )
+        if cfg.get("thermal_external_heat_entity"):
+            configured_sources += (cfg["thermal_external_heat_entity"],)
+        configuration = repr(configured_sources)
         old_configuration = getattr(self, "_adaptive_configuration", None)
         if old_configuration is not None and configuration != old_configuration:
             # A changed configured house/weight/control setup invalidates experience.
@@ -1885,7 +1918,31 @@ class PumpSteerSensor(RestoreEntity):
         reason = "disabled"
         predicted = None
         requested = 1.0
+        external_status = "not_configured"
         if enabled:
+            from .control_intelligence import external_heat_status
+
+            states = getattr(self, "_control_observation_states", None)
+            if states is None:
+                entity = cfg.get("thermal_external_heat_entity")
+                states = {entity: self.hass.states.get(entity)} if entity else {}
+            external_status = external_heat_status(
+                now,
+                cfg,
+                states,
+                measured_after=getattr(self, "_temperature_reported_after", None),
+            )
+            if external_status in ("verified_active", "unknown"):
+                model.mark_external_disturbance(
+                    "external_heat_verified_active"
+                    if external_status == "verified_active"
+                    else "external_heat_signal_unavailable"
+                )
+            elif (
+                cfg.get("external_heat_sources") is True
+                or cfg.get("thermal_external_heat_entity")
+            ) and eligible:
+                model.screen_possible_external_heat(now)
             reason = model.adaptive_reason(now, indoor - outdoor)
             if not getattr(self, "_adaptive_inputs_fresh", False):
                 reason = getattr(
@@ -1893,8 +1950,6 @@ class PumpSteerSensor(RestoreEntity):
                     "_adaptive_observation_reason",
                     "temperature_reports_unavailable",
                 )
-            elif cfg.get("external_heat_sources") is True:
-                reason = "external_heat_sources"
             if reason == "qualified" and eligible:
                 predicted = model.predict_drop(indoor, outdoor, 30)
                 # The model describes unmodified braking, not causal heat output.
@@ -1927,6 +1982,15 @@ class PumpSteerSensor(RestoreEntity):
             if predicted is not None
             else None,
         }
+        if enabled:
+            self._adaptive_braking["external_heat"] = external_status
+            if multiplier < 1 and external_status == "verified_inactive":
+                snapshot = dict(getattr(self, "_control_signal_snapshot", {}) or {})
+                snapshot[cfg["thermal_external_heat_entity"]] = (
+                    "external_heat",
+                    "verified_inactive",
+                )
+                self._control_signal_snapshot = snapshot
         return multiplier
 
     def _control_modifier_multiplier(
@@ -2633,6 +2697,15 @@ class PumpSteerSensor(RestoreEntity):
         )
         self._control_signal_snapshot = {}
         self._control_applied_kind = None
+
+        if (
+            cfg.get("adaptive_braking_enabled") is True
+            and current_cat != PRICE_EXPENSIVE
+            and self._brake_ramp <= 0
+        ):
+            getattr(
+                self, "_adaptive_evidence_model", self._thermal_model
+            ).clear_external_disturbance()
 
         # 1. Summer mode.
         if outdoor >= summer_threshold:

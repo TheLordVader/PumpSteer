@@ -48,7 +48,7 @@
         },
         "data_description": {
           "thermal_intelligence_enabled": "Passively collects qualified observations when a verified heat signal is selected. Does not affect heating control.",
-          "external_heat_sources": "For example, a fireplace or air-to-air heat pump. Intermittent extra heat cannot be reliably identified; learned results remain unvalidated.",
+          "external_heat_sources": "Yes means extra heat may sometimes occur, not that it is on now. Adaptive braking can learn from stable temperature response, rejects clearly disturbed periods and needs later independent checks. Undetected extra heat remains a possible confound; this does not measure heat flow.",
           "adaptive_braking_enabled": "Learns observed house temperature response using your ordinary indoor and outdoor sensors. After at least three checks against later temperatures, it can cautiously reduce price braking near the comfort floor. Off on upgrade. Uncertain or old data returns to Base; no extra heat pump sensors are required. Does not claim measured energy savings."
         },
         "description": "Passive analysis and optional adaptive price braking are separate choices. Adaptive braking uses observed temperature response, not assumed heat output. Advanced verified model learning requires reliable heat signals."
@@ -58,7 +58,7 @@
         "menu_options": {
           "heat_sensors": "Analysis method and primary sensors",
           "energy": "Electricity and energy",
-          "heat_details": "Additional heat pump sensors",
+          "heat_details": "Additional heating sensors",
           "heat_pump_telemetry": "Passive heat pump diagnostics",
           "extended_control": "Extended – optional control limits",
           "advanced_control": "Advanced – verified heat balance"
@@ -324,17 +324,19 @@
         "description": "Ohmigo Push sends the temperature output to the device. The relay is the physical output; Relay Guard supervises safe recovery. These choices affect actual control."
       },
       "heat_details": {
-        "title": "Additional heat pump sensors",
+        "title": "Additional heating sensors",
         "description": "Optional for deeper passive analysis. Compressor operation or electricity consumption does not prove radiator heat. Leave fields empty if sensors are unavailable.",
         "data": {
           "thermal_hot_water_mode_entity": "Verified hot-water mode (optional)",
           "thermal_compressor_entity": "Compressor status (optional)",
-          "thermal_return_temp_entity": "Return temperature (optional)"
+          "thermal_return_temp_entity": "Return temperature (optional)",
+          "thermal_external_heat_entity": "Verified external heater activity (optional)"
         },
         "data_description": {
           "thermal_hot_water_mode_entity": "On means verified hot-water operation. Heat learning pauses when on or unknown; unknown periods are not classified.",
           "thermal_compressor_entity": "Compressor status alone does not prove radiator heating.",
-          "thermal_return_temp_entity": "Used only together with other qualified signals."
+          "thermal_return_temp_entity": "Used only together with other qualified signals.",
+          "thermal_external_heat_entity": "Leave empty without a reliable signal. On must mean the external heater is actually active, not the heat pump compressor or a thermostat request. Requires a documented verified source observation time in the control timestamp attribute (default measurement_time), at most five minutes old. HA report time or MQTT republication is insufficient. Active or unknown selected signals pause adaptive use and require new checks; temperature monitoring works without this sensor."
         }
       },
       "heat_pump_telemetry": {
@@ -415,7 +417,8 @@
       "invalid_balance_kind": "Choose a valid heat balance type.",
       "control_signals_required": "Select the required operation sensors and verify their meanings and observation timestamp attribute. A shared changeover valve requires verified inversion of the radiator mode.",
       "control_balance_required": "Select a heat balance sensor and verify normalization. Scale must be nonzero, offset explicit, and 0 < first limit < maximum limit.",
-      "invalid_numeric_alarm": "Enter a valid numeric normal value before confirming its meaning."
+      "invalid_numeric_alarm": "Enter a valid numeric normal value before confirming its meaning.",
+      "external_heat_alias": "External heat needs its own activity signal, not the heat pump compressor, auxiliary heat or operating-mode signal."
     }
   },
   "entity": {

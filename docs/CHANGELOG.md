@@ -21,6 +21,18 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [3.0.0-beta.1] — Verified local adaptive-control candidate
+
+- Optional adaptive price braking uses independently checked observed house response
+  through the existing PI, ramps and guarded output chain; no measured savings claim.
+- Preserve fitted experience during startup/outages; refit failed models and require
+  fresh independent qualification after a refit or observation-policy upgrade.
+- Possible intermittent extra heat no longer disables adaptive use unconditionally;
+  reject disturbed observation windows and offer one optional verified activity input.
+- Local candidate only: installation and publication require separate GO.
+
+---
+
 ## [2.2.4] — Thermal-learning reliability and control safety
 
 ### Fixed
