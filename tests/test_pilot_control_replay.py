@@ -738,3 +738,150 @@ def test_replay_accepts_only_aligned_external_electrical_cost_forecasts():
         _shared_control_reference(**values)["external_economic_scenario"]["status"]
         == "unavailable"
     )
+
+
+@pytest.mark.parametrize(
+    "flag",
+    [
+        "adaptive_braking_enabled",
+        "control_aux_preheat_limit",
+        "control_balance_brake_limit",
+    ],
+)
+def test_future_shared_baseline_refuses_optional_control_without_future_evidence(flag):
+    values = args()
+    values["context"]["cfg"][flag] = True
+    assert _shared_control_reference(**values) is None
+
+
+@pytest.mark.parametrize("kind", ["adaptive", "preheat", "brake"])
+def test_future_plan_refuses_disabled_modifier_still_ramping_out(kind):
+    ctx = context()
+    ctx["state"].control_modifier_state = {kind: (0.1, NOW)}
+    result = hypothetical_plan(
+        now=NOW,
+        indoor=20.8,
+        outdoor=5,
+        command=5,
+        target=21,
+        floor=20.5,
+        ceiling=21.5,
+        price_states=[],
+        weather_rows=[],
+        weather_unit="°C",
+        replay_context=ctx,
+    )
+    assert result == {
+        "planning_status": "unavailable",
+        "reason": "optional_control_future_evidence_unavailable",
+    }
+
+
+@pytest.mark.parametrize(
+    "flag",
+    [
+        "adaptive_braking_enabled",
+        "control_aux_preheat_limit",
+        "control_balance_brake_limit",
+        None,
+    ],
+)
+def test_live_planner_blocks_optional_control_even_without_replay_context(flag):
+    import asyncio
+    from test_brake_provenance import _sensor
+
+    sensor, _ = _sensor()
+    assert sensor._pilot_price_context is None
+    sensor._pilot_plan = {"planning_status": "validated_passive"}
+    sensor._pilot_plan_next = NOW + timedelta(hours=1)
+    if flag:
+        sensor._config_entry.options[flag] = True
+    else:
+        sensor._control_modifier_state = {"adaptive": (0.1, NOW)}
+    asyncio.run(sensor._plan_pilot(sensor._cfg(), NOW, {}, 5))
+    assert sensor._pilot_plan["planning_status"] == "unavailable"
+    assert (
+        sensor._pilot_plan["reason"] == "optional_control_future_evidence_unavailable"
+    )
+    assert sensor._pilot_plan_next is None
+
+
+def test_disabled_optional_flags_with_neutral_history_allow_original_base_reference():
+    values = args()
+    values["context"]["cfg"] = {"adaptive_braking_enabled": False}
+    values["context"]["state"].control_modifier_state = {
+        "adaptive": (0.0, NOW),
+        "_last_kind": "brake",
+    }
+    assert _shared_control_reference(**values) is not None
+
+
+@pytest.mark.parametrize(
+    "flag",
+    [
+        "adaptive_braking_enabled",
+        "control_aux_preheat_limit",
+        "control_balance_brake_limit",
+    ],
+)
+def test_validated_house_plan_cannot_fallback_when_optional_control_is_enabled(flag):
+    values = args()
+    price = SimpleNamespace(
+        state="1",
+        last_reported=NOW,
+        attributes={
+            "unit_of_measurement": "SEK/kWh",
+            "raw_today": [
+                {"start": a.isoformat(), "end": b.isoformat(), "value": p}
+                for a, b, p in values["control_price_segments"]
+            ],
+        },
+    )
+    kwargs = dict(
+        now=NOW,
+        indoor=20.8,
+        outdoor=5,
+        command=5,
+        target=21,
+        floor=20.5,
+        ceiling=21.5,
+        price_states=[price],
+        weather_rows=values["weather_rows"],
+        weather_unit="°C",
+        response_context=(ResponseParameters(), (0.4, ())),
+        response_scope={
+            "request_min": 0,
+            "request_max": 1,
+            "heat_min": 0,
+            "heat_max": 1,
+        },
+        house_context={
+            "loss": 0.02,
+            "gain": 0.4,
+            "background": 0.1,
+            "mae": 0.02,
+            "persistence_mae": 0.2,
+            "samples": 8,
+            "outdoor_min": -5,
+            "outdoor_max": 10,
+            "indoor_min": 19,
+            "indoor_max": 22,
+            "heat_min": 0,
+            "heat_max": 1,
+        },
+        replay_context=values["context"],
+        pi_reference={
+            "controller": values["context"]["state"].pi,
+            "kp": 2.4,
+            "ki": 0.035,
+            "kd": 0,
+            "integral_clamp": 6,
+            "summer_threshold": 18,
+        },
+    )
+    assert hypothetical_plan(**kwargs)["planning_status"] == "validated_passive"
+    values["context"]["cfg"][flag] = True
+    assert hypothetical_plan(**kwargs) == {
+        "planning_status": "unavailable",
+        "reason": "optional_control_future_evidence_unavailable",
+    }

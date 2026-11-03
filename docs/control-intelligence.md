@@ -351,3 +351,24 @@ Policy version 4 discards old qualification summaries without current provenance
 retaining compatible fitted coefficients for diagnostics. Twenty genuine fitting
 observations, refitting and three new independent holdouts are required before use, including for users who previously selected possible extra
 heat. No new polling, permanent listener, service, database or output path exists.
+
+
+Output-path verification (local synthetic replay, not energy savings):
+The earlier one-decimal controller examples (9.7 versus 9.6 C) did not prove
+an Ohmigo change: values9.688 and9.644 both quantize to9.5 C at its existing
+half-degree transport resolution. The corrected test learns from three genuinely
+asynchronous5/10/15-minute indoor sources, then runs each minute through the
+controller and actual `async_push_ohmigo` with five-minute dispatch. Actual
+`number.set_value` Bas/adaptive pairs at offsets0/5/10/15/20/25 minutes are
+9/9,11.5/11,13.5/12.5,15/13.5,15/13.5,15/13.5 C. Non-due minutes do not write;
+the repeated20/25-minute values are normal keepalive resends. This proves a
+command difference in that synthetic case, not measured comfort or cost benefit.
+No Ohmigo resolution, interval, hysteresis, limits or safety policy changed.
+
+Passive Pilot planning cannot fabricate future temperature observations or
+verified optional telemetry. When adaptive braking, auxiliary preheat limiting
+or balance brake limiting is enabled, or its applied correction remains in the
+transition state after disabling, the plan returns `unavailable` with reason
+`optional_control_future_evidence_unavailable`. It cannot label a Base-only
+future replay `validated_passive` for that live controller. Unmodified Base
+planning and passive model validation remain available.

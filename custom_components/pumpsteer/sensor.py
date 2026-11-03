@@ -4670,6 +4670,20 @@ class PumpSteerSensor(RestoreEntity):
 
     async def _plan_pilot(self, cfg, now, extra, command):
         """Run a bounded diagnostic only; it never changes the control output."""
+        from .pilot_runtime_plan import _optional_control_needs_future_evidence
+
+        if _optional_control_needs_future_evidence(
+            {"cfg": cfg},
+            modifier_state=getattr(self, "_control_modifier_state", None),
+        ):
+            # Apply before cached-plan reuse and even when price context could
+            # not be captured. No future genuine optional evidence is available.
+            self._pilot_plan = self._unavailable_pilot_plan(
+                "optional_control_future_evidence_unavailable"
+            )
+            self._pilot_plan_next = None
+            self._pilot_plan_signature = None
+            return
         if self._pilot_store_read_failed:
             self._pilot_plan = self._unavailable_pilot_plan("history_unavailable")
             return

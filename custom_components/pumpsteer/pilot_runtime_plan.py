@@ -377,6 +377,30 @@ def _shared_window_is_eligible(
         return False
 
 
+def _optional_control_needs_future_evidence(context, *, modifier_state=None):
+    """A hypothetical room trajectory cannot provide future measured modifiers."""
+    if not isinstance(context, dict):
+        return False
+    cfg = context.get("cfg", {})
+    if any(
+        cfg.get(key) is True
+        for key in (
+            "adaptive_braking_enabled",
+            "control_aux_preheat_limit",
+            "control_balance_brake_limit",
+        )
+    ):
+        return True
+    state = context.get("state")
+    history = modifier_state or getattr(state, "control_modifier_state", None) or {}
+    # A just-disabled flag does not make an already applied correction Base.
+    return any(
+        not isinstance(row, (tuple, list)) or len(row) != 2 or row[0] != 0
+        for kind, row in history.items()
+        if kind in ("adaptive", "preheat", "brake")
+    )
+
+
 def hypothetical_plan(
     *,
     now,
@@ -403,6 +427,8 @@ def hypothetical_plan(
     now = _timestamp(now)
     if now is None:
         return {**unavailable, "reason": "invalid_time"}
+    if _optional_control_needs_future_evidence(replay_context):
+        return {**unavailable, "reason": "optional_control_future_evidence_unavailable"}
     values = (
         indoor,
         outdoor,
@@ -1138,6 +1164,8 @@ def _shared_control_reference(
     from .settings import HOLIDAY_TEMP, PRECOOL_LOOKAHEAD, PRICE_LOOKAHEAD_HOURS
 
     try:
+        if _optional_control_needs_future_evidence(context):
+            return None
         if (
             not context.get("holiday_context_known")
             or not context.get("inputs_qualified")

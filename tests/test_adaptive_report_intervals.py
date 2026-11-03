@@ -205,3 +205,110 @@ def test_genuinely_mixed_five_ten_fifteen_minute_sources_learn_and_adapt(monkeyp
     )
     assert adapted.fake_temp < base.fake_temp
     assert adapted.attributes["adaptive_braking"]["state"] == "adapting"
+
+
+def test_weighted_learned_braking_reaches_real_ohmigo_service_quantization(
+    monkeypatch,
+):
+    from custom_components.pumpsteer import ohmigo
+    from test_ohmigo_keepalive import _FakeHass
+
+    sensor, states, _, _ = exercise(
+        monkeypatch, 15, weighted=True, periods=(5, 10, 15), jitter=True
+    )
+    model = sensor._thermal_model
+    assert model.adaptive_reason(START + timedelta(minutes=2880), 16) == "qualified"
+    assert (
+        len(
+            sensor._temperature_state(sensor._cfg(), "indoor_temp_entity").attributes[
+                "source_weights"
+            ]
+        )
+        == 3
+    )
+    monkeypatch.setattr(ohmigo, "_ohmigo_push_enabled", lambda hass, entry_id: True)
+    entry = SimpleNamespace(
+        entry_id="cadence-output",
+        data={},
+        options={"ohmigo_entity": "number.ohmigo_test", "ohmigo_interval_minutes": 5},
+    )
+    # Reproduce the old claim through the real output transport, not test math.
+    for intermediate in (9.688, 9.644):
+        negative = _FakeHass("9.5")
+        asyncio.run(
+            ohmigo.async_push_ohmigo(
+                negative,
+                entry,
+                intermediate,
+                None,
+                temperature_check=lambda: True,
+            )
+        )
+        assert negative.services.calls == [
+            (
+                "number",
+                "set_value",
+                {"entity_id": "number.ohmigo_test", "value": 9.5},
+                True,
+            )
+        ]
+    base_hass, adaptive_hass = _FakeHass("0"), _FakeHass("0")
+    base_state = ControlReplayState.from_sensor(sensor)
+    last_base = last_adaptive = None
+    trace = []
+    for offset in range(26):
+        _, inputs, actual = cold_step(sensor, states, monkeypatch, 2881 + offset)
+        base_state, baseline = replay_control_step(
+            base_state,
+            replace(inputs, cfg={**inputs.cfg, "adaptive_braking_enabled": False}),
+        )
+        # No invented temperature reports: cold_step repeats19.9, so the genuine
+        # indoor observation remains at offset0; every contributor stays in scope.
+        assert min(sensor._adaptive_component_reports.values()) == START + timedelta(
+            minutes=2881
+        )
+        before = len(adaptive_hass.services.calls)
+        before_base = len(base_hass.services.calls)
+        last_base = asyncio.run(
+            ohmigo.async_push_ohmigo(
+                base_hass,
+                entry,
+                round(baseline.fake_temp, 1),
+                last_base,
+                temperature_check=lambda: True,
+            )
+        )
+        last_adaptive = asyncio.run(
+            ohmigo.async_push_ohmigo(
+                adaptive_hass,
+                entry,
+                actual,
+                last_adaptive,
+                temperature_check=lambda: True,
+            )
+        )
+        if offset % 5:
+            assert len(adaptive_hass.services.calls) == before
+            assert len(base_hass.services.calls) == before_base
+        else:
+            assert (
+                last_base == last_adaptive == START + timedelta(minutes=2881 + offset)
+            )
+            base_call = base_hass.services.calls[-1]
+            adaptive_call = adaptive_hass.services.calls[-1]
+            assert base_call[:2] == adaptive_call[:2] == ("number", "set_value")
+            base_hass.current_state = str(base_call[2]["value"])
+            adaptive_hass.current_state = str(adaptive_call[2]["value"])
+            trace.append((offset, base_call[2]["value"], adaptive_call[2]["value"]))
+    assert trace == [
+        (0, 9.0, 9.0),
+        (5, 11.5, 11.0),
+        (10, 13.5, 12.5),
+        (15, 15.0, 13.5),
+        (20, 15.0, 13.5),
+        (25, 15.0, 13.5),
+    ]
+    # Equal first quantization, differing later due writes, then equal-to-current
+    # keepalive resends at20/25: actual transport policy is unchanged throughout.
+    assert len(base_hass.services.calls) == len(adaptive_hass.services.calls) == 6
+    print("actual_ohmigo_service_trace", trace)
