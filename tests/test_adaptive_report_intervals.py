@@ -17,7 +17,7 @@ from custom_components.pumpsteer.control_replay import (
 )
 
 
-def exercise(monkeypatch, interval, *, jitter=False, weighted=False):
+def exercise(monkeypatch, interval, *, jitter=False, weighted=False, periods=None):
     sensor, states = _sensor()
     cfg = sensor._config_entry.options
     cfg.update(adaptive_braking_enabled=True)
@@ -45,7 +45,8 @@ def exercise(monkeypatch, interval, *, jitter=False, weighted=False):
     sources = ["sensor.indoor"] + (
         ["sensor.indoor2", "sensor.indoor3"] if weighted else []
     )
-    due = {name: i * interval / 3 for i, name in enumerate(sources)}
+    source_intervals = dict(zip(sources, periods or [interval] * len(sources)))
+    due = {name: i * source_intervals[name] / 3 for i, name in enumerate(sources)}
     count = {name: int(hasattr(states[name], "last_reported")) for name in sources}
     accepted = []
     last = None
@@ -58,7 +59,7 @@ def exercise(monkeypatch, interval, *, jitter=False, weighted=False):
                 states[name].state = str(round(actual, 1))  # ordinary 0.1 C room sensor
                 states[name].last_reported = now[0]
                 count[name] += 1
-                due[name] += interval + (
+                due[name] += source_intervals[name] + (
                     (-1 if count[name] % 2 else 1) if jitter else 0
                 )
         if minute % interval == 0:
@@ -155,3 +156,25 @@ def test_irregular_validation_uses_frozen_trajectory_and_real_endpoint():
     assert (
         model._session.reports == 4
     )  # start and three actual reports, no synthetic30m
+
+
+def test_genuinely_mixed_five_ten_fifteen_minute_sources_learn_and_adapt(monkeypatch):
+    sensor, states, accepted, count = exercise(
+        monkeypatch, 15, jitter=True, weighted=True, periods=(5, 10, 15)
+    )
+    now = START + timedelta(minutes=2881)
+    assert count["sensor.indoor"] > count["sensor.indoor2"] > count["sensor.indoor3"]
+    assert len(accepted) <= min(count.values())
+    assert sensor._thermal_model.adaptive_reason(now, 16) == "qualified"
+    assert sensor._thermal_model.sample_count >= 20
+    inputs = replace(
+        _input(sensor, now, indoor=19.9),
+        temperature_report_time=sensor._adaptive_report,
+    )
+    state = ControlReplayState.from_sensor(sensor)
+    _, adapted = replay_control_step(state, inputs)
+    _, base = replay_control_step(
+        state, replace(inputs, cfg={**inputs.cfg, "adaptive_braking_enabled": False})
+    )
+    assert adapted.fake_temp < base.fake_temp
+    assert adapted.attributes["adaptive_braking"]["state"] == "adapting"

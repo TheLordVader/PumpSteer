@@ -2409,3 +2409,118 @@ async def test_native_adaptive_fifteen_minute_reports_are_distinct_observations(
     assert len(sensor._thermal_model._temp_history) <= len(reports)
     assert sensor._adaptive_inputs_fresh
     assert sensor._adaptive_braking["multiplier"] == 1
+
+
+@pytest.mark.parametrize("with_configuration", [False, True])
+@pytest.mark.parametrize("backup_first", [False, True])
+async def test_native_enabled_adaptive_startup_waits_without_erasing_experience(
+    recorder_mock,
+    hass,
+    enable_custom_integrations,
+    freezer,
+    with_configuration,
+    backup_first,
+):
+    from datetime import datetime, timezone
+    from homeassistant.core import State
+    from pytest_homeassistant_custom_component.common import mock_restore_cache
+    from custom_components.pumpsteer.settings import BRAKE_DELTA_C
+    from custom_components.pumpsteer.thermal_model import VALIDATION_BASIS
+
+    now = datetime(2026, 11, 3, 8, tzinfo=timezone.utc)
+    freezer.move_to(now)
+    await hass.config.async_set_time_zone("UTC")
+    backup = "sensor.backup" if backup_first else None
+    settings = (BRAKE_DELTA_C, 3, False)
+    context = repr((("sensor.room", "sensor.out", None), *settings))
+    configuration = repr(([("sensor.room", 1.0)], "sensor.out", backup, settings))
+    evidence = {
+        "version": 2,
+        "k": 0.04,
+        "validations": [
+            [(now - timedelta(hours=h)).timestamp(), 0.05, 16.0] for h in (3, 2, 1)
+        ],
+    }
+    summary = {"context": context, "evidence": evidence}
+    if with_configuration:
+        summary["configuration"] = configuration
+    saved = {
+        "thermal_k_restore": 0.04,
+        "thermal_k_valid": True,
+        "thermal_k_samples": 30,
+        "thermal_fit_rmse_c_per_hour": 0.05,
+        "thermal_validation_basis": VALIDATION_BASIS,
+        "adaptive_model_state": summary,
+    }
+    mock_restore_cache(hass, [State("sensor.pumpsteer", "8", saved)])
+    options = {
+        "indoor_temp_entity": "sensor.room",
+        "real_outdoor_entity": "sensor.out",
+        "electricity_price_entity": "sensor.price",
+        "adaptive_braking_enabled": True,
+        "aggressiveness": 3,
+        "target_temperature": 21,
+        "house_inertia": 2,
+        "preheat_boost_enabled": False,
+    }
+    if backup:
+        options["outdoor_temp_entity_2"] = backup
+    entry = MockConfigEntry(domain="pumpsteer", title="test", data={}, options=options)
+    entry.add_to_hass(hass)
+    assert await async_setup_component(hass, "persistent_notification", {})
+    assert await async_setup_component(hass, "pumpsteer", {})
+    await hass.async_block_till_done()
+    sensor = next(
+        e for e in hass.data[SENSOR].entities if e.unique_id == entry.entry_id
+    )
+    model = sensor._thermal_model
+    assert json.loads(json.dumps(model.adaptive_snapshot())) == evidence
+    # HA suppresses unavailable-entity attributes: real extra restore data must
+    # survive another reload while both temperature reports are still missing.
+    await sensor.async_update()
+    sensor.async_write_ha_state()
+    assert sensor.extra_state_attributes["mode"] == "safe_mode"
+    assert "adaptive_model_state" not in hass.states.get(sensor.entity_id).attributes
+    assert (
+        json.loads(
+            json.dumps(
+                sensor.extra_restore_state_data.as_dict()["thermal_model"][
+                    "adaptive_model_state"
+                ]["evidence"]
+            )
+        )
+        == evidence
+    )
+    assert await hass.config_entries.async_reload(entry.entry_id)
+    await hass.async_block_till_done()
+    sensor = next(
+        e for e in hass.data[SENSOR].entities if e.unique_id == entry.entry_id
+    )
+    model = sensor._thermal_model
+    assert json.loads(json.dumps(model.adaptive_snapshot())) == evidence
+    freezer.move_to(now + timedelta(seconds=1))
+    hass.states.async_set("sensor.room", 19.9, {"unit_of_measurement": "°C"})
+    await sensor.async_update()
+    assert sensor.extra_state_attributes["mode"] == "safe_mode"
+    assert sensor._thermal_model is model
+    if backup:
+        freezer.move_to(now + timedelta(seconds=2))
+        hass.states.async_set(backup, 5, {"unit_of_measurement": "°C"})
+        await sensor.async_update()
+        assert sensor._thermal_model is model
+        assert not sensor._adaptive_inputs_fresh
+    freezer.move_to(now + timedelta(seconds=3))
+    hass.states.async_set("sensor.out", 5, {"unit_of_measurement": "°C"})
+    prices = [1.0] * 96
+    prices[32:36] = [10.0] * 4
+    hass.states.async_set("sensor.price", 10, {"today": prices})
+    await sensor.async_update()
+    freezer.move_to(now + timedelta(seconds=4))
+    await sensor.async_update()  # existing two-cycle primary recovery
+    assert sensor._thermal_model is model
+    assert model.adaptive_reason(now + timedelta(seconds=4), 14.9) == "qualified"
+    assert sensor._adaptive_inputs_fresh
+    assert sensor._adaptive_context == context
+    assert sensor._adaptive_configuration == configuration
+    assert sensor._adaptive_braking["state"] == "adapting"
+    assert sensor._adaptive_braking["multiplier"] < 1

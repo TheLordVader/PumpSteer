@@ -237,6 +237,12 @@ class ThermalModel:
             return False
         if not self._valid:
             return True
+        if len(self._adaptive_validations) == 3 and all(
+            abs(row[1]) > 0.2 for row in self._adaptive_validations
+        ):
+            # Repeated failures of the stricter active-use gate require relearning,
+            # even when the older diagnostic MAE threshold has not been reached.
+            return True
         return (
             self._validated_sessions >= _REFIT_MIN_VALIDATED_SESSIONS
             and self._prediction_mae is not None

@@ -12,11 +12,12 @@ remain distinct from measured outcomes.
 
 ## Control map and existing contracts
 
-The reported installed reference is `76bf06d55f816aa69a612b9a61567b65523e0594`;
-verify the actual installed files/settings before any future deployment. Historical
-control-parity tests also retain `b273afc` as a verified code reference; it must not
-be mistaken for the currently reported installed version. This hardening starts
-from `78b9807`.
+The latest production preflight verified `b273afc253ec1c102385fe6d9830024815151c64`
+against all 50 installed integration files. This corrects the earlier reported
+`76bf06d` reference. Always verify the actual installed files/settings again before
+a future deployment; a test reference alone does not identify a running version.
+Control-parity tests retain `b273afc` as their historical code reference. This
+hardening starts from `78b9807`.
 The following map describes the actual code, not a replacement controller.
 
 1. `sensor._do_update` obtains qualified indoor temperature (up to three normalized
@@ -228,8 +229,14 @@ Activation and quality:
   capped at one minute per update). Never add braking or bypass the comfort floor.
 - Modified braking does not train or validate the baseline response. Expired
   evidence returns gradually to Base, allowing new unmodified validation. Sensor
-  source/weight, selected outdoor source, brake-depth or aggressiveness changes
-  discard old evidence. SAFE resets output correction; restored correction is
+  configured source/weight, brake-depth or aggressiveness changes discard old
+  evidence. Missing reports, partial weighted coverage and a temporary outdoor
+  fallback pause learning/use and cancel the current interval without erasing
+  experience. The learned effective composition must match before use resumes.
+  Three consecutive failed adaptive validations (>0.2 C each), together with at
+  least 20 new accepted samples, trigger a refit even below the older diagnostic
+  0.3 C MAE threshold. A refit clears qualification and needs three later
+  independent validations. SAFE resets output correction; restored correction is
   never applied. Known intermittent extra heat disables adaptive use.
 
 `adaptive_braking` reports `collecting` (Samlar erfarenhet), `learned` (Lärt husets
@@ -245,12 +252,17 @@ separate and it is explicitly a causal asynchronous snapshot, not a simultaneous
 physical measurement. An individual report cannot fabricate new observations for
 other contributors.
 The existing 240-sample fitting buffer stays bounded; the adaptive rate window
-is capped at 32 reports/90 minutes. No new listener, polling, database, service,
-output path or model training dependency is introduced.
+is capped at 32 reports/90 minutes. The compact model summary also uses the existing
+RestoreEntity extra-data payload (alongside brake/zone state), so experience
+survives a second restart while both sensors are still unavailable and HA omits
+normal entity attributes. Older summaries without a configured signature wait
+for sufficient reports to match their known configured source variants; a genuinely
+changed composition relearns rather than remaining permanently paused. No new
+listener, polling, database, service, output path or model dependency is introduced.
 
 For a later Tallåsen installation GO: verify candidate file hashes, back up HA
-and preserve the actually installed `76bf06d55f816aa69a612b9a61567b65523e0594`
-integration/settings after verifying that reference, install only candidate
+and preserve the actually installed integration/settings after verifying their
+commit and file hashes (latest preflight: `b273afc`), install only candidate
 integration files and perform the agreed Core restart. Verify normal SAFE recovery,
 PI/prices, ordinary Ohmigo output and Relay Guard before enabling this option.
 Then observe sample count, fit residual, three holdouts, gate reasons, brake factor,

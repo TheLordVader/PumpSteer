@@ -183,6 +183,7 @@ class PumpSteerSensor(RestoreEntity):
         self._pi_precool_paused: bool = False
         self._thermal_model = ThermalModel()
         self._adaptive_context = None
+        self._adaptive_configuration = None
         self._adaptive_report = None
         self._adaptive_new_report = False
         self._adaptive_inputs_fresh = False
@@ -309,9 +310,28 @@ class PumpSteerSensor(RestoreEntity):
     def state(self) -> StateType:
         return self._state
 
+    def _thermal_restore_attributes(self):
+        model = self._thermal_model
+        return {
+            "thermal_k_restore": model.k,
+            "thermal_k_valid": model.is_valid,
+            "thermal_k_samples": model.sample_count,
+            "thermal_fit_rmse_c_per_hour": model.fit_rmse,
+            "thermal_learning_sessions": model.learning_sessions,
+            "thermal_validated_sessions": model.validated_sessions,
+            "thermal_validation_basis": VALIDATION_BASIS,
+            "thermal_prediction_mae_c": model.prediction_mae,
+            "adaptive_model_state": {
+                "context": self._adaptive_context,
+                "configuration": self._adaptive_configuration,
+                "evidence": model.adaptive_snapshot(),
+            },
+        }
+
     @property
     def extra_state_attributes(self) -> dict:
         attrs = {**self._attributes}
+        attrs.update(self._thermal_restore_attributes())
         attrs.pop("control_intelligence", None)
         if getattr(self, "_control_intelligence", None) is not None:
             attrs["control_intelligence"] = {
@@ -509,7 +529,9 @@ class PumpSteerSensor(RestoreEntity):
                 was_braking,
                 zones,
                 heat_alarm,
+                thermal,
             ):
+                self.thermal = thermal
                 self.zones = zones
                 self.heat_alarm = heat_alarm
                 self.brake_ramp = brake_ramp
@@ -519,6 +541,7 @@ class PumpSteerSensor(RestoreEntity):
 
             def as_dict(self):
                 return {
+                    "thermal_model": self.thermal,
                     "extra_temperature_zones": self.zones,
                     "heat_pump_alarm": self.heat_alarm,
                     _RESTORE_WAS_BRAKING: self.was_braking,
@@ -544,6 +567,7 @@ class PumpSteerSensor(RestoreEntity):
                 "_heatpump_alarm_status",
                 getattr(self, "_heatpump_alarm_restore", {}),
             ),
+            self._thermal_restore_attributes(),
         )
 
     async def async_added_to_hass(self) -> None:
@@ -574,6 +598,15 @@ class PumpSteerSensor(RestoreEntity):
         extra = await self.async_get_last_extra_data()
         if extra is not None:
             data = extra.as_dict()
+            thermal = data.get("thermal_model")
+            if isinstance(thermal, dict):
+                self._attributes.update(
+                    {
+                        key: thermal[key]
+                        for key in self._thermal_restore_attributes()
+                        if key in thermal
+                    }
+                )
             self._zone_restore = data.get("extra_temperature_zones", {})
             self._heatpump_alarm_restore = data.get("heat_pump_alarm", {})
             # Older timestamps also record pre-brake/precool requests, so they
@@ -641,6 +674,7 @@ class PumpSteerSensor(RestoreEntity):
         adaptive_saved = self._attributes.get("adaptive_model_state")
         if isinstance(adaptive_saved, dict):
             self._adaptive_context = adaptive_saved.get("context")
+            self._adaptive_configuration = adaptive_saved.get("configuration")
             self._thermal_model.restore_adaptive(adaptive_saved.get("evidence"))
 
         self._attributes["adaptive_braking"] = dict(self._adaptive_braking)
@@ -1125,6 +1159,7 @@ class PumpSteerSensor(RestoreEntity):
             "adaptive_braking": dict(self._adaptive_braking),
             "adaptive_model_state": {
                 "context": self._adaptive_context,
+                "configuration": self._adaptive_configuration,
                 "evidence": self._thermal_model.adaptive_snapshot(),
             },
             "thermal_k": round(self._thermal_model.k, 4),
@@ -1679,17 +1714,40 @@ class PumpSteerSensor(RestoreEntity):
 
     def _prepare_adaptive_observation(self, cfg, now, identity):
         """HA report evidence is observed response, never physical heat delivery."""
-        context = repr(
+        configured = []
+        for index, key in enumerate(
+            ("indoor_temp_entity", "indoor_temp_entity_2", "indoor_temp_entity_3"), 1
+        ):
+            entity = cfg.get(key)
+            weight = safe_float(cfg.get(f"indoor_temp_weight_{index}", 1))
+            if (
+                entity
+                and weight is not None
+                and weight > 0
+                and entity not in [row[0] for row in configured]
+            ):
+                configured.append((entity, weight))
+        settings = (
+            cfg.get("brake_delta_c", BRAKE_DELTA_C),
+            self._aggressiveness(cfg),
+            cfg.get("external_heat_sources", False),
+        )
+        configuration = repr(
             (
-                identity,
-                cfg.get("brake_delta_c", BRAKE_DELTA_C),
-                self._aggressiveness(cfg),
-                cfg.get("external_heat_sources", False),
+                configured,
+                cfg.get("real_outdoor_entity"),
+                cfg.get("outdoor_temp_entity_2"),
+                settings,
             )
         )
-        if self._adaptive_context != context:
+        old_configuration = getattr(self, "_adaptive_configuration", None)
+        if old_configuration is not None and configuration != old_configuration:
+            # A changed configured house/weight/control setup invalidates experience.
             self._thermal_model = ThermalModel()
-            self._adaptive_context = context
+            self._adaptive_context = None
+        if configuration != old_configuration:
+            if old_configuration is not None or self._adaptive_context is None:
+                self._adaptive_configuration = configuration
             self._adaptive_report = None
             self._adaptive_component_reports = {}
             self._adaptive_seen_reports = {}
@@ -1701,7 +1759,67 @@ class PumpSteerSensor(RestoreEntity):
             list(contributors)
             if isinstance(contributors, dict)
             else [cfg.get("indoor_temp_entity")]
+            if indoor is not None
+            else []
         )
+        context = repr((identity, *settings))
+        complete = bool(
+            configured
+            and set(contributors) == {row[0] for row in configured}
+            and self._temperature_state(cfg, "real_outdoor_entity") is not None
+        )
+        if complete and old_configuration is None:
+            # Legacy summaries identify the trained contributors but not configured
+            # availability/priority. Compare against configured source variants,
+            # not merely whichever outdoor source happened to report first.
+            from ast import literal_eval
+
+            legacy_matches = self._adaptive_context is None
+            try:
+                if (
+                    isinstance(self._adaptive_context, str)
+                    and len(self._adaptive_context) < 4096
+                ):
+                    saved_identity, *saved_settings = literal_eval(
+                        self._adaptive_context
+                    )
+                    expected_inside = (
+                        tuple(sorted(configured))
+                        if cfg.get("indoor_temp_entity_2")
+                        or cfg.get("indoor_temp_entity_3")
+                        else cfg.get("indoor_temp_entity")
+                    )
+                    legacy_matches = (
+                        tuple(saved_settings) == settings
+                        and saved_identity[0] == expected_inside
+                        and saved_identity[1]
+                        in (
+                            cfg.get("real_outdoor_entity"),
+                            cfg.get("outdoor_temp_entity_2"),
+                        )
+                    )
+            except (ValueError, TypeError, SyntaxError, IndexError, RecursionError):
+                legacy_matches = False
+            if not legacy_matches:
+                self._thermal_model = ThermalModel()
+                self._adaptive_context = None
+            self._adaptive_configuration = configuration
+        if not complete or (
+            self._adaptive_context is not None and context != self._adaptive_context
+        ):
+            # Missing/partial reports or a temporary fallback are not a new house.
+            # Retain experience but never learn/use it for a different composition.
+            self._adaptive_inputs_fresh = False
+            self._adaptive_new_report = False
+            self._adaptive_observation_reason = "temperature_composition_unavailable"
+            self._adaptive_report = None
+            self._adaptive_component_reports = {}
+            self._adaptive_seen_reports = {}
+            self._adaptive_sparse_sources = set()
+            self._thermal_model.cancel_validation_session()
+            return
+        if self._adaptive_context is None:
+            self._adaptive_context = context
         entities = list(dict.fromkeys([*contributors, self._outdoor_active_entity]))
         accepted = getattr(self, "_adaptive_component_reports", {})
         seen = getattr(self, "_adaptive_seen_reports", {})
