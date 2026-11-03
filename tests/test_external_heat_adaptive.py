@@ -73,8 +73,6 @@ def test_possible_heat_basic_or_mixed_reports_really_learn_and_adapt(
     monkeypatch, interval, weighted
 ):
     from test_adaptive_report_intervals import exercise
-    from test_control_replay_parity import _input
-    from custom_components.pumpsteer.control_replay import ControlReplayState
 
     sensor, states, accepted, count = exercise(
         monkeypatch,
@@ -86,11 +84,9 @@ def test_possible_heat_basic_or_mixed_reports_really_learn_and_adapt(
     )
     now = START + timedelta(minutes=2881)
     assert sensor._thermal_model.adaptive_reason(now, 16) == "qualified"
-    inputs = replace(
-        _input(sensor, now, indoor=19.9),
-        temperature_report_time=sensor._adaptive_report,
-    )
-    state = ControlReplayState.from_sensor(sensor)
+    from test_adaptive_report_intervals import cold_step
+
+    state, inputs, actual = cold_step(sensor, states, monkeypatch, 4 * 720 + 1)
     _, a = replay_control_step(state, inputs)
     _, b = replay_control_step(
         state, replace(inputs, cfg={**inputs.cfg, "adaptive_braking_enabled": False})
@@ -148,15 +144,10 @@ def test_stove_burst_discards_whole_window_then_later_stable_mixed_periods_recov
         == "qualified"
     )
     assert len(sensor._thermal_model.adaptive_snapshot()["validations"]) == 3
-    from test_control_replay_parity import _input
-    from custom_components.pumpsteer.control_replay import ControlReplayState
 
-    now = START + timedelta(minutes=8 * 720 + 1)
-    inputs = replace(
-        _input(sensor, now, indoor=19.9),
-        temperature_report_time=sensor._adaptive_report,
-    )
-    state = ControlReplayState.from_sensor(sensor)
+    from test_adaptive_report_intervals import cold_step
+
+    state, inputs, actual = cold_step(sensor, states, monkeypatch, 8 * 720 + 1)
     _, restored = replay_control_step(state, inputs)
     _, base = replay_control_step(
         state, replace(inputs, cfg={**inputs.cfg, "adaptive_braking_enabled": False})
@@ -264,7 +255,7 @@ def test_old_unscreened_qualification_cannot_activate_after_upgrade():
     assert model.is_valid and model.k == coefficient
     assert (
         model.adaptive_reason(START + timedelta(hours=5), 16)
-        == "insufficient_validation"
+        == "training_evidence_unverified"
     )
     assert not model.adaptive_snapshot()["validations"]
 

@@ -86,6 +86,7 @@ class ControlReplayInput:
     preheat_enabled: bool
     prices_available: bool = True
     control_observation_states: dict | None = None
+    # Oldest genuinely observed indoor contributor; never newest HA republication.
     temperature_report_time: datetime | None = None
 
 
@@ -150,7 +151,15 @@ class _Scratch:
             and report.utcoffset() is not None
             and 0
             <= inputs.now.timestamp() - report.timestamp()
-            <= ADAPTIVE_MAX_REPORT_GAP_MINUTES * 60
+            <= min(
+                45.0,
+                getattr(
+                    self._adaptive_evidence_model,
+                    "adaptive_horizon_minutes",
+                    ADAPTIVE_MAX_REPORT_GAP_MINUTES,
+                ),
+            )
+            * 60
         )
         self._adaptive_braking = {
             "state": "base",

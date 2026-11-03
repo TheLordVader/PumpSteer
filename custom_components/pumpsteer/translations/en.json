@@ -48,7 +48,7 @@
         "data_description": {
           "thermal_intelligence_enabled": "Passively collects qualified observations when a verified heat signal is selected. Does not affect heating control.",
           "external_heat_sources": "Yes means extra heat may sometimes occur, not that it is on now. Adaptive braking can learn from stable temperature response, rejects clearly disturbed periods and needs later independent checks. Undetected extra heat remains a possible confound; this does not measure heat flow.",
-          "adaptive_braking_enabled": "Learns observed house temperature response using your ordinary indoor and outdoor sensors. After at least three checks against later temperatures, it can cautiously reduce price braking near the comfort floor. Off on upgrade. Uncertain or old data returns to Base; no extra heat pump sensors are required. Does not claim measured energy savings."
+          "adaptive_braking_enabled": "Learns observed house temperature response using your ordinary indoor and outdoor sensors. After at least three checks against later temperatures, it can cautiously reduce price braking near the comfort floor. Off on upgrade. Uncertain or old data returns to Base; no extra heat pump sensors are required. Does not claim measured energy savings. Repeated unchanged reports do not add learning observations. Sparse or unresolved temperature changes can keep control in Base."
         },
         "description": "Passive analysis and optional adaptive price braking are separate choices. Adaptive braking uses observed temperature response, not assumed heat output. Advanced verified model learning requires reliable heat signals."
       },

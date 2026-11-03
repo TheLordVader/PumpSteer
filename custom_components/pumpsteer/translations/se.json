@@ -49,7 +49,7 @@
         "data_description": {
           "thermal_intelligence_enabled": "Samlar passivt kvalificerade observationer om en verifierad värmesignal väljs. Påverkar inte värmestyrningen.",
           "external_heat_sources": "Ja betyder att extra värme ibland kan förekomma, inte att den är på nu. Adaptiv bromsning kan lära från stabil temperaturrespons, förkastar tydligt störda perioder och kräver senare oberoende kontroller. Oupptäckt extra värme är fortfarande en möjlig felkälla; inget värmeflöde mäts.",
-          "adaptive_braking_enabled": "Lär husets observerade temperaturrespons med dina vanliga inne- och utegivare. Efter minst tre kontroller av senare temperaturutfall kan prisbromsningen minskas försiktigt nära komfortgränsen. Avstängd vid uppgradering. Osäkra eller gamla data ger grundreglering; inga extra värmepumpsgivare krävs. Visar inte uppmätta energibesparingar."
+          "adaptive_braking_enabled": "Lär husets observerade temperaturrespons med dina vanliga inne- och utegivare. Efter minst tre kontroller av senare temperaturutfall kan prisbromsningen minskas försiktigt nära komfortgränsen. Avstängd vid uppgradering. Osäkra eller gamla data ger grundreglering; inga extra värmepumpsgivare krävs. Visar inte uppmätta energibesparingar. Upprepade oförändrade rapporter ger inga nya inlärningsobservationer. Glesa eller för små temperaturförändringar kan behålla grundregleringen."
         },
         "description": "Passiv analys och frivillig adaptiv prisbromsning är separata val. Adaptiv bromsning använder observerad temperaturrespons, inte antagen värmeeffekt. Mer avancerad verifierad modellinlärning kräver tillförlitliga värmesignaler."
       },

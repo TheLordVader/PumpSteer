@@ -30,7 +30,7 @@ def test_temporary_missing_reports_keep_learned_model_and_safe_restore_summary(
     attrs = sensor.extra_state_attributes
     assert attrs["thermal_k_valid"]
     assert attrs["adaptive_model_state"]["evidence"] == saved
-    states["sensor.indoor"].state = "20.5"
+    states["sensor.indoor"].state = "20.4"
     _cycle(sensor, monkeypatch, 302)
     assert sensor._thermal_model is model
     assert model.adaptive_reason(START + timedelta(minutes=302), 16) == "qualified"
@@ -53,7 +53,8 @@ def test_partial_weighted_composition_is_not_a_new_house(monkeypatch):
     assert sensor._thermal_model is model
     assert not sensor._adaptive_inputs_fresh
     assert sensor._adaptive_braking["multiplier"] == 1
-    states["sensor.room2"].state = "20.5"
+    states["sensor.room2"].state = "20.4"
+    states["sensor.indoor"].state = "20.4"
     states["sensor.room2"].last_reported = START + timedelta(minutes=302)
     _cycle(sensor, monkeypatch, 302)
     assert sensor._thermal_model is model
@@ -104,6 +105,7 @@ def test_temporary_backup_weather_source_pauses_without_replacing_model(monkeypa
     assert not sensor._adaptive_inputs_fresh
     states["sensor.outdoor"].state = "5"
     _cycle(sensor, monkeypatch, 302)
+    states["sensor.indoor"].state = "20.4"
     _cycle(sensor, monkeypatch, 303)
     assert sensor._outdoor_active_entity == "sensor.outdoor"
     assert sensor._thermal_model is model
@@ -140,6 +142,7 @@ def test_legacy_model_with_primary_delayed_and_backup_first_is_retained(monkeypa
     assert not sensor._adaptive_inputs_fresh
     states["sensor.outdoor"].state = "5"
     _cycle(sensor, monkeypatch, 302)
+    states["sensor.indoor"].state = "20.4"
     _cycle(sensor, monkeypatch, 303)
     assert sensor._thermal_model is model
     assert sensor._adaptive_inputs_fresh

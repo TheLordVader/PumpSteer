@@ -18,7 +18,7 @@ from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers.typing import StateType
 
 from .thermal_model import (
-    ADAPTIVE_MAX_REPORT_GAP_MINUTES,
+    ADAPTIVE_LEARNING_MAX_GAP_MINUTES,
     VALIDATION_BASIS,
     ThermalModel,
 )
@@ -187,6 +187,8 @@ class PumpSteerSensor(RestoreEntity):
         self._adaptive_report = None
         self._adaptive_new_report = False
         self._adaptive_inputs_fresh = False
+        self._adaptive_learning_available = False
+        self._adaptive_temperature_evidence = {}
         self._adaptive_braking = {
             "state": "base",
             "reason": "disabled",
@@ -1243,9 +1245,9 @@ class PumpSteerSensor(RestoreEntity):
                     self._thermal_model._external_disturbance
                 )
                 return
-            if not self._adaptive_inputs_fresh:
+            if not self._adaptive_learning_available:
                 self._thermal_model.cancel_validation_session()
-                active, reason = False, "temperature_reports_unavailable"
+                active, reason = False, "temperature_observation_missing"
             elif not self._adaptive_new_report:
                 return
         was_active = self._thermal_learning_active
@@ -1778,6 +1780,7 @@ class PumpSteerSensor(RestoreEntity):
             # A changed configured house/weight/control setup invalidates experience.
             self._thermal_model = ThermalModel()
             self._adaptive_context = None
+            self._adaptive_temperature_evidence = {}
         if configuration != old_configuration:
             if old_configuration is not None or self._adaptive_context is None:
                 self._adaptive_configuration = configuration
@@ -1843,71 +1846,113 @@ class PumpSteerSensor(RestoreEntity):
             # Missing/partial reports or a temporary fallback are not a new house.
             # Retain experience but never learn/use it for a different composition.
             self._adaptive_inputs_fresh = False
+            self._adaptive_learning_available = False
             self._adaptive_new_report = False
             self._adaptive_observation_reason = "temperature_composition_unavailable"
-            self._adaptive_report = None
-            self._adaptive_component_reports = {}
-            self._adaptive_seen_reports = {}
-            self._adaptive_sparse_sources = set()
+            self._adaptive_observation_after = now
             self._thermal_model.cancel_validation_session()
             return
         if self._adaptive_context is None:
             self._adaptive_context = context
-        entities = list(dict.fromkeys([*contributors, self._outdoor_active_entity]))
+        from .control_intelligence import _timestamp, verified_signal_value
+
+        evidence = self._adaptive_temperature_evidence
         accepted = getattr(self, "_adaptive_component_reports", {})
-        seen = getattr(self, "_adaptive_seen_reports", {})
-        sparse = getattr(self, "_adaptive_sparse_sources", set())
-        reports = {}
+        observations = {}
         valid = True
-        for entity in entities:
-            at = getattr(self.hass.states.get(entity), "last_reported", None)
+        attribute = cfg.get("control_measurement_time_attribute", "measurement_time")
+        for entity in contributors:
+            source = self.hass.states.get(entity)
+            value = safe_float(getattr(source, "state", None))
+            report = getattr(source, "last_reported", None)
+            attrs = getattr(source, "attributes", {}) or {}
+            previous = evidence.get(entity)
             if (
-                not isinstance(at, datetime)
-                or at.utcoffset() is None
-                or not 0
-                <= now.timestamp() - at.timestamp()
-                <= ADAPTIVE_MAX_REPORT_GAP_MINUTES * 60
+                value is None
+                or not isinstance(report, datetime)
+                or report.utcoffset() is None
+                or report.timestamp() > now.timestamp()
             ):
                 valid = False
                 continue
-            previous = seen.get(entity)
-            if previous is None or at.timestamp() > previous.timestamp():
-                if previous is not None:
-                    gap = (at.timestamp() - previous.timestamp()) / 60
-                    if gap > ADAPTIVE_MAX_REPORT_GAP_MINUTES:
-                        sparse.add(entity)
-                    else:
-                        sparse.discard(entity)
-                seen[entity] = at
-            reports[entity] = at
-        self._adaptive_seen_reports = seen
-        self._adaptive_sparse_sources = sparse
-        self._adaptive_inputs_fresh = valid and not sparse
+            observed = previous.get("observed_at") if previous else None
+            clock = previous.get("clock") if previous else None
+            authoritative = (
+                cfg.get("control_signals_verified") is True
+                and attribute
+                not in {"last_seen", "last_reported", "last_updated", "last_changed"}
+                and (attribute in attrs or clock is not None)
+            )
+            if authoritative:
+                source_time = _timestamp(attrs.get(attribute))
+                if (
+                    previous
+                    and clock is not None
+                    and source_time == clock
+                    and value == previous["value"]
+                ):
+                    pass  # unchanged measurement clock is not a new observation
+                elif verified_signal_value(
+                    now,
+                    source,
+                    attribute=attribute,
+                    measured_after=self._temperature_reported_after,
+                ) is not None and (clock is None or source_time > clock):
+                    observed = datetime.fromtimestamp(source_time, timezone.utc)
+                    clock = source_time
+                else:
+                    valid = False
+                    continue  # stale/invalid explicit time must never fall back to HA receipt
+            elif previous and value != previous["value"]:
+                if report.timestamp() <= previous["receipt"].timestamp():
+                    valid = False
+                    continue
+                observed = report  # observed value change; NOT a verified physical sampling time
+            evidence[entity] = {
+                "value": value,
+                "receipt": report,
+                "observed_at": observed,
+                "clock": clock,
+            }
+            if (
+                observed is None
+                or (
+                    getattr(self, "_adaptive_observation_after", None) is not None
+                    and observed.timestamp()
+                    <= self._adaptive_observation_after.timestamp()
+                )
+                or not 0
+                <= now.timestamp() - observed.timestamp()
+                <= ADAPTIVE_LEARNING_MAX_GAP_MINUTES * 60
+            ):
+                valid = False
+            else:
+                observations[entity] = observed
+        self._adaptive_learning_available = valid and len(observations) == len(
+            contributors
+        )
+        horizon = min(45.0, self._thermal_model.adaptive_horizon_minutes)
+        self._adaptive_inputs_fresh = self._adaptive_learning_available and all(
+            now.timestamp() - at.timestamp() <= horizon * 60
+            for at in observations.values()
+        )
         self._adaptive_observation_reason = (
-            "report_interval_too_sparse"
-            if sparse
-            else "temperature_reports_unavailable"
+            "temperature_observation_missing"
+            if not self._adaptive_learning_available
+            else "temperature_observation_too_old"
         )
         self._adaptive_new_report = bool(
-            self._adaptive_inputs_fresh
+            self._adaptive_learning_available
             and all(
-                entity in reports
-                and (
-                    entity not in accepted
-                    or reports[entity].timestamp() > accepted[entity].timestamp()
-                )
+                entity not in accepted
+                or observations[entity].timestamp() > accepted[entity].timestamp()
                 for entity in contributors
             )
         )
         if self._adaptive_new_report:
-            # A causal snapshot of actual asynchronous reports, never a simultaneous
-            # physical measurement. All indoor contributors must advance once.
-            self._adaptive_component_reports = {
-                entity: reports[entity] for entity in contributors
-            }
+            self._adaptive_component_reports = dict(observations)
             self._adaptive_report = max(
-                (reports[entity] for entity in contributors),
-                key=lambda at: at.timestamp(),
+                observations.values(), key=lambda at: at.timestamp()
             )
 
     def _adaptive_brake_multiplier(
@@ -1951,7 +1996,9 @@ class PumpSteerSensor(RestoreEntity):
                     "temperature_reports_unavailable",
                 )
             if reason == "qualified" and eligible:
-                predicted = model.predict_drop(indoor, outdoor, 30)
+                predicted = model.predict_drop(
+                    indoor, outdoor, model.adaptive_horizon_minutes
+                )
                 # The model describes unmodified braking, not causal heat output.
                 # Reduce only: retain a 0.2 C reserve plus 0.2 C validation allowance.
                 budget = max(0.0, indoor - comfort_floor - 0.4)
@@ -1983,6 +2030,14 @@ class PumpSteerSensor(RestoreEntity):
             else None,
         }
         if enabled:
+            self._adaptive_braking["prediction_horizon_minutes"] = (
+                model.adaptive_horizon_minutes if predicted is not None else None
+            )
+            self._adaptive_braking["predicted_drop_c"] = (
+                round(predicted, 3) if predicted is not None else None
+            )
+            if model.adaptive_horizon_minutes != 30:
+                self._adaptive_braking["predicted_drop_30m_c"] = None
             self._adaptive_braking["external_heat"] = external_status
             if multiplier < 1 and external_status == "verified_inactive":
                 snapshot = dict(getattr(self, "_control_signal_snapshot", {}) or {})
@@ -2405,7 +2460,9 @@ class PumpSteerSensor(RestoreEntity):
         previous = getattr(self, "_temperature_identity_previous", None)
         if previous is not None and identity != previous:
             self._thermal_model.cancel_validation_session()
-            if indoor is not None:
+            if cfg.get("adaptive_braking_enabled") is True:
+                self._thermal_model.record_temp(now, None)
+            elif indoor is not None:
                 self._thermal_model.reset_temp_history(now, indoor)
             self._plan_audit.cancel_plans("temperature_source_changed")
             self._plan_audit.fixed_pending = None
@@ -2473,13 +2530,21 @@ class PumpSteerSensor(RestoreEntity):
         aggressiveness = self._aggressiveness(cfg)
         house_inertia = self._house_inertia(cfg)
 
-        if cfg.get("adaptive_braking_enabled") is True:
+        adaptive_enabled = cfg.get("adaptive_braking_enabled") is True
+        previous_enabled = getattr(self, "_adaptive_previous_enabled", None)
+        if previous_enabled is not None and adaptive_enabled != previous_enabled:
+            self._thermal_model.reset_observation_policy(adaptive_enabled)
+            self._adaptive_temperature_evidence = {}
+            self._adaptive_component_reports = {}
+            self._adaptive_report = None
+        self._adaptive_previous_enabled = adaptive_enabled
+        if adaptive_enabled:
             self._prepare_adaptive_observation(cfg, now, identity)
             if self._adaptive_new_report:
                 self._thermal_model.record_temp(
                     self._adaptive_report, indoor, adaptive_reports=True
                 )
-            elif not self._adaptive_inputs_fresh:
+            elif not self._adaptive_learning_available:
                 self._thermal_model.record_temp(now, None)
         else:
             self._adaptive_inputs_fresh = False

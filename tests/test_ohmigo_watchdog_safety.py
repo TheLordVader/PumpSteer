@@ -663,6 +663,10 @@ def test_external_heat_optional_report_during_dispatch_uses_semantics_not_report
     sensor._prepare_adaptive_observation(
         sensor._cfg(), clock[0], sensor._temperature_identity(sensor._cfg())
     )
+    # The first plain HA snapshot is a baseline, not a temperature observation.
+    clock[0] += timedelta(minutes=1)
+    states["sensor.indoor"].state = "19.8"
+    states["sensor.indoor"].last_reported = clock[0]
     sensor._thermal_model = qualified()
     listeners = []
 

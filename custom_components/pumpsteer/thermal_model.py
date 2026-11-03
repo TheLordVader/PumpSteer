@@ -47,7 +47,8 @@ _MIN_RATE_WINDOW_MINUTES = 3.0
 
 # Break temperature history and sessions across stale observations.
 _MAX_TEMP_GAP_MINUTES = 5.0
-ADAPTIVE_MAX_REPORT_GAP_MINUTES = 18.0
+ADAPTIVE_MAX_REPORT_GAP_MINUTES = 30.0
+ADAPTIVE_LEARNING_MAX_GAP_MINUTES = 180.0
 
 # Plausible bounds for measured indoor temperature rate (°C/h).
 _MIN_RATE_C_PER_HOUR = -5.0
@@ -94,6 +95,8 @@ class _ValidationSession:
     adaptive_reports: bool = False
     reports: int = 1
     screen_external_heat: bool = False
+    declared_horizon_minutes: float = 30.0
+    max_gap_minutes: float = 0.0
 
 
 class ThermalModel:
@@ -101,6 +104,7 @@ class ThermalModel:
 
     def __init__(self) -> None:
         self._external_disturbance = None
+        self._adaptive_fit = False
         self._adaptive_reports = False
         self._adaptive_validations = deque(maxlen=3)
         self._k: float = _FALLBACK_K
@@ -237,7 +241,7 @@ class ThermalModel:
         """
         if len(self._samples) < _MIN_SAMPLES:
             return False
-        if not self._valid:
+        if not self._valid or (self._adaptive_reports and not self._adaptive_fit):
             return True
         if len(self._adaptive_validations) == 3 and all(
             abs(row[1]) > 0.2 for row in self._adaptive_validations
@@ -245,6 +249,18 @@ class ThermalModel:
             # Repeated failures of the stricter active-use gate require relearning,
             # even when the older diagnostic MAE threshold has not been reached.
             return True
+        if (
+            self._adaptive_reports
+            and len(self._adaptive_validations) == 3
+            and self._sample_count >= 20
+            and self._fit_rmse is not None
+            and self._fit_rmse <= 0.3
+            and all(abs(row[1]) <= 0.2 for row in self._adaptive_validations)
+        ):
+            # Prospectively tested operating horizons govern this model's active
+            # use; a different six-hour retrospective extrapolation cannot unlearn
+            # three good short/declared-horizon forecasts.
+            return False
         return (
             self._validated_sessions >= _REFIT_MIN_VALIDATED_SESSIONS
             and self._prediction_mae is not None
@@ -257,6 +273,7 @@ class ThermalModel:
         """Restore k from previously saved Home Assistant state."""
         if math.isfinite(k) and _K_MIN < k < _K_MAX:
             self._k = k
+            self._adaptive_fit = False
             self._valid = True
             _LOGGER.debug("ThermalModel: restored k=%.4f from state", k)
         else:
@@ -326,7 +343,8 @@ class ThermalModel:
     def adaptive_snapshot(self):
         """Tiny versioned evidence for the current fitted coefficient; no raw history."""
         return {
-            "version": 3,
+            "version": 4,
+            "genuine_fit": self._adaptive_fit,
             "k": self._k,
             "validations": list(self._adaptive_validations),
         }
@@ -334,31 +352,37 @@ class ThermalModel:
     def restore_adaptive(self, saved):
         """Reject incompatible/corrupt evidence instead of qualifying an old model."""
         self._adaptive_validations.clear()
+        self._adaptive_fit = False
         try:
             if (
                 not isinstance(saved, dict)
-                or saved.get("version") != 3
+                or saved.get("version") != 4
                 or saved.get("k") != self._k
             ):
+                return
+            if saved.get("genuine_fit") is not True:
                 return
             rows = saved["validations"]
             if not isinstance(rows, list) or len(rows) > 3:
                 return
             parsed = []
             for row in rows:
-                if len(row) != 3 or not all(
+                if len(row) != 6 or not all(
                     type(v) in (float, int) and math.isfinite(v) for v in row
                 ):
                     return
-                at, error, delta = row
+                at, error, delta, duration, gap, drop = row
                 if (
                     at <= 0
                     or not 2 <= delta <= 70
-                    or (parsed and at - parsed[-1][0] < 1800)
+                    or not 27 <= duration <= 360
+                    or not 0 < gap <= min(duration, ADAPTIVE_LEARNING_MAX_GAP_MINUTES)
+                    or (parsed and at - parsed[-1][0] < 27 * 60)
                 ):
                     return
-                parsed.append((at, error, delta))
+                parsed.append((at, error, delta, duration, gap, drop))
             self._adaptive_validations.extend(parsed)
+            self._adaptive_fit = True
         except (KeyError, TypeError, ValueError):
             return
 
@@ -374,6 +398,8 @@ class ThermalModel:
         ):
             return "model_unqualified"
         rows = self._adaptive_validations
+        if not self._adaptive_fit:
+            return "training_evidence_unverified"
         if len(rows) < 3:
             return "insufficient_validation"
         ages = [now.timestamp() - row[0] for row in rows]
@@ -381,6 +407,10 @@ class ThermalModel:
             return "validation_expired"
         if any(abs(row[1]) > 0.2 for row in rows):
             return "validation_error"
+        if any(row[3] > 45 or row[4] > 35 for row in rows):
+            return "validated_horizon_too_long"
+        if any(row[5] < 0.199999 for row in rows):
+            return "temperature_change_below_resolution"
         if (
             not min(row[2] for row in rows) - 5
             <= delta
@@ -388,6 +418,18 @@ class ThermalModel:
         ):
             return "outside_validation_range"
         return "qualified"
+
+    @property
+    def adaptive_horizon_minutes(self):
+        # Conservative common near-horizon planning choice, never selected by error.
+        return max((row[3] for row in self._adaptive_validations), default=30.0)
+
+    def reset_observation_policy(self, adaptive):
+        """Do not mix legacy poll samples with genuine temperature observations."""
+        self._samples.clear()
+        self._temp_history = deque(maxlen=32 if adaptive else _TEMP_BUFFER_SIZE)
+        self._adaptive_reports = adaptive
+        self.cancel_validation_session()
 
     def mark_external_disturbance(self, reason="temperature_response_disturbed"):
         """Reject uncertain observation periods, never identify their heat source.
@@ -446,7 +488,7 @@ class ThermalModel:
                 elapsed_seconds <= 0.0
                 or elapsed_seconds
                 > (
-                    ADAPTIVE_MAX_REPORT_GAP_MINUTES
+                    ADAPTIVE_LEARNING_MAX_GAP_MINUTES
                     if self._adaptive_reports
                     else _MAX_TEMP_GAP_MINUTES
                 )
@@ -457,7 +499,7 @@ class ThermalModel:
         if self._adaptive_reports:
             while (
                 len(self._temp_history) > 1
-                and now.timestamp() - self._temp_history[0][0].timestamp() > 90 * 60
+                and now.timestamp() - self._temp_history[0][0].timestamp() > 360 * 60
             ):
                 self._temp_history.popleft()
 
@@ -564,6 +606,7 @@ class ThermalModel:
                 residual_sq += (sample.rate - predicted_rate) ** 2
 
             self._k = k
+            self._adaptive_fit = self._adaptive_reports
             self._valid = True
             self._sample_count = len(samples)
             self._fit_rmse = math.sqrt(residual_sq / len(samples))
@@ -623,6 +666,7 @@ class ThermalModel:
             last_indoor=indoor_temp,
             adaptive_reports=adaptive_observations,
             screen_external_heat=screen_external_heat,
+            declared_horizon_minutes=30.0,
             forecast_30m=(
                 self.predict_drop(indoor_temp, outdoor_temp, 30)
                 if self._valid and adaptive_observations
@@ -642,7 +686,7 @@ class ThermalModel:
             elapsed <= 0.0
             or elapsed
             > (
-                ADAPTIVE_MAX_REPORT_GAP_MINUTES
+                ADAPTIVE_LEARNING_MAX_GAP_MINUTES
                 if session.adaptive_reports
                 else _MAX_TEMP_GAP_MINUTES
             )
@@ -651,16 +695,21 @@ class ThermalModel:
             self.cancel_validation_session()
             return False
         session.reports += 1
+        session.max_gap_minutes = max(session.max_gap_minutes, elapsed)
         duration = (now.timestamp() - session.start_time.timestamp()) / 60.0
-        if not session.forecast_checked and duration >= 30:
+        if (
+            not session.forecast_checked
+            and duration >= session.declared_horizon_minutes - 3
+        ):
             session.forecast_checked = True
             if (
-                duration <= 48
-                and session.reports >= 3
+                duration
+                <= session.declared_horizon_minutes + ADAPTIVE_LEARNING_MAX_GAP_MINUTES
+                and session.reports >= 2
                 and session.forecast_30m is not None
             ):
-                # Rule issued with the frozen trajectory: first actual report at/after
-                # 30 minutes, no later than 48. The endpoint is chosen by report time,
+                # Predeclared thirty-minute target with three-minute timing grace.
+                # Long endpoints are diagnostic only. Choose by observation time,
                 # never by its temperature/error. No temperature is interpolated.
                 predicted = self._predict_drop_with_k(
                     session.prediction_k,
@@ -679,6 +728,9 @@ class ThermalModel:
                         now.timestamp(),
                         error,
                         session.start_indoor - session.start_outdoor,
+                        duration,
+                        session.max_gap_minutes,
+                        session.start_indoor - indoor_temp,
                     )
                 )
         session.last_time = now

@@ -23,7 +23,9 @@ def train(model):
     # A complete training session precedes all independent holdout sessions.
     for minute in range(61):
         indoor = 21 - 0.01 * minute
-        model.record_temp(START + timedelta(minutes=minute), indoor)
+        model.record_temp(
+            START + timedelta(minutes=minute), indoor, adaptive_reports=True
+        )
         model.collect_braking_sample(indoor, 5)
     assert model.fit()
     return model
@@ -32,11 +34,11 @@ def train(model):
 def validate(model, start, error=0):
     model.start_validation_session(start, 21, 5, adaptive_observations=True)
     predicted = model.predict_drop(21, 5, 30)
-    for minute in range(1, 32):
+    for minute in range(5, 31, 5):
         model.update_validation_session(
             start + timedelta(minutes=minute), 21 - (predicted + error) * minute / 30, 5
         )
-    model.end_validation_session(start + timedelta(minutes=31), 21 - predicted)
+    model.end_validation_session(start + timedelta(minutes=30), 21 - predicted)
 
 
 def qualified():
@@ -121,7 +123,7 @@ def test_real_replay_off_unqualified_adaptive_and_fallback(monkeypatch):
         assert 0.75 <= adapted.attributes["adaptive_braking"]["multiplier"] <= 1
         assert adapted.attributes["brake_factor"] <= base.attributes["brake_factor"]
     previous = adapted.attributes["adaptive_braking"]["multiplier"]
-    stale = replace(step, now=step.now + timedelta(minutes=20))
+    stale = replace(step, now=step.now + timedelta(minutes=60))
     state, fallback = replay_control_step(state, stale)
     assert (
         previous
@@ -279,6 +281,7 @@ def test_delayed_report_uses_one_observation_timeline(monkeypatch):
     sensor._thermal_model = qualified()
     sensor._adaptive_report = START + timedelta(minutes=16)
     sensor._adaptive_inputs_fresh = True
+    sensor._adaptive_learning_available = True
     sensor._adaptive_new_report = True
     sensor._thermal_learning_active = False
     sensor._update_thermal_learning(

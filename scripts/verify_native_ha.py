@@ -2296,6 +2296,33 @@ async def test_native_rest_ebusd_message_timestamp_is_not_refreshed_by_http(
     assert len(requests) >= 3 and all(path == "/data/mc" for path in requests)
 
 
+def _native_trained_temperature_model(now):
+    """Synthetic genuine observations create the model used by restore fixtures."""
+    from custom_components.pumpsteer.thermal_model import ThermalModel
+
+    model = ThermalModel()
+    for minute in range(91):
+        temperature = 21 - 0.01 * minute
+        model.record_temp(
+            now - timedelta(hours=6) + timedelta(minutes=minute),
+            temperature,
+            adaptive_reports=True,
+        )
+        model.collect_braking_sample(temperature, 5)
+    assert model.fit()
+    for hour in (3, 2, 1):
+        start = now - timedelta(hours=hour)
+        model.start_validation_session(start, 21, 5, adaptive_observations=True)
+        for minute in range(5, 31, 5):
+            temperature = 21 - model.predict_drop(21, 5, minute)
+            assert model.update_validation_session(
+                start + timedelta(minutes=minute), temperature, 5
+            )
+        model.end_validation_session(start + timedelta(minutes=30), temperature)
+    assert model.adaptive_reason(now, 16) == "qualified"
+    return model
+
+
 @pytest.mark.parametrize("corrupt", [False, True])
 async def test_native_adaptive_model_restore_and_default_off(
     recorder_mock, hass, enable_custom_integrations, corrupt
@@ -2306,19 +2333,13 @@ async def test_native_adaptive_model_restore_and_default_off(
     from custom_components.pumpsteer.thermal_model import VALIDATION_BASIS
 
     now = dt_util.utcnow()
-    evidence = {
-        "version": 3,
-        "k": 0.04,
-        "validations": [
-            [(now - timedelta(hours=hour)).timestamp(), 0.05, 16.0]
-            for hour in (3, 2, 1)
-        ],
-    }
+    trained = _native_trained_temperature_model(now)
+    evidence = json.loads(json.dumps(trained.adaptive_snapshot()))
     saved = {
-        "thermal_k_restore": 0.04,
+        "thermal_k_restore": trained.k,
         "thermal_k_valid": True,
-        "thermal_k_samples": "broken" if corrupt else 30,
-        "thermal_fit_rmse_c_per_hour": 0.05,
+        "thermal_k_samples": "broken" if corrupt else trained.sample_count,
+        "thermal_fit_rmse_c_per_hour": trained.fit_rmse,
         "thermal_validation_basis": VALIDATION_BASIS,
         "adaptive_model_state": {"context": "source-context", "evidence": evidence},
         "adaptive_braking": {"state": "adapting", "multiplier": 0.75},
@@ -2404,7 +2425,7 @@ async def test_native_adaptive_fifteen_minute_reports_are_distinct_observations(
             reports.append(hass.states.get("sensor.room").last_reported)
         await sensor._do_update()
     assert sensor._attributes["mode"] == "braking"
-    assert sensor._thermal_model.pending_samples >= 2
+    assert sensor._thermal_model.pending_samples >= 1
     assert all(at in reports for at, value in sensor._thermal_model._temp_history)
     assert len(sensor._thermal_model._temp_history) <= len(reports)
     assert sensor._adaptive_inputs_fresh
@@ -2434,21 +2455,16 @@ async def test_native_enabled_adaptive_startup_waits_without_erasing_experience(
     settings = (BRAKE_DELTA_C, 3, False)
     context = repr((("sensor.room", "sensor.out", None), *settings))
     configuration = repr(([("sensor.room", 1.0)], "sensor.out", backup, settings))
-    evidence = {
-        "version": 3,
-        "k": 0.04,
-        "validations": [
-            [(now - timedelta(hours=h)).timestamp(), 0.05, 16.0] for h in (3, 2, 1)
-        ],
-    }
+    trained = _native_trained_temperature_model(now)
+    evidence = json.loads(json.dumps(trained.adaptive_snapshot()))
     summary = {"context": context, "evidence": evidence}
     if with_configuration:
         summary["configuration"] = configuration
     saved = {
-        "thermal_k_restore": 0.04,
+        "thermal_k_restore": trained.k,
         "thermal_k_valid": True,
-        "thermal_k_samples": 30,
-        "thermal_fit_rmse_c_per_hour": 0.05,
+        "thermal_k_samples": trained.sample_count,
+        "thermal_fit_rmse_c_per_hour": trained.fit_rmse,
         "thermal_validation_basis": VALIDATION_BASIS,
         "adaptive_model_state": summary,
     }
@@ -2518,7 +2534,11 @@ async def test_native_enabled_adaptive_startup_waits_without_erasing_experience(
     freezer.move_to(now + timedelta(seconds=4))
     await sensor.async_update()  # existing two-cycle primary recovery
     assert sensor._thermal_model is model
-    assert model.adaptive_reason(now + timedelta(seconds=4), 14.9) == "qualified"
+    assert not sensor._adaptive_inputs_fresh
+    freezer.move_to(now + timedelta(seconds=5))
+    hass.states.async_set("sensor.room", 19.8, {"unit_of_measurement": "°C"})
+    await sensor.async_update()
+    assert model.adaptive_reason(now + timedelta(seconds=5), 14.8) == "qualified"
     assert sensor._adaptive_inputs_fresh
     assert sensor._adaptive_context == context
     assert sensor._adaptive_configuration == configuration

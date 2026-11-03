@@ -215,29 +215,36 @@ Activation and quality:
   required. Normal room/outdoor HA reports are observational evidence, not proof
   of physical sampling time or heat delivery. Cached/repeated polling ticks do
   not add learning samples.
-- Learning requires distinct indoor reports and indoor/outdoor report coverage
-  within eighteen minutes, stable near-full braking, heating-season temperature
-  difference, at least 20 accepted rate samples and fit residual <=0.3 C/hour.
-  Adaptive rates use at least three distinct observations over at least fifteen
-  minutes, with up to 32 reports and at most 90 minutes in the existing small
-  history. This reduces 0.1 C quantization noise without inventing samples.
-  Ordinary 1/5/10/15-minute reports (including bounded jitter) can qualify when
-  sufficient long braking sessions exist. A 30-minute stream is explicitly too
-  sparse for this first adaptive policy. Base report-age settings and output
-  safety are unchanged.
-- Each qualifying session freezes its coefficient, initial room value and outdoor
-  value as a prediction trajectory. At issue, the endpoint rule is fixed: use the
-  first actual report at/after 30 minutes, no later than 48 minutes, with at least
-  three observations including the start. Predict for that actual elapsed time
-  using only the frozen starting data; never choose an endpoint by its error,
-  interpolate temperatures or use later outdoor measurements.
-  Three separate sessions must each have absolute error <=0.2 C. Confidence alone
-  cannot activate control. Evidence expires after seven days; current indoor–outdoor
-  difference must remain within 5 C of the validation range.
-- Only reduce braking, by at most 25%. Compare predicted 30-minute cooling with
-  remaining comfort margin after a 0.2 C reserve and 0.2 C error allowance. Ramp
-  the correction using existing ramp times (minimum ten minutes, elapsed time
-  capped at one minute per update). Never add braking or bypass the comfort floor.
+- Learning requires genuine observed temperature changes, stable near-full braking,
+  heating-season temperature difference, at least 20 accepted rate samples and fit
+  residual <=0.3 C/hour. The first plain HA snapshot is only a baseline; a verified post-start temperature
+  clock can establish the first observation. Unchanged HA
+  reports, polling, battery updates and generic `last_seen` do not add observations.
+  An existing explicitly verified temperature-specific source clock may confirm an
+  unchanged temperature; stale/pre-start clocks never fall back to receipt time.
+  Without such a clock, changed cached replay cannot be distinguished from a new
+  observation: this is observational learning, not proof of physical freshness.
+- Rates require three real observations over at least fifteen minutes. History is
+  bounded to 32 observations/six hours, with at most three hours between observations.
+  This permits slower learning at 30/60-minute intervals without manufacturing
+  intermediate samples. Base freshness and output safety remain unchanged.
+- Each independent holdout freezes its coefficient, initial room and outdoor value.
+  Its endpoint rule is declared before the outcome: nominal thirty minutes with
+  three minutes of timing grace, using the first actual observation at/after minute
+  27. Predict at the actual elapsed duration; never interpolate temperatures or
+  choose endpoints by temperature, error or resolution. Long endpoints up to 210
+  minutes are diagnostic only. Active evidence requires three separate holdouts
+  with duration <=45 minutes, no actual gap >35 minutes, resolved cooling >=0.2 C
+  and absolute error <=0.2 C each. A sixty-minute holdout cannot license short-horizon
+  control. Flat/sub-resolution series remain in Base with a specific reason.
+  Evidence expires after seven days; current indoor–outdoor difference must remain
+  within 5 C of the validation range. Confidence alone cannot activate control.
+- Only reduce braking, by at most 25%. Compare predicted cooling over the actual
+  supported horizon (maximum duration of the three qualifying holdouts) with
+  remaining comfort margin after a 0.2 C reserve and 0.2 C error allowance. Report
+  that horizon explicitly; a non-thirty-minute forecast is not labelled thirty
+  minutes. Ramp using existing times (minimum ten minutes, elapsed update capped
+  at one minute). Never add braking or bypass the comfort floor.
 - Modified braking does not train or validate the baseline response. Expired
   evidence returns gradually to Base, allowing new unmodified validation. Sensor
   configured source/weight, brake-depth or aggressiveness changes discard old
@@ -246,7 +253,8 @@ Activation and quality:
   experience. The learned effective composition must match before use resumes.
   Three consecutive failed adaptive validations (>0.2 C each), together with at
   least 20 new accepted samples, trigger a refit even below the older diagnostic
-  0.3 C MAE threshold. A refit clears qualification and needs three later
+  0.3 C MAE threshold. Good prospective short-horizon forecasts are not discarded
+  merely because a retrospective six-hour extrapolation has higher error. A refit clears qualification and needs three later
   independent validations. SAFE resets output correction; restored correction is
   never applied. Possible intermittent extra heat is handled by the observational
   screening and optional verified activity described below.
@@ -254,17 +262,22 @@ Activation and quality:
 `adaptive_braking` reports `collecting` (Samlar erfarenhet), `learned` (Lärt husets
 respons), `adapting` (Anpassar styrningen), `returning_to_base` (Återgår) or `base`
 (Grundreglering), together with the gate reason, applied multiplier and predicted
-30-minute drop. `adaptive_model_state` is a compact versioned RestoreEntity
-summary (policy version 3): coefficient association, source context and only three
-validation rows. Older qualification is discarded while the fitted coefficient
-can still be independently revalidated. For weighted room temperature, a learning
-snapshot is accepted only after every contributing indoor source has reported
-again. Its timestamp is the newest included HA report; component times remain
+cooling and its supported horizon. `adaptive_model_state` is a compact versioned RestoreEntity
+summary (policy version 4): coefficient association, genuine-fitting provenance,
+source context and three duration/gap/resolution-bearing validation rows. Older
+coefficients remain diagnostic and require twenty genuine samples, refitting and
+new independent validation before adaptive use. For weighted room temperature, a learning
+snapshot is accepted only after every contributing indoor source has genuinely advanced
+again. Its timestamp is the newest included observation; component times remain
 separate and it is explicitly a causal asynchronous snapshot, not a simultaneous
 physical measurement. An individual report cannot fabricate new observations for
-other contributors.
+other contributors. Current action freshness uses the oldest contributor and the
+supported horizon, independently of the longer learning window. Missing composition
+pauses use until observations newer than the outage return; cached same-value
+reappearance does not resume control. OFF/ON clears raw buffers, preserving a genuine
+fit unless an intervening legacy refit changed it.
 The existing 240-sample fitting buffer stays bounded; the adaptive rate window
-is capped at 32 reports/90 minutes. The compact model summary also uses the existing
+is capped at 32 observations/six hours. The compact model summary also uses the existing
 RestoreEntity extra-data payload (alongside brake/zone state), so experience
 survives a second restart while both sensors are still unavailable and HA omits
 normal entity attributes. Older summaries without a configured signature wait
@@ -334,7 +347,7 @@ output checks also watch the optional signal: a fresh same-off report is allowed
 whereas active/unknown transitions prevent an old adaptive command from obtaining
 a new Guard activation, without resetting valid PI or ramp state.
 
-Policy version 3 discards old unscreened qualification summaries on upgrade while
-retaining compatible fitted coefficients. Three new independent holdouts are
-required before use, including for users who previously selected possible extra
+Policy version 4 discards old qualification summaries without current provenance/coverage on upgrade while
+retaining compatible fitted coefficients for diagnostics. Twenty genuine fitting
+observations, refitting and three new independent holdouts are required before use, including for users who previously selected possible extra
 heat. No new polling, permanent listener, service, database or output path exists.

@@ -27,6 +27,7 @@ def exercise(
     external_possible=False,
     temperature_profile=None,
     episodes=4,
+    event_driven=False,
 ):
     sensor, states = _sensor()
     cfg = sensor._config_entry.options
@@ -63,14 +64,16 @@ def exercise(
     for minute in range(episodes * 720 + 1):
         now[0] = START + timedelta(minutes=minute)
         phase = minute % 720
-        actual = 23 - 0.005 * min(phase, 360) if phase < 360 else 23
+        actual = 23 - 0.008 * min(phase, 360) if phase < 360 else 23
         if temperature_profile is not None:
             actual = temperature_profile(minute, actual)
         for name in sources:
             if minute >= due[name]:
-                states[name].state = str(round(actual, 1))  # ordinary 0.1 C room sensor
-                states[name].last_reported = now[0]
-                count[name] += 1
+                value = str(round(actual, 1))
+                if not event_driven or value != states[name].state:
+                    states[name].state = value
+                    states[name].last_reported = now[0]
+                    count[name] += 1
                 due[name] += source_intervals[name] + (
                     (-1 if count[name] % 2 else 1) if jitter else 0
                 )
@@ -84,6 +87,24 @@ def exercise(
     return sensor, states, accepted, count
 
 
+def cold_step(sensor, states, monkeypatch, minute):
+    before = ControlReplayState.from_sensor(sensor)
+    at = START + timedelta(minutes=minute)
+    for key in ("indoor_temp_entity", "indoor_temp_entity_2", "indoor_temp_entity_3"):
+        entity = sensor._cfg().get(key)
+        if entity:
+            states[entity].state = "19.9"
+            states[entity].last_reported = at
+    from test_brake_provenance import _cycle
+
+    _cycle(sensor, monkeypatch, minute)
+    coverage = min(
+        sensor._adaptive_component_reports.values(), key=lambda value: value.timestamp()
+    )
+    inputs = replace(_input(sensor, at, indoor=19.9), temperature_report_time=coverage)
+    return before, inputs, sensor.state
+
+
 @pytest.mark.parametrize("interval", [1, 5, 10, 15])
 def test_quantized_reports_can_qualify_without_extra_telemetry(monkeypatch, interval):
     sensor, states, accepted, count = exercise(monkeypatch, interval)
@@ -93,25 +114,23 @@ def test_quantized_reports_can_qualify_without_extra_telemetry(monkeypatch, inte
     )
     assert len(accepted) <= count["sensor.indoor"]
     assert sensor._thermal_model.fit_rmse <= 0.3
-    # This model came from the real sparse-report controller chain, not injected k.
-    now = START + timedelta(minutes=4 * 720)
-    adaptive = ControlReplayState.from_sensor(sensor)
-    base = adaptive
-    report = sensor._adaptive_report
-    for minute in range(16):
-        at = now + timedelta(minutes=minute)
-        if minute % interval == 0:
-            report = at
-        inputs = replace(
-            _input(sensor, at, indoor=19.9), temperature_report_time=report
-        )
-        adaptive, changed = replay_control_step(adaptive, inputs)
-        base, unchanged = replay_control_step(
-            base, replace(inputs, cfg={**inputs.cfg, "adaptive_braking_enabled": False})
-        )
-    assert changed.attributes["adaptive_braking"]["state"] == "adapting"
-    assert changed.fake_temp < unchanged.fake_temp
-    assert changed.attributes["adaptive_braking"]["multiplier"] >= 0.75
+    # A real new changed value, not an unchanged report promoted to fresh data.
+    state, inputs, actual = cold_step(sensor, states, monkeypatch, 4 * 720 + 1)
+    _, adapted = replay_control_step(state, inputs)
+    _, base = replay_control_step(
+        state, replace(inputs, cfg={**inputs.cfg, "adaptive_braking_enabled": False})
+    )
+    assert round(adapted.fake_temp, 1) == actual
+    assert adapted.fake_temp < base.fake_temp
+    assert adapted.attributes["adaptive_braking"]["multiplier"] >= 0.75
+    # Continue the actual ramp: the correction must reach the 0.1 C output,
+    # not merely change an unrounded replay intermediate.
+    state, inputs, actual = cold_step(sensor, states, monkeypatch, 4 * 720 + 6)
+    _, adapted = replay_control_step(state, inputs)
+    _, base = replay_control_step(
+        state, replace(inputs, cfg={**inputs.cfg, "adaptive_braking_enabled": False})
+    )
+    assert actual == round(adapted.fake_temp, 1) < round(base.fake_temp, 1)
 
 
 @pytest.mark.parametrize("interval", [5, 10, 15])
@@ -125,12 +144,7 @@ def test_jitter_and_three_asynchronous_weighted_sensors(monkeypatch, interval):
     )
     # Each accepted aggregate requires fresh evidence from all contributors.
     assert len(accepted) <= min(count.values())
-    now = START + timedelta(minutes=4 * 720 + 1)
-    inputs = replace(
-        _input(sensor, now, indoor=19.9),
-        temperature_report_time=sensor._adaptive_report,
-    )
-    state = ControlReplayState.from_sensor(sensor)
+    state, inputs, actual = cold_step(sensor, states, monkeypatch, 4 * 720 + 1)
     _, adaptive = replay_control_step(state, inputs)
     _, base = replay_control_step(
         state, replace(inputs, cfg={**inputs.cfg, "adaptive_braking_enabled": False})
@@ -139,13 +153,18 @@ def test_jitter_and_three_asynchronous_weighted_sensors(monkeypatch, interval):
     assert adaptive.attributes["adaptive_braking"]["state"] == "adapting"
 
 
-def test_thirty_minute_series_remains_explicitly_underresolved(monkeypatch):
-    sensor, states, accepted, count = exercise(monkeypatch, 30)
-    assert sensor._adaptive_braking["reason"] == "report_interval_too_sparse"
-    assert sensor._adaptive_braking["multiplier"] == 1
-    assert (
-        sensor._thermal_model.adaptive_reason(START + timedelta(minutes=4 * 720), 16)
-        != "qualified"
+@pytest.mark.parametrize("jitter", [False, True])
+def test_thirty_minute_reports_can_validate_real_thirty_minute_outcomes(
+    monkeypatch, jitter
+):
+    sensor, states, accepted, count = exercise(
+        monkeypatch, 30, episodes=6, jitter=jitter
+    )
+    now = START + timedelta(minutes=6 * 720)
+    assert sensor._thermal_model.is_valid
+    assert sensor._thermal_model.adaptive_reason(now, 16) == "qualified"
+    assert all(
+        row[3] <= 45 for row in sensor._thermal_model.adaptive_snapshot()["validations"]
     )
 
 
@@ -179,11 +198,7 @@ def test_genuinely_mixed_five_ten_fifteen_minute_sources_learn_and_adapt(monkeyp
     assert len(accepted) <= min(count.values())
     assert sensor._thermal_model.adaptive_reason(now, 16) == "qualified"
     assert sensor._thermal_model.sample_count >= 20
-    inputs = replace(
-        _input(sensor, now, indoor=19.9),
-        temperature_report_time=sensor._adaptive_report,
-    )
-    state = ControlReplayState.from_sensor(sensor)
+    state, inputs, actual = cold_step(sensor, states, monkeypatch, 4 * 720 + 1)
     _, adapted = replay_control_step(state, inputs)
     _, base = replay_control_step(
         state, replace(inputs, cfg={**inputs.cfg, "adaptive_braking_enabled": False})
