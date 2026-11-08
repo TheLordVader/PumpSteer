@@ -23,12 +23,6 @@ consistency check; no separate version engine or automatic publication is added.
 
 ## Control map and existing contracts
 
-The latest production preflight verified `b273afc253ec1c102385fe6d9830024815151c64`
-against all 50 installed integration files. This corrects the earlier reported
-`76bf06d` reference. Always verify the actual installed files/settings again before
-a future deployment; a test reference alone does not identify a running version.
-Control-parity tests retain `b273afc` as their historical code reference. This
-hardening starts from `78b9807`.
 The following map describes the actual code, not a replacement controller.
 
 1. `sensor._do_update` obtains qualified indoor temperature (up to three normalized
@@ -135,7 +129,7 @@ blocks remaining writes and relay activation without clearing PI or ramp state.
 The next normal control cycle recalculates; there is no immediate double integration.
 If a first output was already accepted before the invalidation, it cannot be unsent.
 
-### Example source contract, not a proven Tallåsen installation
+### Example source contract requiring installation-specific verification
 
 [ebusds HTTP API](https://github.com/john30/ebusd/wiki/3.2.-HTTP-client) returns a
 per-message `lastup` and its values in a JSON object; [HA REST](https://www.home-assistant.io/integrations/rest/)
@@ -155,9 +149,8 @@ proof. A normal cache-reading GET avoids initiating bus polling; do not add
 `required`, `maxage` or `poll` merely to make data appear fresh. At startup a new
 qualified source timestamp is required, including when an adapter restores state.
 
-The observed Husdata/H66 signals have no verified per-observation timestamp, and
-their balance decoding remains unverified. Neither active limiter is currently
-established as usable with those signals; no H66 settings were changed.
+Signals lacking verified per-observation timestamps or calibrated decoding cannot
+qualify these active limiters.
 
 ## Rejected/unproven interventions
 
@@ -168,8 +161,7 @@ established as usable with those signals; no H66 settings were changed.
   cycling limiter is included without coverage and a verified beneficial replay.
 * Supply-minus-target and supply-minus-return remain temperature indications, not
   measured heat flow or COP. No model-based output or COP control was introduced.
-* Physical Husdata/1250 decoding remains unverified. The generic calibrated path
-  exists, but supplied production observations do not authorize its activation.
+* Unverified physical signal decoding cannot qualify the generic calibrated path.
   No vendor register identifier appears in generic configuration.
 
 ## Synthetic replay results
@@ -284,17 +276,6 @@ normal entity attributes. Older summaries without a configured signature wait
 for sufficient reports to match their known configured source variants; a genuinely
 changed composition relearns rather than remaining permanently paused. No new
 listener, polling, database, service, output path or model dependency is introduced.
-
-For a later Tallåsen installation GO: verify candidate file hashes, back up HA
-and preserve the actually installed integration/settings after verifying their
-commit and file hashes (latest preflight: `b273afc`), install only candidate
-integration files and perform the agreed Core restart. Verify normal SAFE recovery,
-PI/prices, ordinary Ohmigo output and Relay Guard before enabling this option.
-Then observe sample count, fit residual, three holdouts, gate reasons, brake factor,
-virtual outdoor command and room-temperature floor during actual price periods.
-Disable this option for immediate normal-operation selection (an existing correction
-ramps out); restore only the previous integration files/settings if rollback is
-needed. No production actions are part of local development.
 
 Replay changes demonstrate program behavior and bounded comfort protection, not
 measured energy, compressor-start, comfort or monetary improvements. Actual benefit

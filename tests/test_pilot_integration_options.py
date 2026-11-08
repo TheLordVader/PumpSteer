@@ -822,7 +822,7 @@ def test_calibrated_multi_signal_indication_does_not_become_pilot_heat(monkeypat
             attributes={"unit_of_measurement": unit},
         )
     _cycle(sensor, monkeypatch, 0)
-    # Explicit synthetic fixture: no claim that Tallåsen has these calibrated bands.
+    # Explicit synthetic fixture: these bands are not installation evidence.
     operation = sensor._heat_operation
     operation.samples = {"idle": [0.1] * 3, "heating": [1.2] * 3}
     operation.temperatures = {"supply": [35] * 3, "return": [30] * 3}
