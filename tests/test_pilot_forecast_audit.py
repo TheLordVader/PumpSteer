@@ -1,5 +1,6 @@
 """Only actually issued, causally qualified forecasts may enter error statistics."""
 
+import math
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 import pytest
@@ -272,3 +273,66 @@ def test_fixed_pending_is_dropped_by_safe_unload_or_disable():
 )
 def test_fixed_forecasts_match_thermal_model_k_limits(k, expected):
     assert ForecastAudit().issue_fixed(T, 21, 5, k, ("a", "b")) is expected
+
+
+def test_fixed_delayed_endpoint_uses_frozen_curve_at_actual_report_time():
+    audit = ForecastAudit()
+    audit.issue_fixed(T, 21, 5, 0.03, ("a", "b"))
+    at = T + timedelta(minutes=34)
+    audit.observe_fixed(at + timedelta(minutes=1), state(20.8, at), ("a", "b"))
+    row = audit.fixed_records[0]
+    assert row["predictions"][0] == pytest.approx(21 - .03 * 16 * 34 / 60)
+    assert row["predictions"][1] == pytest.approx(5 + 16 * math.exp(-.03 * 34 / 60))
+    assert row["predictions"][2] == 21
+
+
+def test_fixed_braking_interruption_cancels_pending_before_outcome():
+    from test_thermal_learning_confidence import _sensor, _START
+    sensor = _sensor()
+    sensor._config_entry.options = {"thermal_intelligence_enabled": True}
+    sensor._plan_audit.issue_fixed(_START, 21, 5, .03, ("a", "b"))
+    sensor._update_thermal_learning(active=False, reason="price_not_expensive",
+        now=_START + timedelta(minutes=20), indoor=21, outdoor=5)
+    sensor._plan_audit.observe_fixed(_START + timedelta(minutes=30),
+        state(20.8, _START + timedelta(minutes=30)), ("a", "b"))
+    assert not sensor._plan_audit.fixed_records
+    assert sensor._plan_audit.fixed_pending is None
+
+
+@pytest.mark.parametrize("interrupted", [False, True])
+def test_fixed_real_control_cycle_requires_continuous_braking(monkeypatch, interrupted):
+    from test_brake_provenance import _sensor, _cycle
+    sensor, states = _sensor()
+    states["sensor.indoor"].attributes["unit_of_measurement"] = "°C"
+    states["sensor.outdoor"].attributes["unit_of_measurement"] = "°C"
+    sensor._config_entry.options["thermal_intelligence_enabled"] = True
+    sensor._thermal_model.restore_k(.03)
+    saved = []
+    sensor._pilot_store = SimpleNamespace(async_delay_save=lambda callback, delay: saved.append(callback()))
+    current = [0]
+    async def prices(*args):
+        expensive = not (interrupted and 20 <= current[0] < 35)
+        return [10 if expensive else 1]*96, ["expensive" if expensive else "normal"]*96, 15, 0
+    monkeypatch.setattr(sensor, "_get_prices", prices)
+    for minute in range(51):
+        current[0] = minute
+        _cycle(sensor, monkeypatch, minute)
+    records = sensor._plan_audit.fixed_records
+    if interrupted:
+        assert not records
+    else:
+        assert len(records) == 1
+        assert records[0]["horizon"] == 30
+        assert saved[-1]["plan_audit"]["fixed_v1"] == records
+
+
+def test_fixed_legacy_evaluation_basis_is_not_restored_as_new_evidence():
+    audit = ForecastAudit()
+    audit.issue_fixed(T, 21, 5, .03, ("a", "b"))
+    at = T + timedelta(minutes=30)
+    audit.observe_fixed(at, state(20.8, at), ("a", "b"))
+    payload = audit.export_plan()
+    del payload["fixed_v1"][0]["evaluation_basis"]
+    restored = ForecastAudit()
+    restored.restore_plan(payload, at)
+    assert restored.fixed_records == []

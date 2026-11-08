@@ -338,7 +338,7 @@ def test_valid_temperatures_remain_visible_when_prices_missing(
     assert [e.available for e in entities] == [True, True]
 
 
-def test_fixed_audit_completes_in_control_cycle_and_uses_existing_store(temperatures):
+def test_fixed_audit_normal_control_cycle_discards_pending(temperatures):
     controller, states, clock, _, _ = temperatures
     controller._config_entry.options = {
         **controller._config_entry.options,
@@ -356,9 +356,9 @@ def test_fixed_audit_completes_in_control_cycle_and_uses_existing_store(temperat
     clock[0] += timedelta(minutes=60)
     _report(states, clock, unit_of_measurement="°C")
     asyncio.run(controller._do_update())
-    assert len(controller._plan_audit.fixed_records) == 1
-    assert controller._plan_audit.fixed_records[0]["horizon"] == 60
-    assert saved[-1]["plan_audit"]["fixed_v1"][0]["horizon"] == 60
+    assert controller._plan_audit.fixed_records == []
+    assert controller._plan_audit.fixed_pending is None
+    assert not saved or saved[-1]["plan_audit"]["fixed_v1"] == []
 
 
 @pytest.mark.parametrize("valid", [False, True, None])

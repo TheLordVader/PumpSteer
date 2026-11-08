@@ -158,6 +158,7 @@ class ForecastAudit:
         self.fixed_pending = {
             "issued": at,
             "identity": tuple(identity),
+            "curve": (indoor, delta, k),
             "predictions": {
                 h: [
                     indoor - k * delta * h / 60,
@@ -190,13 +191,21 @@ class ForecastAudit:
         for horizon in list(pending["predictions"]):
             due = pending["issued"] + timedelta(minutes=horizon)
             if reading and due <= reading[0] <= due + timedelta(minutes=5):
+                initial, delta, k = pending["curve"]
+                elapsed = (reading[0] - pending["issued"]).total_seconds() / 3600
+                pending["predictions"].pop(horizon)
                 self.fixed_records.append(
                     {
+                        "evaluation_basis": "actual_elapsed_braking_v2",
                         "issued": pending["issued"].isoformat(),
                         "observed": reading[0].isoformat(),
                         "horizon": horizon,
                         "identity": list(identity),
-                        "predictions": pending["predictions"].pop(horizon),
+                        "predictions": [
+                            initial - k * delta * elapsed,
+                            initial + delta * math.expm1(-k * elapsed),
+                            initial,
+                        ],
                         "actual": reading[1],
                     }
                 )
@@ -780,7 +789,8 @@ class ForecastAudit:
                 pred, actual = row.get("predictions"), row.get("actual")
                 identity = row.get("identity")
                 if (
-                    issued is None
+                    row.get("evaluation_basis") != "actual_elapsed_braking_v2"
+                    or issued is None
                     or observed is None
                     or h not in (30, 60, 120)
                     or not issued + timedelta(minutes=h)

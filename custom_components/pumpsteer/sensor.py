@@ -1240,6 +1240,7 @@ class PumpSteerSensor(RestoreEntity):
         adaptive = self._cfg().get("adaptive_braking_enabled") is True
         if adaptive and active:
             if self._thermal_model._external_disturbance:
+                self._plan_audit.fixed_pending = None
                 self._thermal_learning_active = False
                 self._thermal_learning_reason = (
                     self._thermal_model._external_disturbance
@@ -1255,6 +1256,7 @@ class PumpSteerSensor(RestoreEntity):
         self._thermal_learning_reason = reason
 
         if not active:
+            self._plan_audit.fixed_pending = None
             if self._thermal_model.validation_session_active:
                 self._thermal_model.end_validation_session(now, indoor)
             return
@@ -2499,20 +2501,6 @@ class PumpSteerSensor(RestoreEntity):
             "outdoor_active": identity[1],
             "physical_measurement_time": "unknown",
         }
-        if cfg.get("thermal_intelligence_enabled") is True:
-            try:
-                if indoor is None or outdoor is None:
-                    self._plan_audit.fixed_pending = None
-                else:
-                    self._plan_audit.observe_fixed(
-                        now,
-                        self._temperature_state(cfg, "indoor_temp_entity"),
-                        self._fixed_audit_identity(cfg),
-                    )
-                await self._save_pilot_store()
-            except Exception:
-                self._plan_audit.fixed_pending = None
-                _LOGGER.debug("Passive fixed-horizon audit unavailable", exc_info=True)
         self._input_temperatures = {
             "indoor_temperature": indoor,
             "outdoor_temperature": outdoor,
@@ -2674,6 +2662,20 @@ class PumpSteerSensor(RestoreEntity):
             interval_minutes=interval_minutes,
             preheat_dt_seconds=preheat_dt_seconds,
         )
+        if cfg.get("thermal_intelligence_enabled") is True:
+            try:
+                if indoor is None or outdoor is None:
+                    self._plan_audit.fixed_pending = None
+                else:
+                    self._plan_audit.observe_fixed(
+                        now,
+                        self._temperature_state(cfg, "indoor_temp_entity"),
+                        self._fixed_audit_identity(cfg),
+                    )
+                await self._save_pilot_store()
+            except Exception:
+                self._plan_audit.fixed_pending = None
+                _LOGGER.debug("Passive fixed-horizon audit unavailable", exc_info=True)
 
     def _control_event(self, event, **details):
         log_event(event, **details)
