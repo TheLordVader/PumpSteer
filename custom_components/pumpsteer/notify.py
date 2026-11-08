@@ -1,9 +1,22 @@
+import asyncio
 import logging
+import math
+from time import monotonic
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.event import async_track_state_change_event
+
+from .const import (
+    NOTIFICATION_COOLDOWN_CHOICES,
+    NOTIFICATION_COOLDOWN_OPTION,
+    NOTIFICATION_LEVEL_ALL,
+    NOTIFICATION_LEVEL_BRAKING_ONLY,
+    NOTIFICATION_LEVEL_OFF,
+    NOTIFICATION_LEVEL_OPTION,
+    NOTIFICATION_LEVELS,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -18,7 +31,7 @@ MODE_NOTIFICATIONS = {
     ),
     "preheating": (
         "🔥 Pre-heating started",
-        "Electricity is cheap — pre-heating now before prices rise.",
+        "Heating is being boosted ahead of an upcoming expensive period.",
     ),
 }
 
@@ -37,10 +50,50 @@ def _notifications_enabled(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     return state.state == "on"
 
 
+def _notification_level(entry: ConfigEntry) -> str:
+    """Return the configured price-alert level, preserving legacy defaults."""
+    cfg = {**entry.data, **entry.options}
+    level = cfg.get(NOTIFICATION_LEVEL_OPTION, NOTIFICATION_LEVEL_ALL)
+    return (
+        level
+        if isinstance(level, str) and level in NOTIFICATION_LEVELS
+        else NOTIFICATION_LEVEL_ALL
+    )
+
+
+def _notification_cooldown_minutes(entry: ConfigEntry) -> int:
+    """Validate the configured same-mode repeat interval (zero = no limit)."""
+    cfg = {**entry.data, **entry.options}
+    raw = cfg.get(NOTIFICATION_COOLDOWN_OPTION, 0)
+    try:
+        minutes = int(raw)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    return minutes if minutes in NOTIFICATION_COOLDOWN_CHOICES else 0
+
+
 def _get_main_sensor_entity_id(hass: HomeAssistant, entry: ConfigEntry) -> str | None:
     """Resolve the entity_id of the main PumpSteer sensor for this config entry."""
     registry = er.async_get(hass)
     return registry.async_get_entity_id("sensor", DOMAIN, entry.entry_id)
+
+
+def _notification_content(mode: str, state) -> tuple[str, str]:
+    """Build notification content from the state that triggered the transition."""
+    title, message = MODE_NOTIFICATIONS[mode]
+
+    raw_price = state.attributes.get("current_price")
+    try:
+        price = float(raw_price)
+    except (TypeError, ValueError):
+        return title, message
+
+    if not math.isfinite(price):
+        return title, message
+
+    unit = state.attributes.get("current_price_unit")
+    unit_suffix = f" {unit.strip()}" if isinstance(unit, str) and unit.strip() else ""
+    return title, f"{message}\nCurrent price: {price:.2f}{unit_suffix}"
 
 
 @callback
@@ -53,6 +106,7 @@ def async_setup_notifications(hass: HomeAssistant, entry: ConfigEntry):
         main_entity_id = "sensor.pumpsteer"
 
     _LOGGER.debug("PumpSteer notifications watching: %s", main_entity_id)
+    last_sent_by_mode: dict[str, float] = {}
 
     @callback
     def _on_state_change(event):
@@ -77,7 +131,37 @@ def async_setup_notifications(hass: HomeAssistant, entry: ConfigEntry):
             )
             return
 
-        title, message = MODE_NOTIFICATIONS[new_mode]
+        level = _notification_level(entry)
+        if level == NOTIFICATION_LEVEL_OFF or (
+            level == NOTIFICATION_LEVEL_BRAKING_ONLY and new_mode != "braking"
+        ):
+            _LOGGER.debug(
+                "PumpSteer price notification filtered: mode=%s level=%s",
+                new_mode,
+                level,
+            )
+            return
+
+        # A preheating notification must not silence the first braking alert.
+        # Monotonic time survives DST changes, while counters intentionally
+        # reset after an integration reload or a Home Assistant restart.
+        now = monotonic()
+        cooldown_seconds = _notification_cooldown_minutes(entry) * 60
+        last_sent = last_sent_by_mode.get(new_mode)
+        if (
+            cooldown_seconds > 0
+            and last_sent is not None
+            and now - last_sent < cooldown_seconds
+        ):
+            _LOGGER.debug(
+                "PumpSteer notification in cooldown: mode=%s remaining=%.0fs",
+                new_mode,
+                cooldown_seconds - (now - last_sent),
+            )
+            return
+
+        title, message = _notification_content(new_mode, new_state)
+        last_sent_by_mode[new_mode] = now
         hass.async_create_task(
             async_send_notification(hass, entry, title, message, "pumpsteer_price")
         )
@@ -92,17 +176,25 @@ async def async_send_notification(
     title: str,
     message: str,
     notification_id: str = "pumpsteer",
-) -> None:
+    *,
+    confirmed: bool = False,
+    persistent_existing: bool = False,
+) -> str:
     """Send via notify_service (from options), or fall back to persistent_notification."""
     service = {**entry.data, **entry.options}.get("notify_service", "")
 
     if service:
         domain, svc = service.split(".", 1) if "." in service else ("notify", service)
         try:
-            await hass.services.async_call(
-                domain, svc, {"title": title, "message": message}
-            )
-            return
+            async with asyncio.timeout(20):
+                await hass.services.async_call(
+                    domain,
+                    svc,
+                    {"title": title, "message": message},
+                    **({"blocking": True} if confirmed else {}),
+                )
+            if not persistent_existing:
+                return "mobile"
         except Exception as err:
             _LOGGER.warning(
                 "PumpSteer notify failed (%s), using persistent_notification: %s",
@@ -114,4 +206,23 @@ async def async_send_notification(
         "persistent_notification",
         "create",
         {"title": title, "message": message, "notification_id": notification_id},
+        **({"blocking": True} if confirmed else {}),
+    )
+
+    return "persistent"
+
+
+def heatpump_alarm_message(hass, event):
+    """Localize safety alerts independently of price notification preferences."""
+    language = getattr(getattr(hass, "config", None), "language", "sv")
+    if language in ("sv", "se"):
+        return (
+            "Värmepumpen rapporterar ett aktivt fellarm."
+            if event == "alarm"
+            else "Värmepumpens fellarm har återgått."
+        )
+    return (
+        "The heat pump reports an active fault."
+        if event == "alarm"
+        else "The heat pump fault has cleared."
     )

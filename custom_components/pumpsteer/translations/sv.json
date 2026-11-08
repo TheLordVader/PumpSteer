@@ -1,0 +1,464 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "PumpSteer – inställningar",
+        "data": {
+          "indoor_temp_entity": "Inomhustemperatursensor",
+          "real_outdoor_entity": "Utomhustemperatursensor",
+          "electricity_price_entity": "Elprisensor"
+        }
+      }
+    },
+    "error": {
+      "required": "Det här fältet är obligatoriskt",
+      "entity_not_found": "Entiteten hittades inte",
+      "entity_unavailable": "Entiteten är otillgänglig",
+      "unknown": "Ett okänt fel uppstod"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "PumpSteer",
+        "menu_options": {
+          "basic": "Grundinställningar",
+          "thermal": "Thermal Intelligence",
+          "telemetry": "Avancerade givare",
+          "notifications": "Notiser",
+          "ohmigo": "Ohmigo och säkerhet",
+          "zones": "Extra temperaturzoner"
+        }
+      },
+      "basic": {
+        "title": "Grundinställningar",
+        "menu_options": {
+          "basic_settings": "Inne, ute och elpris",
+          "temperature_sources": "Fler temperaturgivare",
+          "report_age": "Rapportålder – avancerat"
+        },
+        "description": "Välj grundläggande styrgivare eller frivilliga avancerade givare."
+      },
+      "thermal": {
+        "title": "Thermal Intelligence",
+        "data": {
+          "thermal_intelligence_enabled": "Thermal Intelligence (experimentell diagnostik)",
+          "external_heat_sources": "Använder du ibland en extra värmekälla?",
+          "adaptive_braking_enabled": "Adaptiv prisbromsning"
+        },
+        "data_description": {
+          "thermal_intelligence_enabled": "Samlar passivt kvalificerade observationer om en verifierad värmesignal väljs. Påverkar inte värmestyrningen.",
+          "external_heat_sources": "Ja betyder att extra värme ibland kan förekomma, inte att den är på nu. Adaptiv bromsning kan lära från stabil temperaturrespons, förkastar tydligt störda perioder och kräver senare oberoende kontroller. Oupptäckt extra värme är fortfarande en möjlig felkälla; inget värmeflöde mäts.",
+          "adaptive_braking_enabled": "Lär husets observerade temperaturrespons med dina vanliga inne- och utegivare. Efter minst tre kontroller av senare temperaturutfall kan prisbromsningen minskas försiktigt nära komfortgränsen. Avstängd vid uppgradering. Osäkra eller gamla data ger grundreglering; inga extra värmepumpsgivare krävs. Visar inte uppmätta energibesparingar. Upprepade oförändrade rapporter ger inga nya inlärningsobservationer. Glesa eller för små temperaturförändringar kan behålla grundregleringen."
+        },
+        "description": "Passiv analys och frivillig adaptiv prisbromsning är separata val. Adaptiv bromsning använder observerad temperaturrespons, inte antagen värmeeffekt. Mer avancerad verifierad modellinlärning kräver tillförlitliga värmesignaler."
+      },
+      "telemetry": {
+        "title": "Avancerade givare",
+        "menu_options": {
+          "heat_sensors": "Analysmetod och huvudgivare",
+          "energy": "El- och energimätning",
+          "heat_details": "Fler givare för värme",
+          "heat_pump_telemetry": "Passiv värmepumpsdiagnostik",
+          "extended_control": "Utökad – frivillig styrbegränsning",
+          "advanced_control": "Avancerad – verifierad värmebalans"
+        },
+        "description": "Bas använder temperatur och pris utan extra givare. Utökad och Avancerad kan begränsa befintlig styrning först när respektive funktion uttryckligen aktiveras. Att välja en givare aktiverar aldrig ett styringrepp."
+      },
+      "notifications": {
+        "title": "Notiser",
+        "data": {
+          "notify_service": "Notifieringstjänst (valfri, t.ex. notify.mobile_app_min_telefon)",
+          "notification_level": "Prisnotiser",
+          "notification_cooldown_minutes": "Spärrtid för upprepade prisnotiser"
+        },
+        "data_description": {
+          "notify_service": "Lämna tomt för att använda beständiga notifieringar i HA:s sidofält istället.",
+          "notification_level": "Välj alla prisnotiser, endast bromsning eller inga. Den befintliga notisbrytaren är fortfarande huvudbrytare.",
+          "notification_cooldown_minutes": "Minsta tid mellan två notiser av samma typ. Välj 0 för ingen spärr; 60 minuter rekommenderas. Bromsning och förvärmning har separata spärrtider."
+        },
+        "description": "Ordinarie pris- och styrnotiser använder denna mottagare, nivå och upprepningsspärr. Zonlarm har en egen gemensam mottagare under Extra temperaturzoner."
+      },
+      "ohmigo": {
+        "title": "Ohmigo och säkerhet",
+        "menu_options": {
+          "ohmigo_settings": "Ohmigo och relä",
+          "generic_output": "Generisk utgång – avancerat"
+        },
+        "description": "Välj Ohmigo eller frivillig generisk utgång."
+      },
+      "zones": {
+        "title": "Extra temperaturzoner",
+        "description": "Välj en zon. Den övervakar rumstemperatur och trend och kan vid tillräckligt underlag uppmärksamma misstänkt värmebrist. Zonerna styr inte värmen.",
+        "menu_options": {
+          "zone_1": "Zon 1",
+          "zone_2": "Zon 2",
+          "zone_3": "Zon 3",
+          "zone_4": "Zon 4",
+          "zone_notifications": "Gemensam zonmottagare"
+        }
+      },
+      "temperature_sources": {
+        "title": "Fler temperaturgivare",
+        "description": "Valfritt. Vikterna räknas om till andelar automatiskt. Saknas en innegivare räknas medelvärdet om med de tillgängliga givarna. Reservutegivaren används om primärgivaren inte kan användas. Dessa val påverkar styrningen.",
+        "data": {
+          "indoor_temp_entity_2": "Innegivare 2 (valfri)",
+          "indoor_temp_entity_3": "Innegivare 3 (valfri)",
+          "outdoor_temp_entity_2": "Reservutegivare (valfri)",
+          "indoor_temp_weight_1": "Vikt för primär innegivare (från grundsidan)",
+          "indoor_temp_weight_2": "Vikt för innegivare 2",
+          "indoor_temp_weight_3": "Vikt för innegivare 3"
+        },
+        "data_description": {}
+      },
+      "report_age": {
+        "title": "Rapportålder – avancerat",
+        "description": "Standardvärdena passar de flesta. En för kort gräns kan göra att en fungerande givare underkänns och styrningen går till säkert läge. HA:s rapporttid bevisar inte fysisk mättid.",
+        "data": {
+          "outdoor_temperature_report_max_age_minutes": "Högsta rapportålder för utetemperatur (minuter)",
+          "temperature_report_max_age_minutes": "Högsta rapportålder för innetemperatur (minuter)"
+        },
+        "data_description": {
+          "outdoor_temperature_report_max_age_minutes": "Standard 120 minuter, baserat på observerade rapportluckor. Anpassa till dina utegivare. HA-rapporttid är inte bevis på fysisk mättid.",
+          "temperature_report_max_age_minutes": "Standardvärdet är 360 minuter, baserat på observerade rapportintervall. Anpassa gränsen till dina givares observerade intervall. HA-rapporttid visar inte säkert när en fysisk mätning gjordes."
+        }
+      },
+      "energy": {
+        "title": "El- och energimätning",
+        "description": "Valfritt och endast övervakning. Elektrisk effekt eller kompressordrift bevisar inte levererad radiatorvärme. Lämna tomt om mätare saknas.",
+        "data": {
+          "thermal_power_entity": "Värmepumpens eleffekt (valfri)",
+          "thermal_energy_entities": "Ackumulerande energimätare (valfria)"
+        },
+        "data_description": {
+          "thermal_power_entity": "Uppmätt eleffekt för den utrustning som ska analyseras. Energi skattas från HA-rapporter; det är inte levererad värme.",
+          "thermal_energy_entities": "Välj en totalmätare eller oberoende mätare som kan summeras. När mätare väljs används de för energidiagnostiken. Endast hela räknarintervall med ett entydigt pris prissätts. Rapportluckor över 24 timmar utesluts."
+        }
+      },
+      "generic_output": {
+        "title": "Generisk utgång – avancerat",
+        "description": "Valfritt för särskilda installationer. En tjänst och mall kan styra en extern utgång. Lämna tomt om den inte används.",
+        "data": {
+          "modbus_service": "Generisk utgångstjänst",
+          "modbus_payload_template": "Mall för generisk utgångspayload",
+          "modbus_interval_minutes": "Intervall för generisk utgång"
+        },
+        "data_description": {
+          "modbus_service": "Home Assistant-tjänsten som ska anropas, till exempel modbus.write_register, mqtt.publish eller input_number.set_value.",
+          "modbus_payload_template": "YAML-mall för tjänsteanropets payload. Mallen kan använda variabeln fake_temp.",
+          "modbus_interval_minutes": "Minsta tid mellan anrop från Generic Output System."
+        }
+      },
+      "zone_1": {
+        "title": "Zon 1",
+        "description": "Endast övervakning, även när larm är på. Zonen ändrar inte termostatens börvärde eller ventilöppning och styr inte den centrala värmeproduktionen. En kall zon påverkar inte den gemensamma PI-regulatorn.",
+        "data": {
+          "zone_1_name": "Zon 1 – namn",
+          "zone_1_entity": "Zon 1 – temperaturgivare",
+          "zone_1_enabled": "Zon 1 – larm aktiverat",
+          "zone_1_profile": "Zon 1 – Driftprofil",
+          "zone_1_threshold": "Zon 1 – Gräns för underhållsvärme",
+          "zone_1_comfort_threshold": "Zon 1 – Komfortgräns",
+          "zone_1_climate": "Zon 1 – Termostat (valfri)",
+          "zone_1_notify_service": "Zon 1 – Notifikationstjänst",
+          "zone_1_alarm_delay_minutes": "Zon 1 – Larmfördröjning (minuter)"
+        },
+        "data_description": {
+          "zone_1_name": "Namnet visas i diagnostik och zonnotiser.",
+          "zone_1_entity": "Välj en rumstemperaturgivare i °C. En givare nära radiatorn kan visa en annan temperatur än rummet.",
+          "zone_1_enabled": "Av som standard. När larm är aktiverat kan zonen ge larm vid låg temperatur, förvarning, misstänkt värmebrist och givarfel. Temperaturen övervakas även med larm av.",
+          "zone_1_profile": "Välj manuellt vilken av zonens två temperaturgränser som används.",
+          "zone_1_threshold": "Temperaturgräns för profilen Underhållsvärme. Standard är 5 °C. Används endast när profilen är vald.",
+          "zone_1_comfort_threshold": "Temperaturgräns för profilen Komfort. Standard är 18 °C. Används endast när profilen är vald.",
+          "zone_1_climate": "Valfri och endast för avläsning. Utan termostat fungerar temperaturövervakningen fortfarande, men termostatdiagnostik och analys av värmebrist begränsas. Termostatens börvärde är inte zonens larmgräns.",
+          "zone_1_notify_service": "Valfritt undantag. Tomt använder den gemensamma zonmottagaren; saknas även den skickas ingen push.",
+          "zone_1_alarm_delay_minutes": "Standard 15 minuter, valbart 1–240 minuter. Lågtemperaturlarm kräver minst två separata rapporter under gränsen som sträcker sig över fördröjningen. Övriga larm har egna underlagskrav."
+        }
+      },
+      "zone_2": {
+        "title": "Zon 2",
+        "description": "Endast övervakning, även när larm är på. Zonen ändrar inte termostatens börvärde eller ventilöppning och styr inte den centrala värmeproduktionen. En kall zon påverkar inte den gemensamma PI-regulatorn.",
+        "data": {
+          "zone_2_name": "Zon 2 – namn",
+          "zone_2_entity": "Zon 2 – temperaturgivare",
+          "zone_2_enabled": "Zon 2 – larm aktiverat",
+          "zone_2_profile": "Zon 2 – Driftprofil",
+          "zone_2_threshold": "Zon 2 – Gräns för underhållsvärme",
+          "zone_2_comfort_threshold": "Zon 2 – Komfortgräns",
+          "zone_2_climate": "Zon 2 – Termostat (valfri)",
+          "zone_2_notify_service": "Zon 2 – Notifikationstjänst",
+          "zone_2_alarm_delay_minutes": "Zon 2 – Larmfördröjning (minuter)"
+        },
+        "data_description": {
+          "zone_2_name": "Namnet visas i diagnostik och zonnotiser.",
+          "zone_2_entity": "Välj en rumstemperaturgivare i °C. En givare nära radiatorn kan visa en annan temperatur än rummet.",
+          "zone_2_enabled": "Av som standard. När larm är aktiverat kan zonen ge larm vid låg temperatur, förvarning, misstänkt värmebrist och givarfel. Temperaturen övervakas även med larm av.",
+          "zone_2_profile": "Välj manuellt vilken av zonens två temperaturgränser som används.",
+          "zone_2_threshold": "Temperaturgräns för profilen Underhållsvärme. Standard är 5 °C. Används endast när profilen är vald.",
+          "zone_2_comfort_threshold": "Temperaturgräns för profilen Komfort. Standard är 18 °C. Används endast när profilen är vald.",
+          "zone_2_climate": "Valfri och endast för avläsning. Utan termostat fungerar temperaturövervakningen fortfarande, men termostatdiagnostik och analys av värmebrist begränsas. Termostatens börvärde är inte zonens larmgräns.",
+          "zone_2_notify_service": "Valfritt undantag. Tomt använder den gemensamma zonmottagaren; saknas även den skickas ingen push.",
+          "zone_2_alarm_delay_minutes": "Standard 15 minuter, valbart 1–240 minuter. Lågtemperaturlarm kräver minst två separata rapporter under gränsen som sträcker sig över fördröjningen. Övriga larm har egna underlagskrav."
+        }
+      },
+      "zone_3": {
+        "title": "Zon 3",
+        "description": "Endast övervakning, även när larm är på. Zonen ändrar inte termostatens börvärde eller ventilöppning och styr inte den centrala värmeproduktionen. En kall zon påverkar inte den gemensamma PI-regulatorn.",
+        "data": {
+          "zone_3_name": "Zon 3 – namn",
+          "zone_3_entity": "Zon 3 – temperaturgivare",
+          "zone_3_enabled": "Zon 3 – larm aktiverat",
+          "zone_3_profile": "Zon 3 – Driftprofil",
+          "zone_3_threshold": "Zon 3 – Gräns för underhållsvärme",
+          "zone_3_comfort_threshold": "Zon 3 – Komfortgräns",
+          "zone_3_climate": "Zon 3 – Termostat (valfri)",
+          "zone_3_notify_service": "Zon 3 – Notifikationstjänst",
+          "zone_3_alarm_delay_minutes": "Zon 3 – Larmfördröjning (minuter)"
+        },
+        "data_description": {
+          "zone_3_name": "Namnet visas i diagnostik och zonnotiser.",
+          "zone_3_entity": "Välj en rumstemperaturgivare i °C. En givare nära radiatorn kan visa en annan temperatur än rummet.",
+          "zone_3_enabled": "Av som standard. När larm är aktiverat kan zonen ge larm vid låg temperatur, förvarning, misstänkt värmebrist och givarfel. Temperaturen övervakas även med larm av.",
+          "zone_3_profile": "Välj manuellt vilken av zonens två temperaturgränser som används.",
+          "zone_3_threshold": "Temperaturgräns för profilen Underhållsvärme. Standard är 5 °C. Används endast när profilen är vald.",
+          "zone_3_comfort_threshold": "Temperaturgräns för profilen Komfort. Standard är 18 °C. Används endast när profilen är vald.",
+          "zone_3_climate": "Valfri och endast för avläsning. Utan termostat fungerar temperaturövervakningen fortfarande, men termostatdiagnostik och analys av värmebrist begränsas. Termostatens börvärde är inte zonens larmgräns.",
+          "zone_3_notify_service": "Valfritt undantag. Tomt använder den gemensamma zonmottagaren; saknas även den skickas ingen push.",
+          "zone_3_alarm_delay_minutes": "Standard 15 minuter, valbart 1–240 minuter. Lågtemperaturlarm kräver minst två separata rapporter under gränsen som sträcker sig över fördröjningen. Övriga larm har egna underlagskrav."
+        }
+      },
+      "zone_4": {
+        "title": "Zon 4",
+        "description": "Endast övervakning, även när larm är på. Zonen ändrar inte termostatens börvärde eller ventilöppning och styr inte den centrala värmeproduktionen. En kall zon påverkar inte den gemensamma PI-regulatorn.",
+        "data": {
+          "zone_4_name": "Zon 4 – namn",
+          "zone_4_entity": "Zon 4 – temperaturgivare",
+          "zone_4_enabled": "Zon 4 – larm aktiverat",
+          "zone_4_profile": "Zon 4 – Driftprofil",
+          "zone_4_threshold": "Zon 4 – Gräns för underhållsvärme",
+          "zone_4_comfort_threshold": "Zon 4 – Komfortgräns",
+          "zone_4_climate": "Zon 4 – Termostat (valfri)",
+          "zone_4_notify_service": "Zon 4 – Notifikationstjänst",
+          "zone_4_alarm_delay_minutes": "Zon 4 – Larmfördröjning (minuter)"
+        },
+        "data_description": {
+          "zone_4_name": "Namnet visas i diagnostik och zonnotiser.",
+          "zone_4_entity": "Välj en rumstemperaturgivare i °C. En givare nära radiatorn kan visa en annan temperatur än rummet.",
+          "zone_4_enabled": "Av som standard. När larm är aktiverat kan zonen ge larm vid låg temperatur, förvarning, misstänkt värmebrist och givarfel. Temperaturen övervakas även med larm av.",
+          "zone_4_profile": "Välj manuellt vilken av zonens två temperaturgränser som används.",
+          "zone_4_threshold": "Temperaturgräns för profilen Underhållsvärme. Standard är 5 °C. Används endast när profilen är vald.",
+          "zone_4_comfort_threshold": "Temperaturgräns för profilen Komfort. Standard är 18 °C. Används endast när profilen är vald.",
+          "zone_4_climate": "Valfri och endast för avläsning. Utan termostat fungerar temperaturövervakningen fortfarande, men termostatdiagnostik och analys av värmebrist begränsas. Termostatens börvärde är inte zonens larmgräns.",
+          "zone_4_notify_service": "Valfritt undantag. Tomt använder den gemensamma zonmottagaren; saknas även den skickas ingen push.",
+          "zone_4_alarm_delay_minutes": "Standard 15 minuter, valbart 1–240 minuter. Lågtemperaturlarm kräver minst två separata rapporter under gränsen som sträcker sig över fördröjningen. Övriga larm har egna underlagskrav."
+        }
+      },
+      "zone_notifications": {
+        "title": "Gemensam zonmottagare",
+        "description": "Används för zonlarm och återhämtning när zonen inte har en egen mottagare. Lämna tomt för att avstå push; zonlarm visas fortfarande i diagnostiken. Detta är separat från ordinarie prisnotiser.",
+        "data": {
+          "zone_notify_service": "Notifikationstjänst (notify.namn)"
+        }
+      },
+      "basic_settings": {
+        "title": "Grundinställningar",
+        "data": {
+          "indoor_temp_entity": "Inomhustemperatursensor",
+          "real_outdoor_entity": "Utomhustemperatursensor",
+          "electricity_price_entity": "Elprisensor (idag)",
+          "price_tomorrow_entity": "Elprisensor (imorgon)",
+          "pid_kp": "Temperaturrespons (Kp)",
+          "pid_ki": "Långsiktig korrigering (Ki)",
+          "pid_kd": "Dämpning vid snabba förändringar (Kd)",
+          "pid_integral_clamp": "Gräns för långsiktig korrigering",
+          "pid_output_clamp": "Maximal temperaturregel",
+          "preheat_boost_enabled": "Aktivera förvärmning"
+        },
+        "data_description": {
+          "pid_kp": "Hur kraftigt PumpSteer reagerar på aktuell temperaturdifferens. Typiskt intervall: 2,0 till 5,0.",
+          "pid_ki": "Hur mycket PumpSteer korrigerar långsiktig drift. Typiskt intervall: 0,01 till 0,05.",
+          "pid_kd": "Hur mycket PumpSteer reagerar på snabba temperaturförändringar. Håll på 0,0 om du inte trimmar det medvetet.",
+          "pid_integral_clamp": "Begränsar uppbyggd långsiktig korrigering för att minska windup. Typiskt intervall: 5,0 till 10,0.",
+          "pid_output_clamp": "Begränsar hur många grader PumpSteer maximalt justerar börvärdet.",
+          "preheat_boost_enabled": "När aktiverad värmer PumpSteer extra inför dyra perioder för att bygga upp termisk massa."
+        },
+        "description": "Välj en inne- och en utegivare samt elprissensorer. Dessa värden används av värmestyrningen. Fler givare är frivilliga."
+      },
+      "heat_sensors": {
+        "title": "Avancerade givare",
+        "data": {
+          "thermal_heat_activity_entity": "Verifierad värmetillförsel till huset (valfri)",
+          "thermal_supply_temp_entity": "Framledning till radiatorer (valfri)",
+          "thermal_supply_threshold": "Framledningens indikationströskel",
+          "thermal_detection_method": "Metod för värmedetektering",
+          "thermal_heating_mode_entity": "Verifierat radiatorvärmeläge (valfri)",
+          "thermal_heating_mode_inverted": "Radiatorläge motsvarar av"
+        },
+        "data_description": {
+          "thermal_heat_activity_entity": "En binär sensor där på betyder uppmätt värmetillförsel till huset och av betyder ingen. Kompressorstatus eller varmvattenläge räcker inte. Rapporttider bevisar inte fysisk mättid.",
+          "thermal_supply_temp_entity": "Välj en givare för radiatorkretsen. Den kan avläsas passivt utan radiatorläge. Temperaturen bevisar inte levererad värme.",
+          "thermal_supply_threshold": "Anpassa till värmesystemet. Fel tröskel kan ge felaktig värmeindikation.",
+          "thermal_detection_method": "Automatisk använder kvalificerade signaler och visar osäkerhet. Manuell behåller tröskeln.",
+          "thermal_heating_mode_entity": "Verifierat radiatorläge krävs för den manuella framledningsindikatorn, men inte för passiv temperaturavläsning.",
+          "thermal_heating_mode_inverted": "Aktivera endast om av betyder radiatorläge. Okänd eller gammal status stoppar inlärning."
+        },
+        "description": "Valfri övervakning. Automatic använder tillgängliga indikationer; Manual använder vald framledningsgivare och tröskel; Verified kräver en tillförlitlig binär värmesignal. Kompressor och elförbrukning bevisar inte radiatorvärme. Valen aktiverar ingen styrning."
+      },
+      "ohmigo_settings": {
+        "title": "Ohmigo och säkerhet",
+        "data": {
+          "ohmigo_entity": "Ohmigo-entitet (valfri)",
+          "ohmigo_interval_minutes": "Ohmigo push-intervall",
+          "ohmigo_relay_entity": "Ohmigo Active/Bypass-relä (valfritt)"
+        },
+        "data_description": {
+          "ohmigo_entity": "PumpSteer skickar den virtuella utetemperaturen till den här entiteten efter varje uppdatering. Lämna tomt för att inaktivera. Slå av/på utan att konfigurera om via brytaren 'Ohmigo Push'.",
+          "ohmigo_interval_minutes": "Minsta tid mellan push-uppdateringar till Ohmigo. Standard 5 minuter. Förändringar under 0,2 °C behandlas som oförändrade, men aktuellt börvärde skickas på nytt när intervallet löpt ut för att hålla Ohmigos watchdog aktiv.",
+          "ohmigo_relay_entity": "Valfri switch-entitet för Ohmigos Active/Bypass-relä. När den är konfigurerad skapar PumpSteer en separat Relay Guard-brytare. Skyddet återställer bara ett uttryckligt OFF-läge när Ohmigo Push är på; unknown eller unavailable skickar aldrig något reläkommando."
+        },
+        "description": "Ohmigo Push skickar temperaturutgången till enheten. Reläet är den fysiska utgången; Relay Guard övervakar dess säkra återgång. Dessa val påverkar faktisk styrning."
+      },
+      "heat_details": {
+        "title": "Fler givare för värme",
+        "description": "Valfritt för djupare passiv analys. Kompressordrift eller elförbrukning bevisar inte radiatorvärme. Lämna fälten tomma om givare saknas.",
+        "data": {
+          "thermal_hot_water_mode_entity": "Verifierat varmvattenläge (valfritt)",
+          "thermal_compressor_entity": "Kompressorstatus (valfri)",
+          "thermal_return_temp_entity": "Returtemperatur (valfri)",
+          "thermal_external_heat_entity": "Verifierad drift för extra värmekälla (frivilligt)"
+        },
+        "data_description": {
+          "thermal_hot_water_mode_entity": "På betyder verifierad varmvattenproduktion. Värmeinlärning pausas vid på eller okänt läge; okända perioder klassas inte.",
+          "thermal_compressor_entity": "Kompressorstatus ensam bevisar inte radiatorvärme.",
+          "thermal_return_temp_entity": "Används endast tillsammans med andra kvalificerade signaler.",
+          "thermal_external_heat_entity": "Lämna tomt utan en tillförlitlig signal. På ska betyda att den extra värmekällan faktiskt är aktiv, inte värmepumpens kompressor eller termostatens värmebegäran. Kräver en dokumenterat verifierad källtid i tidsattributet för styrsignaler (standard measurement_time), högst fem minuter gammal. HA-rapporttid eller återpublicerad MQTT-data räcker inte. Aktiv eller okänd vald signal pausar adaptiv användning och kräver nya kontroller; temperaturövervakning fungerar utan signalen."
+        }
+      },
+      "heat_pump_telemetry": {
+        "title": "Passiv värmepumpsdiagnostik",
+        "description": "Alla givare är frivilliga. Valen här ger diagnostik och eventuella fellarm. Aktiv styrpåverkan kräver separat aktivering under Utökad eller Avancerad. Kompressor, framledning, retur och varmvatten väljs på övriga givarsidor.",
+        "data": {
+          "thermal_balance_entity": "Intern värmebalans",
+          "thermal_balance_kind": "Typ av värmebalans",
+          "thermal_supply_target_entity": "Framledningens börvärde",
+          "thermal_brine_pump_entity": "Köldbärarpump",
+          "thermal_circulation_pump_entity": "Radiatorernas cirkulationspump",
+          "thermal_brine_in_entity": "Köldbärare in",
+          "thermal_brine_out_entity": "Köldbärare ut",
+          "thermal_aux_heat_entity": "Eltillskott",
+          "thermal_alarm_entity": "Aktivt värmepumpslarm",
+          "thermal_alarm_numeric_normal": "Normalt värde för numeriskt larm",
+          "thermal_alarm_numeric_verified": "Jag har verifierat det numeriska larmets betydelse"
+        },
+        "data_description": {
+          "thermal_balance_entity": "Välj en numerisk givare om värdet finns. Ingen skalning eller teckentolkning antas.",
+          "thermal_balance_kind": "Välj gradminuter eller integral endast när betydelsen är verifierad; annars välj rått värde. Ingen startgräns antas.",
+          "thermal_supply_target_entity": "Värmepumpens begärda framledningstemperatur, inte en rumstemperatur eller larmgräns.",
+          "thermal_brine_pump_entity": "Binär status för köldbärarpumpen. Anger inte ensam värmeleverans.",
+          "thermal_circulation_pump_entity": "Binär status för radiatorernas cirkulationspump. Anger inte ensam värmeleverans.",
+          "thermal_brine_in_entity": "Temperaturgivare för inkommande köldbärare.",
+          "thermal_brine_out_entity": "Temperaturgivare för utgående köldbärare.",
+          "thermal_aux_heat_entity": "Binär signal för aktivt eltillskott.",
+          "thermal_alarm_entity": "Välj binär eller numerisk fellarmssignal. Numerisk signal är avstängd tills du verifierat normalvärdet och att alla andra ändliga värden betyder aktivt fellarm. Notiser använder ordinarie mottagare eller beständig HA-notis.",
+          "thermal_alarm_numeric_normal": "Endast för numerisk givare: ange ett verifierat normalt värde, exempelvis 0 bara om din värmepumps dokumentation bekräftar det. Tomt ger okänt larmtillstånd.",
+          "thermal_alarm_numeric_verified": "Endast för numerisk givare: bekräfta att det angivna värdet är normalt och att alla andra ändliga värden betyder aktivt fellarm. Ändrad givare eller normalt värde kräver ny bekräftelse."
+        }
+      },
+      "extended_control": {
+        "title": "Utökad styrning",
+        "description": "Bas gäller när begränsaren är avstängd. Den kräver verifierade signaler för kompressor, radiatorläge, varmvattenläge och eltillskott. Kompressor och radiatorläge ska vara på och varmvatten av; en vald köldbärarpump ska också vara på. Varje deltagande signal behöver en verifierad observationstid högst fem minuter gammal. En gemensam växelventilsignal kan användas för båda lägena när radiatorläget är verifierat inverterat. Ett gammalt värde används inte; utgången återgår mot Bas med befintliga ramptider. En ändrad verifierad källa eller tidsinställning kräver ny bekräftelse.",
+        "data": {
+          "control_aux_preheat_limit": "Begränsa extra förvärmning vid eltillskott",
+          "control_signals_verified": "Jag har verifierat signalernas betydelse och observationstider",
+          "control_measurement_time_attribute": "Attribut för verifierad observationstid"
+        },
+        "data_description": {
+          "control_aux_preheat_limit": "Av som standard. Tar bara bort den extra förvärmningshöjningen när eltillskott är verifierat aktivt för radiatorvärme. Ändrar inte pumpens egna tillskott eller nödvärme och garanterar ingen energibesparing.",
+          "control_signals_verified": "Bekräfta först när signalernas betydelse och observationstider är verifierade. Tiden ska vara en fysisk mättid eller en mottagningstid för ett nytt mätmeddelande där källans dokumentation verifierar kopplingen till just värdet. En mottagningstid är inte en fysisk mättid. HA:s last_reported, MQTT-återpublicering och online-status räcker inte i sig. Gäller båda begränsarna.",
+          "control_measurement_time_attribute": "Samma attributnamn läses från varje deltagande givare. Värdet ska vara en verifierad observationstid som tidszonsangiven ISO-tid eller Unix-sekunder. Saknas tillförlitligt källunderlag kan ingreppet inte aktiveras; kopiera inte HA:s rapporttid till ett nytt attribut."
+        }
+      },
+      "advanced_control": {
+        "title": "Avancerad styrning – värmebalans",
+        "description": "Av som standard. Kan släppa högst hälften av prisbromsningen vid verifierat värmeunderskott. Kräver färska och verifierat tidsatta signaler för värmebalans, radiatorläge och varmvattenläge, men inte kompressordrift eller köldbärarpump. En gemensam växelventilsignal kan användas om radiatorläget är verifierat inverterat. Normalisering: underskott = råvärde × skala + offset. Positivt värde ska betyda större underskott. Verifiera avkodning, tecken, enhet och gränser; enbart ett registernamn eller enstaka gradminutvärden räcker inte. Saknas underlag, lämna avstängt; råvärde och trend kan visas. Ändrad källa, tidsinställning eller balanskalibrering kräver ny verifiering.",
+        "data": {
+          "control_balance_brake_limit": "Begränsa prisbromsning med verifierad värmebalans",
+          "control_balance_verified": "Jag har verifierat normalisering och underskottsgränser",
+          "control_balance_scale": "Verifierad skalfaktor inklusive tecken",
+          "control_balance_offset": "Verifierad offset",
+          "control_balance_deficit_threshold": "Underskott där bromsen börjar släppas",
+          "control_balance_deficit_full": "Underskott för maximal bromsbegränsning"
+        },
+        "data_description": {
+          "control_balance_brake_limit": "Ändrar bara befintlig prisbromsning, inte PI eller värmepumpens egen reglering. Ett underskott är inte bevis för pågående värmeleverans. Gamla data används inte; utgången återgår mot Bas med befintliga ramptider.",
+          "control_balance_verified": "Bekräfta bara med verifierat underlag för just din givare och värmepump. Ingen avkodning eller generell teckenkonvention antas automatiskt.",
+          "control_balance_scale": "Ingen gissad standard. Måste vara ändlig och skild från noll; kan vara negativ beroende på verifierad teckenkonvention.",
+          "control_balance_offset": "Ange uttryckligen även om den verifierade offseten är noll. Samma enhet som det normaliserade underskottet.",
+          "control_balance_deficit_threshold": "Positiv verifierad gräns i normaliserade enheter. Vid och under gränsen ändras inte bromsningen.",
+          "control_balance_deficit_full": "Måste vara högre än första gränsen. Mellan gränserna släpps bromsen gradvis; vid och över denna gräns släpps högst 50 procent."
+        }
+      }
+    },
+    "error": {
+      "duplicate_temperature_sensor": "Välj olika temperaturgivare.",
+      "required": "Det här fältet är obligatoriskt",
+      "entity_not_found": "Entiteten hittades inte",
+      "entity_unavailable": "Entiteten är otillgänglig",
+      "invalid_notification_setting": "Ogiltig notisinställning",
+      "invalid_detection_method": "Ogiltig metod för värmedetektering.",
+      "heat_signal_alias": "Värmesignalen måste vara en separat indikator för radiatorvärme.",
+      "invalid_balance_kind": "Välj en giltig typ av värmebalans.",
+      "control_signals_required": "Välj nödvändiga driftgivare och verifiera deras betydelse samt attributet för observationstid. En gemensam växelventil kräver verifierad invertering av radiatorläget.",
+      "control_balance_required": "Välj värmebalansgivare och verifiera normalisering. Skalan måste vara skild från noll, offset angiven och 0 < första gränsen < maximalgränsen.",
+      "invalid_numeric_alarm": "Ange ett giltigt numeriskt normalvärde innan du bekräftar tolkningen.",
+      "external_heat_alias": "Extra värmekälla måste ha en egen driftsignal, inte värmepumpens kompressor-, tillskotts- eller värmelägessignal."
+    }
+  },
+  "entity": {
+    "sensor": {
+      "indoor_temperature": {
+        "name": "Inomhustemperatur"
+      },
+      "outdoor_temperature": {
+        "name": "Utomhustemperatur"
+      },
+      "control_temperature": {
+        "name": "Styrtemperatur"
+      },
+      "thermal_intelligence": {
+        "name": "Thermal Intelligence",
+        "state": {
+          "disabled": "Avstängd",
+          "waiting": "Passiv – väntar på data",
+          "learning": "Passiv – samlar observationer",
+          "unavailable": "Passiv – tillfälligt otillgänglig",
+          "hypothetical_plan": "Passiv – hypotetisk plan",
+          "validated_plan": "Passiv – validerad modellplan"
+        }
+      }
+    }
+  },
+  "selector": {
+    "thermal_detection_method": {
+      "options": {
+        "automatic": "Automatisk (rekommenderas)",
+        "manual": "Manuell framledningströskel",
+        "verified": "Verifierad värmedriftssignal"
+      }
+    },
+    "zone_profile": {
+      "options": {
+        "maintenance": "Underhållsvärme",
+        "comfort": "Komfort"
+      }
+    },
+    "thermal_balance_kind": {
+      "options": {
+        "unconfigured": "Inte valt",
+        "raw": "Rått värde (okänd innebörd)",
+        "degree_minutes": "Gradminuter (verifierade)",
+        "integral": "Integral (verifierad)"
+      }
+    }
+  }
+}

@@ -1,0 +1,990 @@
+"""Offline temperature qualification and dispatch interruption regressions."""
+
+import asyncio
+from datetime import timedelta
+from types import SimpleNamespace
+
+import pytest
+from test_safe_mode_output import setup_sensor  # noqa: F401 -- shared HA boundary
+
+from custom_components.pumpsteer.sensor import MODE_PI, MODE_SAFE
+
+
+@pytest.fixture
+def control(request, monkeypatch):
+    sensor, states, clock = request.getfixturevalue("setup_sensor")
+    sensor._config_entry.options["aggressiveness"] = 0
+
+    async def prices(cfg, now):
+        return [1.0] * 24, ["normal"] * 24, 60, 0
+
+    async def forecast():
+        return []
+
+    monkeypatch.setattr(sensor, "_get_prices", prices)
+    monkeypatch.setattr(sensor, "_forecast_temps", forecast)
+    sensor.async_write_ha_state = lambda: None
+    return sensor, states, clock
+
+
+def _report(states, clock, **attributes):
+    for key in ("sensor.indoor", "sensor.outdoor"):
+        states[key].attributes = dict(attributes)
+        states[key].last_reported = clock[0]
+
+
+def test_explicit_restored_numeric_not_used(control):
+    sensor, states, clock = control
+    _report(states, clock, restored=True)
+    asyncio.run(sensor.async_update())
+    assert sensor.state is None
+    assert sensor.hass.services.calls == []
+
+
+@pytest.mark.parametrize("metadata", ["missing", "old", "naive"])
+def test_unqualified_report_rejected_after_start(control, metadata):
+    sensor, states, clock = control
+    asyncio.run(sensor._handle_ha_started(None))
+    clock[0] += timedelta(seconds=1)
+    for key in ("sensor.indoor", "sensor.outdoor"):
+        if metadata == "old":
+            states[key].last_reported = clock[0] - timedelta(days=1)
+        elif metadata == "naive":
+            states[key].last_reported = clock[0].replace(tzinfo=None)
+    asyncio.run(sensor.async_update())
+    assert sensor.state is None
+    assert sensor.hass.services.calls == []
+
+
+def test_restore_pulse_unavailable_then_unchanged_fresh_report(control):
+    sensor, states, clock = control
+    _report(states, clock, restored=True)
+    asyncio.run(sensor._handle_ha_started(None))
+    clock[0] += timedelta(seconds=1)
+    _report(states, clock, restored=True)
+    asyncio.run(sensor.async_update())
+    assert sensor.hass.services.calls == []
+    states["sensor.outdoor"].state = "unavailable"
+    asyncio.run(sensor.async_update())
+    assert sensor.hass.services.calls == []
+    states["sensor.outdoor"].state = "-3.3"
+    clock[0] += timedelta(seconds=1)
+    _report(states, clock)
+    for key in ("sensor.indoor", "sensor.outdoor"):
+        states[key].last_changed = clock[0] - timedelta(days=1)
+        states[key].last_updated = states[key].last_changed
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["mode"] == MODE_PI
+    assert len(sensor.hass.services.calls) == 2
+
+
+@pytest.mark.parametrize("fresh_metadata", [False, True])
+def test_start_requires_report_after_start_and_recovers(control, fresh_metadata):
+    sensor, states, clock = control
+    _report(states, clock)
+    asyncio.run(sensor._handle_ha_started(None))
+    assert sensor.hass.services.calls == []
+    clock[0] += timedelta(seconds=1)
+    if fresh_metadata:
+        _report(states, clock)
+    asyncio.run(sensor.async_update())
+    assert len(sensor.hass.services.calls) == (2 if fresh_metadata else 0)
+
+
+@pytest.mark.parametrize(
+    "report_kind", ["early", "restored", "old", "at_event", "late"]
+)
+def test_start_qualifies_against_event_not_delayed_handler(control, report_kind):
+    sensor, states, clock = control
+    event = SimpleNamespace(time_fired=clock[0])
+    clock[0] += timedelta(seconds=1)
+    _report(states, clock, **({"restored": True} if report_kind == "restored" else {}))
+    if report_kind in ("old", "at_event"):
+        for key in ("sensor.indoor", "sensor.outdoor"):
+            states[key].last_reported = event.time_fired - timedelta(
+                seconds=1 if report_kind == "old" else 0
+            )
+    elif report_kind == "late":
+        for key in ("sensor.indoor", "sensor.outdoor"):
+            states[key].last_reported = event.time_fired
+    clock[0] += timedelta(seconds=1)
+    asyncio.run(sensor._handle_ha_started(event))
+    assert len(sensor.hass.services.calls) == (2 if report_kind == "early" else 0)
+    if report_kind == "late":
+        clock[0] += timedelta(seconds=1)
+        _report(states, clock)
+        asyncio.run(sensor.async_update())
+        assert sensor.extra_state_attributes["mode"] == MODE_PI
+        assert len(sensor.hass.services.calls) == 2
+
+
+@pytest.mark.parametrize("event_time", [None, "invalid", "naive", "future"])
+def test_start_invalid_event_time_uses_conservative_now(control, event_time):
+    sensor, states, clock = control
+    if event_time == "naive":
+        event_time = clock[0].replace(tzinfo=None)
+    elif event_time == "future":
+        event_time = clock[0] + timedelta(days=1)
+    _report(states, clock)
+    asyncio.run(sensor._handle_ha_started(SimpleNamespace(time_fired=event_time)))
+    assert sensor.hass.services.calls == []
+    clock[0] += timedelta(seconds=1)
+    _report(states, clock)
+    asyncio.run(sensor.async_update())
+    assert len(sensor.hass.services.calls) == 2
+
+
+def test_reload_waits_for_new_reports(control, monkeypatch):
+    sensor, states, clock = control
+    _report(states, clock)
+    sensor.hass.is_running = True
+    subscriptions = []
+    sensor.hass.bus = SimpleNamespace(
+        async_listen_once=lambda *args: subscriptions.append(args)
+    )
+    sensor._config_entry.add_update_listener = lambda callback: lambda: None
+
+    async def no_extra():
+        return None
+
+    monkeypatch.setattr(sensor, "async_get_last_extra_data", no_extra, raising=False)
+    asyncio.run(sensor.async_added_to_hass())
+    assert sensor.hass.services.calls == []
+    assert subscriptions == []  # HA is already running
+    clock[0] += timedelta(seconds=1)
+    _report(states, clock)
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["mode"] == MODE_PI
+    assert len(sensor.hass.services.calls) == 2
+
+
+def test_start_with_recent_preexisting_reports_waits_for_each_new_source(control):
+    sensor, states, clock = control
+    for key in ("sensor.indoor", "sensor.outdoor"):
+        states[key].last_reported = clock[0] - timedelta(seconds=30)
+    event = SimpleNamespace(time_fired=clock[0])
+    asyncio.run(sensor._handle_ha_started(event))
+    assert sensor.hass.services.calls == []
+
+    clock[0] += timedelta(minutes=1)
+    states["sensor.outdoor"].last_reported = clock[0]
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["mode"] == "safe_mode"
+    assert "indoor" in sensor.extra_state_attributes["status"]
+
+    clock[0] += timedelta(seconds=1)
+    states["sensor.indoor"].last_reported = clock[0]
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["mode"] == MODE_PI
+    assert sensor.extra_state_attributes["status"] == "ok"
+
+
+def test_before_ha_start_sends_nothing(control):
+    sensor, _, _ = control
+    sensor.hass.is_running = False
+    asyncio.run(sensor.async_update())
+    assert sensor.hass.services.calls == []
+
+
+@pytest.mark.parametrize("stage", ["prices", "forecast"])
+@pytest.mark.parametrize("value", ["unavailable", "unknown", "nan", "-10"])
+def test_loss_or_changed_input_during_calculation_aborts(
+    control, monkeypatch, stage, value
+):
+    sensor, states, _ = control
+
+    async def prices(cfg, now):
+        states["sensor.outdoor"].state = value
+        return [], [], 60, 0
+
+    async def forecast():
+        states["sensor.outdoor"].state = value
+        return []
+
+    monkeypatch.setattr(
+        sensor,
+        "_get_prices" if stage == "prices" else "_forecast_temps",
+        prices if stage == "prices" else forecast,
+    )
+    asyncio.run(sensor.async_update())
+    assert sensor.hass.services.calls == []
+    assert sensor.state is None
+    assert sensor.extra_state_attributes["temperature_input_status"] == "interrupted"
+    assert sensor.extra_state_attributes["receiver_state"] == "unverified"
+
+
+def test_loss_between_gos_and_ohmigo_blocks_second_write(control):
+    sensor, states, _ = control
+    calls = sensor.hass.services.calls
+
+    async def dispatch(domain, service, data, blocking=False):
+        calls.append((domain, service, data))
+        states["sensor.outdoor"].state = "unavailable"
+
+    sensor.hass.services.async_call = dispatch
+    asyncio.run(sensor.async_update())
+    assert len(calls) == 1
+    assert calls[0][0] == "test_output"
+    assert sensor._ohmigo_last_push is None
+    assert sensor.state is None
+    assert sensor.extra_state_attributes["temperature_input_status"] == "interrupted"
+
+
+def test_unavailable_then_recovery_preserves_intervals(control):
+    sensor, states, clock = control
+    asyncio.run(sensor.async_update())
+    calls = list(sensor.hass.services.calls)
+    states["sensor.outdoor"].state = "unavailable"
+    clock[0] += timedelta(seconds=1)
+    asyncio.run(sensor.async_update())
+    assert sensor.state is None
+    assert sensor.hass.services.calls == calls
+    states["sensor.outdoor"].state = "-4"
+    clock[0] += timedelta(seconds=1)
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["mode"] == MODE_PI
+    assert sensor.hass.services.calls == calls
+    clock[0] += timedelta(minutes=10)
+    asyncio.run(sensor.async_update())
+    assert len(sensor.hass.services.calls) == len(calls) + 2
+
+
+def test_source_change_during_calculation_aborts(control, monkeypatch):
+    sensor, states, _ = control
+    states["sensor.other"] = SimpleNamespace(state="-3.3", attributes={})
+
+    async def forecast():
+        sensor._config_entry.options["real_outdoor_entity"] = "sensor.other"
+        return []
+
+    monkeypatch.setattr(sensor, "_forecast_temps", forecast)
+    asyncio.run(sensor.async_update())
+    assert sensor.hass.services.calls == []
+
+
+def test_unload_removes_pending_start_listener(control, monkeypatch):
+    sensor, _, _ = control
+    sensor.hass.is_running = False
+    removed = []
+    sensor.hass.bus = SimpleNamespace(
+        async_listen_once=lambda *args: lambda: removed.append("start")
+    )
+    sensor._config_entry.add_update_listener = lambda callback: (
+        lambda: removed.append("options")
+    )
+
+    async def no_extra():
+        return None
+
+    monkeypatch.setattr(sensor, "async_get_last_extra_data", no_extra, raising=False)
+    asyncio.run(sensor.async_added_to_hass())
+    asyncio.run(sensor.async_will_remove_from_hass())
+    assert sorted(removed) == ["options", "start"]
+
+
+def test_unload_during_calculation_blocks_dispatch(control, monkeypatch):
+    sensor, _, _ = control
+
+    async def forecast():
+        await sensor.async_will_remove_from_hass()
+        return []
+
+    monkeypatch.setattr(sensor, "_forecast_temps", forecast)
+    asyncio.run(sensor.async_update())
+    assert sensor.hass.services.calls == []
+    assert sensor.extra_state_attributes["temperature_input_status"] == "interrupted"
+
+
+def test_overlapping_updates_do_not_duplicate_output(control):
+    sensor, _, _ = control
+
+    async def scenario():
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls = sensor.hass.services.calls
+
+        async def dispatch(domain, service, data, blocking=False):
+            calls.append((domain, service, data))
+            if len(calls) == 1:
+                started.set()
+                await release.wait()
+
+        sensor.hass.services.async_call = dispatch
+        first = asyncio.create_task(sensor.async_update())
+        await started.wait()
+        try:
+            await sensor.async_options_update_listener(
+                sensor.hass, sensor._config_entry
+            )
+        finally:
+            release.set()
+            await first
+        assert len(calls) == 2
+
+    asyncio.run(scenario())
+
+
+def test_update_gate_released_after_error(control, monkeypatch):
+    sensor, _, _ = control
+
+    async def failure():
+        raise RuntimeError("synthetic calculation failure")
+
+    monkeypatch.setattr(sensor, "_forecast_temps", failure)
+    asyncio.run(sensor.async_update())
+    assert sensor.state is None
+
+    async def recovered():
+        return []
+
+    monkeypatch.setattr(sensor, "_forecast_temps", recovered)
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["mode"] == MODE_PI
+    assert len(sensor.hass.services.calls) == 2
+
+
+def test_update_gate_released_after_cancellation(control, monkeypatch):
+    sensor, _, _ = control
+
+    async def scenario():
+        started = asyncio.Event()
+        waiting = asyncio.Event()
+
+        async def delayed_forecast():
+            started.set()
+            await waiting.wait()
+
+        monkeypatch.setattr(sensor, "_forecast_temps", delayed_forecast)
+        task = asyncio.create_task(sensor.async_update())
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert sensor.hass.services.calls == []
+
+        async def recovered():
+            return []
+
+        monkeypatch.setattr(sensor, "_forecast_temps", recovered)
+        await sensor.async_update()
+        assert sensor.extra_state_attributes["mode"] == MODE_PI
+        assert len(sensor.hass.services.calls) == 2
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("stage", ["prices", "forecast"])
+def test_options_during_calculation_rerun_without_stale_dispatch(control, stage):
+    sensor, _, _ = control
+    sensor._prev_aggressiveness = 0
+    sensor._pi._integral = 5.0
+
+    async def scenario():
+        started, release = asyncio.Event(), asyncio.Event()
+        passes = []
+
+        async def prices(cfg, now):
+            passes.append(cfg.get("electricity_price_entity"))
+            if len(passes) == 2:
+                assert sensor.hass.services.calls == []
+            if stage == "prices" and len(passes) == 1:
+                started.set()
+                await release.wait()
+            # A stale expensive source must never reach the receiver.
+            category = "expensive" if len(passes) == 1 else "normal"
+            return [1.0] * 24, [category] * 24, 60, 0
+
+        async def forecast():
+            if stage == "forecast" and len(passes) == 1:
+                started.set()
+                await release.wait()
+            return []
+
+        sensor._get_prices = prices
+        sensor._forecast_temps = forecast
+        task = asyncio.create_task(sensor.async_update())
+        await started.wait()
+        try:
+            for suffix in ("one", "two"):
+                sensor._config_entry.options.update(
+                    electricity_price_entity=f"sensor.price_{suffix}",
+                    weather_entity=f"weather.{suffix}",
+                )
+                await sensor.async_options_update_listener(
+                    sensor.hass, sensor._config_entry
+                )
+            assert sensor.hass.services.calls == []
+        finally:
+            release.set()
+            await task
+        assert passes == ["sensor.price", "sensor.price_two"]
+        assert sensor._pi._integral == 5.0
+        assert sensor.extra_state_attributes["mode"] == MODE_PI
+        assert len(sensor.hass.services.calls) == 2
+        assert sensor._ohmigo_last_push is not None
+
+    asyncio.run(scenario())
+
+
+def test_running_report_timeout_enters_safe_and_recovers(control):
+    sensor, states, clock = control
+    sensor._config_entry.options["temperature_report_max_age_minutes"] = 60
+    asyncio.run(sensor._handle_ha_started(None))
+    clock[0] += timedelta(seconds=1)
+    _report(states, clock)
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["mode"] == MODE_PI
+    clock[0] += timedelta(minutes=61)
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["mode"] == MODE_SAFE
+    _report(states, clock)
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["mode"] == MODE_PI
+
+
+def test_changed_update_time_does_not_freshen_old_report(control):
+    sensor, states, clock = control
+    sensor._config_entry.options["temperature_report_max_age_minutes"] = 60
+    asyncio.run(sensor._handle_ha_started(None))
+    clock[0] += timedelta(seconds=1)
+    _report(states, clock)
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["mode"] == MODE_PI
+    clock[0] += timedelta(minutes=61)
+    for key in ("sensor.indoor", "sensor.outdoor"):
+        states[key].last_updated = clock[0]
+        states[key].last_changed = clock[0]
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["mode"] == MODE_SAFE
+
+
+def test_new_unchanged_report_after_start_allows_recovery(control):
+    sensor, states, clock = control
+    sensor._config_entry.options["temperature_report_max_age_minutes"] = 60
+    _report(states, clock)
+    unchanged_at = clock[0]
+    asyncio.run(sensor._handle_ha_started(None))
+    assert sensor.extra_state_attributes["mode"] == MODE_SAFE
+    clock[0] += timedelta(minutes=10)
+    for key in ("sensor.indoor", "sensor.outdoor"):
+        states[key].last_reported = clock[0]
+        states[key].last_changed = unchanged_at
+        states[key].last_updated = unchanged_at
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["mode"] == MODE_PI
+
+
+def test_weighted_indoor_sensors_reweight_on_loss_and_return(control):
+    sensor, states, clock = control
+    options = sensor._config_entry.options
+    options.update(
+        indoor_temp_entity_2="sensor.room2",
+        indoor_temp_entity_3="sensor.room3",
+        indoor_temp_weight_1=5,
+        indoor_temp_weight_2=3,
+        indoor_temp_weight_3=2,
+    )
+    states["sensor.indoor"].state = "20"
+    states["sensor.room2"] = SimpleNamespace(state="22", attributes={})
+    states["sensor.room3"] = SimpleNamespace(state="24", attributes={})
+    _report(states, clock)
+    for name in ("sensor.room2", "sensor.room3"):
+        states[name].last_reported = clock[0]
+        states[name].last_changed = clock[0]
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["indoor_temperature"] == pytest.approx(21.4)
+    clock[0] += timedelta(minutes=1)
+    states["sensor.room2"].state = "unavailable"
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["indoor_temperature"] == pytest.approx(148 / 7)
+    assert len(sensor._thermal_model._temp_history) == 1
+    clock[0] += timedelta(minutes=1)
+    states["sensor.room2"].state = "22"
+    states["sensor.room2"].last_reported = clock[0]
+    states["sensor.room2"].last_changed = clock[0]
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["indoor_temperature"] == pytest.approx(21.4)
+    assert len(sensor._thermal_model._temp_history) == 1
+
+
+def test_outdoor_backup_failure_and_delayed_primary_return(control):
+    sensor, states, clock = control
+    sensor._config_entry.options["outdoor_temp_entity_2"] = "sensor.backup"
+    states["sensor.backup"] = SimpleNamespace(
+        state="-4", attributes={}, last_reported=clock[0], last_changed=clock[0]
+    )
+    _report(states, clock)
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["outdoor_temperature"] == -3.3
+    clock[0] += timedelta(minutes=1)
+    states["sensor.outdoor"].state = "unavailable"
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["outdoor_temperature"] == -4
+    clock[0] += timedelta(minutes=1)
+    states["sensor.outdoor"].state = "-3.3"
+    states["sensor.outdoor"].last_reported = clock[0]
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["outdoor_temperature"] == -4
+    clock[0] += timedelta(minutes=1)
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["outdoor_temperature"] == -3.3
+
+
+def test_indoor_loss_all_enters_safe_even_with_configured_backups(control):
+    sensor, states, clock = control
+    sensor._config_entry.options["indoor_temp_entity_2"] = "sensor.room2"
+    states["sensor.room2"] = SimpleNamespace(state="unavailable", attributes={})
+    states["sensor.indoor"].state = "unavailable"
+    _report(states, clock)
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["mode"] == MODE_SAFE
+
+
+def test_expired_indoor_sensor_is_excluded_and_recovers(control):
+    sensor, states, clock = control
+    sensor._config_entry.options.update(
+        indoor_temp_entity_2="sensor.room2",
+        temperature_report_max_age_minutes=60,
+    )
+    states["sensor.room2"] = SimpleNamespace(state="23", attributes={})
+    asyncio.run(sensor._handle_ha_started(None))
+    clock[0] += timedelta(seconds=1)
+    _report(states, clock)
+    states["sensor.room2"].last_reported = clock[0]
+    states["sensor.room2"].last_changed = clock[0]
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["indoor_temperature"] == 22
+    clock[0] += timedelta(minutes=61)
+    _report(states, clock)
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["indoor_temperature"] == 21
+    assert (
+        sensor.extra_state_attributes["temperature_sources"]["indoor_coverage"]
+        == "reduced"
+    )
+    clock[0] += timedelta(seconds=1)
+    _report(states, clock)
+    states["sensor.room2"].last_reported = clock[0]
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["indoor_temperature"] == 22
+    assert (
+        sensor.extra_state_attributes["temperature_sources"]["indoor_coverage"]
+        == "complete"
+    )
+
+
+def test_default_report_age_expires_after_start(control):
+    sensor, states, clock = control
+    asyncio.run(sensor._handle_ha_started(None))
+    clock[0] += timedelta(seconds=1)
+    _report(states, clock)
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["mode"] == MODE_PI
+    clock[0] += timedelta(minutes=361)
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["mode"] == MODE_SAFE
+
+
+def test_changed_weights_invalidate_temperature_rate_history(control):
+    sensor, states, clock = control
+    sensor._config_entry.options.update(indoor_temp_entity_2="sensor.room2")
+    states["sensor.room2"] = SimpleNamespace(state="23", attributes={})
+    _report(states, clock)
+    states["sensor.room2"].last_reported = clock[0]
+    states["sensor.room2"].last_changed = clock[0]
+    asyncio.run(sensor.async_update())
+    clock[0] += timedelta(minutes=1)
+    asyncio.run(sensor.async_update())
+    assert len(sensor._thermal_model._temp_history) == 2
+    sensor._config_entry.options["indoor_temp_weight_2"] = 3
+    clock[0] += timedelta(minutes=1)
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["indoor_temperature"] == 22.5
+    assert len(sensor._thermal_model._temp_history) == 1
+
+
+def test_incompatible_additional_temperature_unit_is_excluded(control):
+    sensor, states, clock = control
+    sensor._config_entry.options.update(indoor_temp_entity_2="sensor.room2")
+    states["sensor.room2"] = SimpleNamespace(
+        state="70", attributes={"unit_of_measurement": "°F"}, last_reported=clock[0]
+    )
+    _report(states, clock)
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["indoor_temperature"] == 21
+    assert (
+        sensor.extra_state_attributes["temperature_sources"]["indoor_coverage"]
+        == "reduced"
+    )
+
+
+def test_start_accepts_one_new_indoor_report_and_excludes_old_peers(control):
+    sensor, states, clock = control
+    sensor._config_entry.options.update(
+        indoor_temp_entity_2="sensor.room2", indoor_temp_entity_3="sensor.room3"
+    )
+    states["sensor.room2"] = SimpleNamespace(
+        state="25", attributes={}, last_reported=clock[0]
+    )
+    states["sensor.room3"] = SimpleNamespace(
+        state="26", attributes={"restored": True}, last_reported=clock[0]
+    )
+    _report(states, clock)
+    asyncio.run(sensor._handle_ha_started(None))
+    assert sensor.extra_state_attributes["mode"] == MODE_SAFE
+    clock[0] += timedelta(seconds=1)
+    states["sensor.indoor"].last_reported = clock[0]
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["mode"] == MODE_SAFE
+    states["sensor.outdoor"].last_reported = clock[0]
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["mode"] == MODE_PI
+    assert sensor.extra_state_attributes["indoor_temperature"] == 21
+    assert (
+        sensor.extra_state_attributes["temperature_sources"]["indoor_coverage"]
+        == "reduced"
+    )
+
+
+def test_outdoor_report_age_switches_to_fresh_backup_before_indoor_expires(control):
+    sensor, states, clock = control
+    sensor._config_entry.options["outdoor_temp_entity_2"] = "sensor.backup"
+    states["sensor.backup"] = SimpleNamespace(state="-4", attributes={})
+    asyncio.run(sensor._handle_ha_started(None))
+    clock[0] += timedelta(seconds=1)
+    _report(states, clock)
+    states["sensor.backup"].last_reported = clock[0]
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["outdoor_temperature"] == -3.3
+    clock[0] += timedelta(minutes=121)
+    states["sensor.backup"].last_reported = clock[0]
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["mode"] == MODE_PI
+    assert sensor.extra_state_attributes["outdoor_temperature"] == -4
+    states["sensor.outdoor"].last_reported = clock[0]
+    clock[0] += timedelta(minutes=1)
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["outdoor_temperature"] == -4
+    clock[0] += timedelta(minutes=1)
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["outdoor_temperature"] == -3.3
+
+
+def test_existing_stricter_shared_age_remains_in_force_for_outdoor(control):
+    sensor, states, clock = control
+    sensor._config_entry.options.update(
+        temperature_report_max_age_minutes=30, outdoor_temp_entity_2="sensor.backup"
+    )
+    states["sensor.backup"] = SimpleNamespace(state="-4", attributes={})
+    asyncio.run(sensor._handle_ha_started(None))
+    clock[0] += timedelta(seconds=1)
+    _report(states, clock)
+    states["sensor.backup"].last_reported = clock[0]
+    asyncio.run(sensor.async_update())
+    clock[0] += timedelta(minutes=31)
+    states["sensor.indoor"].last_reported = clock[0]
+    states["sensor.backup"].last_reported = clock[0]
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["outdoor_temperature"] == -4
+
+
+def test_extra_zone_alert_is_passive_and_not_repeated(control):
+    sensor, states, clock = control
+    sensor._config_entry.options.update(
+        zone_1_entity="sensor.garage",
+        zone_1_name="Garage",
+        zone_1_enabled=True,
+        zone_1_threshold=5,
+        zone_notify_service="notify.family",
+    )
+    states["sensor.garage"] = SimpleNamespace(
+        state="4", attributes={"unit_of_measurement": "°C"}, last_reported=clock[0]
+    )
+    for minute in range(17):
+        _report(states, clock)
+        states["sensor.garage"].last_reported = clock[0]
+        asyncio.run(sensor.async_update())
+        assert sensor.extra_state_attributes["mode"] == MODE_PI
+        assert sensor.extra_state_attributes["indoor_temperature"] == 21
+        clock[0] += timedelta(minutes=1)
+    sent = [call for call in sensor.hass.services.calls if call[0] == "notify"]
+    assert len(sent) == 1
+    assert (
+        sensor.extra_state_attributes["extra_temperature_zones"]["1"]["status"]
+        == "alarm"
+    )
+
+
+def test_zone_only_options_do_not_reset_control_learning(control, monkeypatch):
+    sensor, states, clock = control
+
+    async def update():
+        pass
+
+    monkeypatch.setattr(sensor, "async_update", update)
+    asyncio.run(sensor.async_options_update_listener(sensor.hass, sensor._config_entry))
+    pilot = object()
+    sensor._pilot = pilot
+    sensor._config_entry.options["zone_1_entity"] = "sensor.garage"
+    asyncio.run(sensor.async_options_update_listener(sensor.hass, sensor._config_entry))
+    assert sensor._pilot is pilot
+
+
+def test_passive_heatpump_options_do_not_reset_control_learning(control, monkeypatch):
+    sensor, states, clock = control
+
+    async def update():
+        pass
+
+    monkeypatch.setattr(sensor, "async_update", update)
+    asyncio.run(sensor.async_options_update_listener(sensor.hass, sensor._config_entry))
+    pilot = sensor._pilot = object()
+    sensor._config_entry.options["thermal_balance_entity"] = "sensor.balance"
+    asyncio.run(sensor.async_options_update_listener(sensor.hass, sensor._config_entry))
+    assert sensor._pilot is pilot
+
+
+def test_removed_heatpump_options_do_not_keep_restored_diagnostics(control):
+    sensor, states, clock = control
+    sensor._attributes["heat_pump_telemetry"] = {"operation": "compressor_running"}
+    sensor._attributes["heat_pump_alarm"] = {"active": True}
+    asyncio.run(sensor.async_update())
+    assert "heat_pump_telemetry" not in sensor.extra_state_attributes
+    assert "heat_pump_alarm" not in sensor.extra_state_attributes
+
+
+def test_existing_compressor_and_missing_configured_brine_are_observed(control):
+    sensor, states, clock = control
+    states["binary_sensor.compressor"] = SimpleNamespace(
+        state="on", attributes={}, last_reported=clock[0]
+    )
+    sensor._config_entry.options["thermal_compressor_entity"] = (
+        "binary_sensor.compressor"
+    )
+    asyncio.run(sensor.async_update())
+    assert (
+        sensor.extra_state_attributes["heat_pump_telemetry"]["operation"]
+        == "compressor_running"
+    )
+    sensor._config_entry.options["thermal_brine_pump_entity"] = "binary_sensor.missing"
+    asyncio.run(sensor.async_update())
+    assert (
+        sensor.extra_state_attributes["heat_pump_telemetry"]["operation"] == "unknown"
+    )
+
+
+def test_removed_zones_do_not_keep_restored_diagnostics(control):
+    sensor, states, clock = control
+    sensor._attributes["extra_temperature_zones"] = {"1": {"alarm_active": True}}
+    asyncio.run(sensor.async_update())
+    assert "extra_temperature_zones" not in sensor.extra_state_attributes
+
+
+def test_slow_zone_notification_does_not_block_main_control(control, monkeypatch):
+    sensor, states, clock = control
+    sensor._config_entry.options.update(
+        zone_1_entity="sensor.garage",
+        zone_1_threshold=5,
+        zone_1_enabled=True,
+        zone_1_alarm_delay_minutes=1,
+        zone_notify_service="notify.family",
+    )
+    room = SimpleNamespace(
+        state="4", attributes={"unit_of_measurement": "°C"}, last_reported=clock[0]
+    )
+    states["sensor.garage"] = room
+
+    async def scenario():
+        release = asyncio.Event()
+        entered = asyncio.Event()
+        original = sensor.hass.services.async_call
+
+        async def slow(domain, service, data, **kwargs):
+            if domain == "notify":
+                entered.set()
+                await release.wait()
+            else:
+                await original(domain, service, data, **kwargs)
+
+        monkeypatch.setattr(sensor.hass.services, "async_call", slow)
+        _report(states, clock)
+        await sensor.async_update()
+        clock[0] += timedelta(minutes=1)
+        room.last_reported = clock[0]
+        _report(states, clock)
+        try:
+            await asyncio.wait_for(sensor.async_update(), timeout=0.1)
+            await asyncio.wait_for(entered.wait(), timeout=0.1)
+            assert sensor.extra_state_attributes["mode"] == MODE_PI
+            assert not sensor._update_in_progress
+        finally:
+            release.set()
+            await asyncio.sleep(0)
+
+    asyncio.run(scenario())
+
+
+def test_unreasonable_or_fahrenheit_single_control_sensor_enters_safe_mode(control):
+    sensor, states, clock = control
+    _report(states, clock)
+    states["sensor.indoor"].state = "68"
+    states["sensor.indoor"].attributes = {"unit_of_measurement": "°F"}
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["mode"] == MODE_SAFE
+    states["sensor.indoor"].state = "999"
+    states["sensor.indoor"].attributes = {"unit_of_measurement": "°C"}
+    asyncio.run(sensor.async_update())
+    assert sensor.extra_state_attributes["mode"] == MODE_SAFE
+
+
+def test_weighted_temperature_has_consistent_report_and_component_freshness(control):
+    from custom_components.pumpsteer.pilot_passive import PilotPassive
+
+    sensor, states, clock = control
+    sensor._config_entry.options.update(
+        indoor_temp_entity_2="sensor.second", indoor_temp_weight_2=1
+    )
+    _report(states, clock)
+    states["sensor.indoor"].last_changed = clock[0] - timedelta(minutes=4)
+    states["sensor.indoor"].last_reported = clock[0] - timedelta(minutes=2)
+    states["sensor.second"] = SimpleNamespace(
+        state="19",
+        attributes={"unit_of_measurement": "°C"},
+        last_reported=clock[0],
+        last_changed=clock[0] - timedelta(minutes=1),
+    )
+    state = sensor._temperature_state(sensor._cfg(), "indoor_temp_entity")
+    assert state.last_changed <= state.last_reported
+    assert PilotPassive._report(state, clock[0], temperature=True) is not None
+    outside = states["sensor.outdoor"]
+    outside.attributes = {"unit_of_measurement": "°C"}
+    outside.last_changed = clock[0] - timedelta(minutes=2)
+    pilot = PilotPassive()
+    pilot.observe_indicated(clock[0], state, outside, {})
+    assert pilot.indicated_house.last_status != "temperature_context_transition"
+    assert pilot.indicated_house.last_status != "temperature_report_unavailable"
+    states["sensor.indoor"].last_reported = clock[0] - timedelta(minutes=6)
+    state = sensor._temperature_state(sensor._cfg(), "indoor_temp_entity")
+    assert PilotPassive._report(state, clock[0], temperature=True) is None
+
+
+def test_heat_pump_fault_notifies_once_and_does_not_change_control(control):
+    sensor, states, clock = control
+    sensor._config_entry.options.update(
+        thermal_alarm_entity="binary_sensor.fault", notify_service="notify.family"
+    )
+    states["binary_sensor.fault"] = SimpleNamespace(
+        state="on", attributes={}, last_reported=clock[0]
+    )
+
+    async def scenario():
+        _report(states, clock)
+        await sensor.async_update()
+        await asyncio.sleep(0)
+        assert sensor.extra_state_attributes["mode"] == MODE_PI
+        assert sensor.extra_state_attributes["heat_pump_alarm"]["active"]
+        await sensor.async_update()
+        await asyncio.sleep(0)
+        assert len([c for c in sensor.hass.services.calls if c[0] == "notify"]) == 1
+        clock[0] += timedelta(minutes=1)
+        _report(states, clock)
+        states["binary_sensor.fault"].state = "off"
+        states["binary_sensor.fault"].last_reported = clock[0]
+        await sensor.async_update()
+        await asyncio.sleep(0)
+        assert len([c for c in sensor.hass.services.calls if c[0] == "notify"]) == 2
+
+    asyncio.run(scenario())
+
+
+def test_heat_pump_fault_recovery_waits_for_inflight_alarm(control, monkeypatch):
+    sensor, states, clock = control
+    sensor._config_entry.options.update(
+        thermal_alarm_entity="binary_sensor.fault", notify_service="notify.family"
+    )
+    states["binary_sensor.fault"] = SimpleNamespace(
+        state="on", attributes={}, last_reported=clock[0]
+    )
+
+    async def scenario():
+        delivered = []
+        started = asyncio.Event()
+        release = asyncio.Event()
+        original = sensor.hass.services.async_call
+
+        async def slow_notify(domain, service, data, blocking=False):
+            if domain == "notify":
+                delivered.append(data["message"])
+                if len(delivered) == 1:
+                    started.set()
+                    await release.wait()
+            else:
+                await original(domain, service, data, blocking=blocking)
+
+        monkeypatch.setattr(sensor.hass.services, "async_call", slow_notify)
+        _report(states, clock)
+        await sensor.async_update()
+        await started.wait()
+        clock[0] += timedelta(seconds=1)
+        states["binary_sensor.fault"].state = "off"
+        states["binary_sensor.fault"].last_reported = clock[0]
+        await sensor.async_update()
+        release.set()
+        await sensor._heatpump_alarm_task
+        assert sensor._heatpump_alarm.recovery_pending
+        await sensor.async_update()
+        await sensor._heatpump_alarm_task
+        assert len(delivered) == 2
+        assert "återgått" in delivered[-1]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("service_fails", [False, True])
+def test_heatpump_fault_persistent_fallback_and_recovery(
+    control, monkeypatch, service_fails
+):
+    sensor, states, clock = control
+    sensor._config_entry.options.update(
+        thermal_alarm_entity="binary_sensor.fault",
+        notify_service="notify.broken" if service_fails else "",
+        notification_level="off",
+    )
+    sensor.hass.config = SimpleNamespace(language="en")
+    states["binary_sensor.fault"] = SimpleNamespace(
+        state="on", attributes={}, last_reported=clock[0]
+    )
+    original = sensor.hass.services.async_call
+
+    async def calls(domain, service, data, blocking=False):
+        if domain == "notify":
+            raise RuntimeError("delivery failed")
+        await original(domain, service, data, blocking=blocking)
+
+    monkeypatch.setattr(sensor.hass.services, "async_call", calls)
+
+    async def scenario():
+        _report(states, clock)
+        for _ in range(2):
+            await sensor.async_update()
+            await sensor._heatpump_alarm_task
+        persistent = [
+            c for c in sensor.hass.services.calls if c[0] == "persistent_notification"
+        ]
+        assert len(persistent) == 1
+        assert "active fault" in persistent[0][2]["message"]
+        clock[0] += timedelta(seconds=1)
+        states["binary_sensor.fault"].state = "off"
+        states["binary_sensor.fault"].last_reported = clock[0]
+        await sensor.async_update()
+        await sensor._heatpump_alarm_task
+        persistent = [
+            c for c in sensor.hass.services.calls if c[0] == "persistent_notification"
+        ]
+        assert len(persistent) == 2
+        assert "cleared" in persistent[1][2]["message"]
+        assert (
+            persistent[0][2]["notification_id"] == persistent[1][2]["notification_id"]
+        )
+
+    asyncio.run(scenario())

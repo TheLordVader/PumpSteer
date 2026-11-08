@@ -16,7 +16,7 @@ from custom_components.pumpsteer.electricity_price import (
     PRICE_EXPENSIVE,
     PRICE_NORMAL,
 )
-from custom_components.pumpsteer.sensor import MODE_PI, PumpSteerSensor
+from custom_components.pumpsteer.sensor import MODE_BRAKE_HOLD, MODE_PI, PumpSteerSensor
 
 
 class _DummyState:
@@ -61,7 +61,10 @@ def _make_sensor(brake_hold_minutes=30.0):
             "brake_hold_minutes": brake_hold_minutes,
         },
     )
-    return PumpSteerSensor(_DummyHass(), entry)
+    sensor = PumpSteerSensor(_DummyHass(), entry)
+    # These bridge fixtures start after an actual expensive braking phase.
+    sensor._was_braking_last_cycle = True
+    return sensor
 
 
 def _run_cycle(sensor, monkeypatch, now, categories, forecast_temps=None):
@@ -110,7 +113,7 @@ def test_short_dip_holds_existing_brake_factor_without_ramping(monkeypatch):
         forecast_temps=[0.0] * 6,
     )
 
-    assert captured["mode"] == MODE_PI
+    assert captured["mode"] == MODE_BRAKE_HOLD
     assert captured["extra"]["bridge_short_dip"] is True
     assert captured["extra"]["minutes_until_expensive"] == 5.0
     assert sensor._brake_ramp == 0.5
@@ -161,3 +164,69 @@ def test_bridge_uses_configured_hold_window(monkeypatch):
     assert captured["extra"]["bridge_short_dip"] is True
     assert captured["extra"]["bridge_limit_minutes"] == 45.0
     assert sensor._brake_ramp == 0.5
+
+
+def test_bridge_logs_start_only_once(monkeypatch):
+    sensor = _make_sensor(brake_hold_minutes=30.0)
+    now = datetime(2026, 9, 20, 8, 10, tzinfo=timezone.utc)
+    sensor._brake_ramp = 0.5
+    sensor._brake_last_t = now - timedelta(minutes=1)
+    events = []
+
+    monkeypatch.setattr(
+        sensor_module,
+        "log_event",
+        lambda event, **kwargs: events.append((event, kwargs)),
+    )
+
+    first = _run_cycle(
+        sensor,
+        monkeypatch,
+        now,
+        [PRICE_NORMAL, PRICE_EXPENSIVE],
+        forecast_temps=[0.0] * 6,
+    )
+    second = _run_cycle(
+        sensor,
+        monkeypatch,
+        now + timedelta(seconds=30),
+        [PRICE_NORMAL, PRICE_EXPENSIVE],
+        forecast_temps=[0.0] * 6,
+    )
+
+    assert first["mode"] == MODE_BRAKE_HOLD
+    assert second["mode"] == MODE_BRAKE_HOLD
+    assert [event for event, _ in events].count("BRIDGE_SHORT_DIP_START") == 1
+    assert [event for event, _ in events].count("BRIDGE_SHORT_DIP_END") == 0
+
+
+def test_bridge_logs_end_when_normal_control_resumes(monkeypatch):
+    sensor = _make_sensor(brake_hold_minutes=30.0)
+    now = datetime(2026, 9, 20, 8, 10, tzinfo=timezone.utc)
+    sensor._brake_ramp = 0.5
+    sensor._brake_last_t = now - timedelta(minutes=1)
+    events = []
+
+    monkeypatch.setattr(
+        sensor_module,
+        "log_event",
+        lambda event, **kwargs: events.append((event, kwargs)),
+    )
+
+    _run_cycle(
+        sensor,
+        monkeypatch,
+        now,
+        [PRICE_NORMAL, PRICE_EXPENSIVE],
+        forecast_temps=[0.0] * 6,
+    )
+    captured = _run_cycle(
+        sensor,
+        monkeypatch,
+        now + timedelta(minutes=1),
+        [PRICE_NORMAL, PRICE_NORMAL, PRICE_NORMAL, PRICE_EXPENSIVE],
+    )
+
+    assert captured["mode"] == MODE_PI
+    assert [event for event, _ in events].count("BRIDGE_SHORT_DIP_START") == 1
+    assert [event for event, _ in events].count("BRIDGE_SHORT_DIP_END") == 1

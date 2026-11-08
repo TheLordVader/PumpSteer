@@ -65,7 +65,7 @@ def _expected_call():
         "number",
         "set_value",
         {"entity_id": "number.ohmigo_test", "value": 21.5},
-        False,
+        True,
     )
 
 
@@ -110,3 +110,22 @@ def test_missing_or_invalid_state_still_pushes(setup_push, current_state):
     assert _push(hass, entry, None) == clock[0]
     assert hass.services.calls == [_expected_call()]
     assert len(logbook_calls) == 1
+
+
+@pytest.mark.parametrize(
+    "before,after",
+    [
+        ((2026, 3, 29, 1, 58, 0), (2026, 3, 29, 3, 3, 0)),
+        ((2026, 10, 25, 2, 58, 0), (2026, 10, 25, 2, 3, 1)),
+    ],
+)
+def test_keepalive_interval_across_dst(setup_push, before, after):
+    from zoneinfo import ZoneInfo
+
+    clock, _, entry = setup_push
+    tz = ZoneInfo("Europe/Stockholm")
+    old = datetime(*before[:5], tzinfo=tz, fold=before[5])
+    clock[0] = datetime(*after[:5], tzinfo=tz, fold=after[5])
+    hass = _FakeHass("21.5")
+    _push(hass, entry, old)
+    assert hass.services.calls == [_expected_call()]

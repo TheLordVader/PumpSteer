@@ -1,26 +1,47 @@
+import asyncio
 import logging
 import math
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import homeassistant.util.dt as dt_util
 from homeassistant.components.sensor import SensorEntity
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.dispatcher import (
+    async_dispatcher_connect,
+    async_dispatcher_send,
+)
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers.typing import StateType
 
-from .thermal_model import ThermalModel
+from .thermal_model import (
+    ADAPTIVE_LEARNING_MAX_GAP_MINUTES,
+    VALIDATION_BASIS,
+    ThermalModel,
+)
+from .const import (
+    DEFAULT_OUTDOOR_REPORT_MAX_AGE_MINUTES,
+    DEFAULT_TEMPERATURE_REPORT_MAX_AGE_MINUTES,
+)
 
 from .control import PIController
+from .control_ramps import (
+    BRAKE_RAMP_MAX_DT_SECONDS as _BRAKE_RAMP_MAX_DT_SECONDS,
+    PREHEAT_RAMP_MAX_DT_SECONDS as _PREHEAT_RAMP_MAX_DT_SECONDS,
+    brake_ramp_step,
+    preheat_ramp_step,
+)
 from .electricity_price import (
     PRICE_EXPENSIVE,
     PRICE_NORMAL,
     async_get_price_thresholds,
     classify_price_list,
     filter_short_peaks,
+    price_cache_refresh_due,
+    price_cache_transition,
 )
 from .holiday import async_update_holiday
 from .ohmigo import async_push_ohmigo
@@ -58,6 +79,7 @@ from .utils import (
     detect_price_interval_minutes,
     get_attr,
     get_state,
+    get_temperature,
     get_version,
     safe_float,
 )
@@ -73,6 +95,7 @@ MODE_PRECOOL = "precool"
 MODE_PREHEAT = "preheating"
 MODE_PREBRAKE = "pre_braking"
 MODE_BRAKING = "braking"
+MODE_BRAKE_HOLD = "brake_hold"
 MODE_PI = "normal"
 MODE_HOLIDAY = "holiday"
 MODE_ERROR = "error"
@@ -81,13 +104,23 @@ MODE_SAFE = "safe_mode"
 _RESTORE_BRAKE_RAMP = "brake_ramp"
 _RESTORE_BRAKE_LAST_T = "brake_last_t"
 _RESTORE_BRAKE_LAST_EXPENSIVE_T = "brake_last_expensive_t"
+_RESTORE_WAS_BRAKING = "was_braking_last_cycle"
 
-# Maximum dt_seconds allowed in _update_brake_ramp.
-# Caps the step size so a long gap between mode transitions (e.g. normal →
-# braking at a slot boundary, or braking → normal when price is reclassified)
-# does not cause a large jump in brake_ramp in a single cycle.
-# 60 s = one polling cycle → max ±5% per step at ramp_in/out = 20 min.
-_BRAKE_RAMP_MAX_DT_SECONDS: float = 60.0
+_PASSIVE_HEATPUMP_OPTIONS = frozenset(
+    {
+        "thermal_balance_entity",
+        "thermal_balance_kind",
+        "thermal_supply_target_entity",
+        "thermal_brine_pump_entity",
+        "thermal_circulation_pump_entity",
+        "thermal_brine_in_entity",
+        "thermal_brine_out_entity",
+        "thermal_aux_heat_entity",
+        "thermal_alarm_entity",
+        "thermal_alarm_numeric_verified",
+        "thermal_alarm_numeric_normal",
+    }
+)
 
 
 class PumpSteerSensor(RestoreEntity):
@@ -95,29 +128,122 @@ class PumpSteerSensor(RestoreEntity):
     PumpSteer heat pump controller.
 
     State machine:
+        safe_mode    -> required temperature/price input missing or invalid
         summer_mode  -> outdoor >= summer_threshold, passthrough
         precool      -> forecast shows warm period coming, raise fake temp
-        holiday      -> lower target, same PI/braking logic
-        preheating   -> expensive period coming, boost heating now
-        braking      -> expensive period active, PI disconnected
+        preheating   -> expensive period coming, bounded forecast-driven boost
+        pre_braking  -> expensive period imminent, price-only brake ramp
+        braking      -> expensive period active, PI integral frozen
+        brake_hold   -> short gap before another expensive period, factor held
+        holiday      -> lower target, otherwise same PI/price logic
         normal       -> PI regulates fake temp toward target
-        safe_mode    -> required data missing, passthrough real outdoor temp
     """
+
+    # Keep detailed, potentially large passive plans visible in HA without
+    # duplicating them in Recorder on every controller state update. Qualified
+    # outcome evidence is persisted separately in the bounded HA Store.
+    _attr_has_entity_name = True
+    _attr_translation_key = "control_temperature"
+    _unrecorded_attributes = frozenset(
+        {
+            "thermal_intelligence_plan_detail",
+            "thermal_intelligence_plan_outcomes",
+            "extra_temperature_zones",
+            "control_intelligence",
+            "heat_pump_telemetry",
+            "heat_pump_alarm",
+            "thermal_fixed_horizon_audit",
+            "thermal_intelligence_grid_marginal",
+        }
+    )
 
     def __init__(self, hass: HomeAssistant, config_entry: ConfigEntry):
         self.hass = hass
         self._config_entry = config_entry
+        self._control_config = {
+            k: v
+            for k, v in self._cfg().items()
+            if not k.startswith("zone_") and k not in _PASSIVE_HEATPUMP_OPTIONS
+        }
         self._state: Optional[float] = None
         self._attributes: Dict[str, Any] = {}
+        # Only live, qualified inputs; never populated from restored attributes.
+        self._input_temperatures: Dict[str, Optional[float]] = {}
+        self._input_temperature_signal = (
+            f"{DOMAIN}_{config_entry.entry_id}_input_temperatures"
+        )
         self._ohmigo_last_push = None
+        self._temperature_reported_after: Optional[datetime] = None
+        self._remove_start_listener = None
+        self._temperature_unloaded = False
+        self._update_in_progress = False
+        self._options_update_pending = False
 
         self._pi = PIController()
+        self._pi_precool_paused: bool = False
         self._thermal_model = ThermalModel()
+        self._adaptive_context = None
+        self._adaptive_configuration = None
+        self._adaptive_report = None
+        self._adaptive_new_report = False
+        self._adaptive_inputs_fresh = False
+        self._adaptive_learning_available = False
+        self._adaptive_temperature_evidence = {}
+        self._adaptive_braking = {
+            "state": "base",
+            "reason": "disabled",
+            "multiplier": 1.0,
+        }
+        self._pilot = None
+        from .pilot_forecast_audit import ForecastAudit
+
+        self._plan_audit = ForecastAudit()
+        self._plan_audit_loaded = False
+        self._pilot_store_read_failed = False
+        self._plan_cycle_identity = None
+        self._pilot_persisted = None
+        self._pilot_sources = None
+        self._pilot_detector = None
+        self._pilot_detection_after = None
+        self._pilot_heat_source = "unavailable"
+        self._pilot_status = "heat_signal_not_configured"
+        self._pilot_operating_mode = "unknown"
+        self._pilot_operating_quality = "insufficient_evidence"
+        self._heat_operation = None
+        self._heat_operation_signature = None
+        self._heat_operation_detail = {}
+        self._pilot_operation_checked_at = None
+        self._pilot_price_available = False
+        self._pilot_forecast_available = False
+        self._pilot_price_forecast = False
+        self._pilot_grid_marginal = {"status": "unavailable", "reason": "not_evaluated"}
+        self._pilot_price_context = None
+        self._pilot_plan = {"planning_status": "unavailable", "reason": "not_evaluated"}
+        self._pilot_plan_next = None
+        self._pilot_plan_signature = None
+        self._pilot_replay_state_signature = None
+        self._pilot_house_candidate = None
+        self._pilot_house_candidate_at = None
+        self._pilot_house_candidate_owner = None
+        self._pilot_weather_raw = None
+        self._pilot_holiday_current = None
+        self._pilot_hot_water_checked_at = None
+        self._power_ledger = None
+        self._power_unsubscribe = None
+        self._power_signature = None
+        self._power_last_report = None
+        self._pilot_store = None
+        self._pilot_saved = None
+        self._pilot_restore = None
+        # Thermal Learning is observational and cannot change control output.
+        self._thermal_learning_active: bool = False
+        self._thermal_learning_reason: str = "not_evaluated"
         self._last_outlook: Optional[Any] = None
         self._last_pi_result = None
 
         self._brake_ramp: float = 0.0
         self._preheat_ramp: float = 0.0
+        self._preheat_last_t: Optional[datetime] = None
         self._brake_last_t: Optional[datetime] = None
         self._brake_last_expensive_t: Optional[datetime] = None
 
@@ -130,6 +256,8 @@ class PumpSteerSensor(RestoreEntity):
         self._last_price_categories: List[str] = []
         self._p30: float = 0.0
         self._p80: float = 0.0
+        self._current_price: Optional[float] = None
+        self._current_price_unit: Optional[str] = None
 
         # Cache price thresholds once per calendar day per entity.
         # Recomputing every hour caused mid-slot reclassification: P80 could
@@ -146,12 +274,16 @@ class PumpSteerSensor(RestoreEntity):
         # The PI reset should happen once on entry, not on every cycle.
         self._prev_aggressiveness: Optional[int] = None
         self._prev_mode: Optional[str] = None
+        self._bridge_short_dip_active: bool = False
 
         # Store the remove callback returned by add_update_listener so it can
         # be cleaned up on unload.
         self._remove_update_listener = None
 
         self._attr_unique_id = config_entry.entry_id
+        # Keep the legacy default ID used by notifications before registration.
+        # HA still resolves existing (including user-renamed) entities by unique_id.
+        self.entity_id = "sensor.pumpsteer"
         self._forecast_available_last: Optional[bool] = None
         self._safe_mode_warned: bool = False
         self._helper_fallback_issues: Dict[str, Optional[str]] = {
@@ -173,10 +305,6 @@ class PumpSteerSensor(RestoreEntity):
         )
 
     @property
-    def name(self) -> str:
-        return "PumpSteer"
-
-    @property
     def unique_id(self) -> str:
         return self._attr_unique_id
 
@@ -184,9 +312,193 @@ class PumpSteerSensor(RestoreEntity):
     def state(self) -> StateType:
         return self._state
 
+    def _thermal_restore_attributes(self):
+        model = self._thermal_model
+        return {
+            "thermal_k_restore": model.k,
+            "thermal_k_valid": model.is_valid,
+            "thermal_k_samples": model.sample_count,
+            "thermal_fit_rmse_c_per_hour": model.fit_rmse,
+            "thermal_learning_sessions": model.learning_sessions,
+            "thermal_validated_sessions": model.validated_sessions,
+            "thermal_validation_basis": VALIDATION_BASIS,
+            "thermal_prediction_mae_c": model.prediction_mae,
+            "adaptive_model_state": {
+                "context": self._adaptive_context,
+                "configuration": self._adaptive_configuration,
+                "evidence": model.adaptive_snapshot(),
+            },
+        }
+
     @property
     def extra_state_attributes(self) -> dict:
-        return {**self._attributes, "friendly_name": "PumpSteer"}
+        attrs = {**self._attributes}
+        attrs.update(self._thermal_restore_attributes())
+        attrs.pop("control_intelligence", None)
+        if getattr(self, "_control_intelligence", None) is not None:
+            attrs["control_intelligence"] = {
+                **self._control_intelligence,
+                "applied": bool(
+                    getattr(self, "_control_applied_kind", None)
+                    and getattr(self, "_control_signal_snapshot", {})
+                ),
+            }
+        attrs.pop("extra_temperature_zones", None)
+        attrs.pop("heat_pump_telemetry", None)
+        attrs.pop("heat_pump_alarm", None)
+        if getattr(self, "_zone_diagnostics", None):
+            attrs["extra_temperature_zones"] = self._zone_diagnostics
+        if getattr(self, "_heatpump_diagnostics", None) is not None:
+            attrs["heat_pump_telemetry"] = self._heatpump_diagnostics
+        if getattr(self, "_heatpump_alarm_status", None):
+            attrs["heat_pump_alarm"] = self._heatpump_alarm_status
+        if hasattr(self, "_temperature_coverage"):
+            attrs["temperature_sources"] = self._temperature_coverage
+        for key in (
+            "thermal_intelligence_status",
+            "thermal_intelligence_reason",
+            "thermal_intelligence_learning_intervals",
+            "thermal_intelligence_plan",
+            "thermal_intelligence_forecast",
+            "thermal_intelligence_price",
+            "thermal_intelligence_price_forecast",
+            "thermal_intelligence_grid_marginal",
+            "thermal_intelligence_model",
+            "thermal_intelligence_physical_freshness",
+            "thermal_intelligence_external_heat",
+            "thermal_intelligence_planning_status",
+            "thermal_intelligence_plan_detail",
+            "thermal_intelligence_forecast_quality",
+            "thermal_intelligence_plan_outcomes",
+            "thermal_intelligence_electrical",
+            "thermal_intelligence_heat_source",
+            "thermal_intelligence_response",
+            "thermal_intelligence_operating_mode",
+            "thermal_intelligence_operating_quality",
+            "thermal_intelligence_operation_detail",
+        ):
+            attrs.pop(key, None)
+        if self._cfg().get("thermal_intelligence_enabled") is True:
+            interrupted = (
+                attrs.get("mode") == MODE_SAFE or attrs.get("status") == "error"
+            )
+            attrs["thermal_intelligence_operating_mode"] = (
+                "unknown" if interrupted else self._pilot_operating_mode
+            )
+            attrs["thermal_intelligence_operating_quality"] = (
+                "insufficient_evidence"
+                if interrupted
+                else self._pilot_operating_quality
+            )
+            attrs["thermal_intelligence_operation_detail"] = (
+                {} if interrupted else self._heat_operation_detail
+            )
+            attrs["thermal_intelligence_status"] = (
+                "suspended_safe"
+                if attrs.get("mode") == MODE_SAFE
+                else self._pilot_status
+            )
+            if attrs.get("mode") == MODE_SAFE:
+                reason = "safe_mode"
+            elif attrs.get("status") == "error":
+                reason = "update_error"
+            elif self._pilot_status in {
+                "heat_signal_not_configured",
+                "heat_signal_unavailable",
+                "temperature_report_unavailable",
+                "hot_water_active",
+                "hot_water_mode_unavailable",
+                "history_unavailable",
+            }:
+                reason = self._pilot_status
+            elif not self._pilot_price_forecast:
+                reason = "timestamped_price_forecast_unavailable"
+            elif not self._pilot_forecast_available:
+                reason = "weather_forecast_unavailable"
+            else:
+                reason = "validated_model_and_weather_issue_time_unavailable"
+            attrs["thermal_intelligence_reason"] = reason
+            attrs["thermal_intelligence_learning_intervals"] = (
+                self._pilot.house_intervals if self._pilot else 0
+            )
+            plan = (
+                self._pilot_plan
+                if not interrupted
+                else self._unavailable_pilot_plan("control_interrupted")
+            )
+            attrs["thermal_intelligence_plan"] = (
+                "hypothetical_only"
+                if plan["planning_status"] == "hypothetical_unvalidated"
+                else "validated_passive"
+                if plan["planning_status"] == "validated_passive"
+                else "not_available"
+            )
+            attrs["thermal_intelligence_planning_status"] = plan["planning_status"]
+            attrs["thermal_intelligence_plan_detail"] = plan
+            if (
+                self._plan_audit.plan_pending
+                or self._plan_audit.plan_records
+                or self._plan_audit.plan_unverifiable
+            ):
+                cfg = self._cfg()
+                attrs["thermal_intelligence_plan_outcomes"] = (
+                    self._plan_audit.plan_summary(
+                        cfg.get("indoor_temp_entity") or "",
+                        self._plan_current_identity(cfg),
+                    )
+                )
+            if self._power_ledger is not None:
+                attrs["thermal_intelligence_electrical"] = self._power_ledger.summary()
+            if (
+                self._pilot is not None
+                and self._pilot.audit.records
+                and not interrupted
+            ):
+                revision = self._pilot.audit.records[-1]["revision"]
+                attrs["thermal_intelligence_forecast_quality"] = {
+                    "model_revision": revision,
+                    **self._pilot.audit.summary(revision),
+                }
+            attrs["thermal_intelligence_forecast"] = (
+                "weather_outlook_unverified"
+                if not interrupted and self._pilot_forecast_available
+                else "unavailable"
+            )
+            attrs["thermal_intelligence_price"] = (
+                "current_available"
+                if not interrupted and self._pilot_price_available
+                else "unavailable"
+            )
+            attrs["thermal_intelligence_price_forecast"] = (
+                "coverage_complete_issue_time_unknown"
+                if not interrupted and self._pilot_price_forecast
+                else "unavailable"
+            )
+            attrs["thermal_intelligence_grid_marginal"] = (
+                {"status": "unavailable", "reason": "control_interrupted"}
+                if interrupted
+                else self._pilot_grid_marginal
+            )
+            attrs["thermal_intelligence_model"] = (
+                "validated_conditional"
+                if plan["planning_status"] == "validated_passive"
+                else "unvalidated"
+            )
+            attrs["thermal_intelligence_heat_source"] = (
+                self._pilot_heat_source if not interrupted else "unavailable"
+            )
+            attrs["thermal_intelligence_response"] = (
+                self._pilot.manager.pump.reason
+                if self._pilot is not None and not interrupted
+                else "unavailable"
+            )
+            attrs["thermal_intelligence_physical_freshness"] = "unverified"
+            attrs["thermal_intelligence_external_heat"] = (
+                "background_unverified"
+                if self._cfg().get("external_heat_sources") is True
+                else "not_enabled"
+            )
+        return attrs
 
     @property
     def unit_of_measurement(self) -> str:
@@ -214,13 +526,30 @@ class PumpSteerSensor(RestoreEntity):
         from homeassistant.helpers.restore_state import ExtraStoredData
 
         class _BrakeData(ExtraStoredData):
-            def __init__(self, brake_ramp, brake_last_t, brake_last_expensive_t):
+            def __init__(
+                self,
+                brake_ramp,
+                brake_last_t,
+                brake_last_expensive_t,
+                was_braking,
+                zones,
+                heat_alarm,
+                thermal,
+            ):
+                self.thermal = thermal
+                self.zones = zones
+                self.heat_alarm = heat_alarm
                 self.brake_ramp = brake_ramp
                 self.brake_last_t = brake_last_t
                 self.brake_last_expensive_t = brake_last_expensive_t
+                self.was_braking = was_braking
 
             def as_dict(self):
                 return {
+                    "thermal_model": self.thermal,
+                    "extra_temperature_zones": self.zones,
+                    "heat_pump_alarm": self.heat_alarm,
+                    _RESTORE_WAS_BRAKING: self.was_braking,
                     _RESTORE_BRAKE_RAMP: self.brake_ramp,
                     _RESTORE_BRAKE_LAST_T: (
                         self.brake_last_t.isoformat() if self.brake_last_t else None
@@ -236,10 +565,23 @@ class PumpSteerSensor(RestoreEntity):
             self._brake_ramp,
             self._brake_last_t,
             self._brake_last_expensive_t,
+            self._was_braking_last_cycle,
+            getattr(self, "_zone_diagnostics", getattr(self, "_zone_restore", {})),
+            getattr(
+                self,
+                "_heatpump_alarm_status",
+                getattr(self, "_heatpump_alarm_restore", {}),
+            ),
+            self._thermal_restore_attributes(),
         )
 
     async def async_added_to_hass(self) -> None:
+        self._temperature_reported_after = dt_util.now()
+        self._temperature_unloaded = False
         await super().async_added_to_hass()
+        self._setup_power_telemetry()
+        if self._cfg().get("thermal_intelligence_enabled") is True:
+            await self._load_pilot_store()
 
         self._remove_update_listener = self._config_entry.add_update_listener(
             self.async_options_update_listener
@@ -261,6 +603,20 @@ class PumpSteerSensor(RestoreEntity):
         extra = await self.async_get_last_extra_data()
         if extra is not None:
             data = extra.as_dict()
+            thermal = data.get("thermal_model")
+            if isinstance(thermal, dict):
+                self._attributes.update(
+                    {
+                        key: thermal[key]
+                        for key in self._thermal_restore_attributes()
+                        if key in thermal
+                    }
+                )
+            self._zone_restore = data.get("extra_temperature_zones", {})
+            self._heatpump_alarm_restore = data.get("heat_pump_alarm", {})
+            # Older timestamps also record pre-brake/precool requests, so they
+            # cannot prove that an expensive braking phase actually occurred.
+            self._was_braking_last_cycle = data.get(_RESTORE_WAS_BRAKING) is True
             self._brake_ramp = float(data.get(_RESTORE_BRAKE_RAMP, 0.0))
             raw_last_t = data.get(_RESTORE_BRAKE_LAST_T)
             raw_last_exp = data.get(_RESTORE_BRAKE_LAST_EXPENSIVE_T)
@@ -283,23 +639,86 @@ class PumpSteerSensor(RestoreEntity):
             self._brake_last_expensive_t,
         )
 
-        saved_k = self._attributes.get("thermal_k")
-        if saved_k is not None:
-            self._thermal_model.restore_k(float(saved_k))
+        try:
+            saved_k = safe_float(
+                self._attributes.get(
+                    "thermal_k_restore", self._attributes.get("thermal_k")
+                )
+            )
+            if saved_k is not None and self._attributes.get("thermal_k_valid") is True:
+                self._thermal_model.restore_k(saved_k)
+                self._thermal_model.restore_diagnostics(
+                    sample_count=self._attributes.get("thermal_k_samples", 0),
+                    fit_rmse=self._attributes.get("thermal_fit_rmse_c_per_hour"),
+                    learning_sessions=self._attributes.get(
+                        "thermal_learning_sessions", 0
+                    ),
+                    validated_sessions=self._attributes.get(
+                        "thermal_validated_sessions", 0
+                    ),
+                    prediction_mae=self._attributes.get("thermal_prediction_mae_c"),
+                    validation_basis=self._attributes.get("thermal_validation_basis"),
+                    last_prediction_error=self._attributes.get(
+                        "thermal_last_prediction_error_c"
+                    ),
+                    last_session_duration_minutes=self._attributes.get(
+                        "thermal_last_session_duration_minutes"
+                    ),
+                    last_session_actual_drop=self._attributes.get(
+                        "thermal_last_session_actual_drop_c"
+                    ),
+                    last_session_predicted_drop=self._attributes.get(
+                        "thermal_last_session_predicted_drop_c"
+                    ),
+                )
+
+        except (TypeError, ValueError, OverflowError):
+            self._thermal_model = ThermalModel()
+            _LOGGER.warning("Discarding corrupt restored thermal model")
+
+        adaptive_saved = self._attributes.get("adaptive_model_state")
+        if isinstance(adaptive_saved, dict):
+            self._adaptive_context = adaptive_saved.get("context")
+            self._adaptive_configuration = adaptive_saved.get("configuration")
+            self._thermal_model.restore_adaptive(adaptive_saved.get("evidence"))
+
+        self._attributes["adaptive_braking"] = dict(self._adaptive_braking)
 
         # Wait until Home Assistant is fully started before the first real update.
-        self.hass.bus.async_listen_once(
-            "homeassistant_started",
-            self._handle_ha_started,
-        )
-
         # If HA is already running (for example on reload), update immediately.
         if self.hass.is_running:
             await self.async_update()
             self.async_write_ha_state()
+        else:
+            self._remove_start_listener = self.hass.bus.async_listen_once(
+                "homeassistant_started", self._handle_ha_started
+            )
 
     async def async_will_remove_from_hass(self) -> None:
         """Cancel options update listener on unload."""
+        self._temperature_unloaded = True
+        alarm_task = getattr(self, "_heatpump_alarm_task", None)
+        if alarm_task is not None:
+            alarm_task.cancel()
+            await asyncio.gather(alarm_task, return_exceptions=True)
+        pending = list(getattr(self, "_zone_notify_tasks", {}).values())
+        for _, task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*(task for _, task in pending), return_exceptions=True)
+        self._input_temperatures = {}
+        async_dispatcher_send(self.hass, self._input_temperature_signal)
+        if self._cfg().get("thermal_intelligence_enabled") is True:
+            try:
+                self._plan_audit.cancel_plans("unload")
+                await self._save_pilot_store()
+                await self._flush_pilot_store()
+            except Exception:
+                _LOGGER.exception("Passive plan audit cleanup failed")
+        self._stop_power_telemetry()
+        if self._remove_start_listener is not None:
+            self._remove_start_listener()
+            self._remove_start_listener = None
         if self._remove_update_listener is not None:
             self._remove_update_listener()
             self._remove_update_listener = None
@@ -310,10 +729,74 @@ class PumpSteerSensor(RestoreEntity):
     ) -> None:
         """Handle updated options."""
         self._config_entry = entry
+        control_config = {
+            k: v
+            for k, v in self._cfg().items()
+            if not k.startswith("zone_") and k not in _PASSIVE_HEATPUMP_OPTIONS
+        }
+        if control_config == self._control_config:
+            if self._update_in_progress:
+                self._options_update_pending = True
+            else:
+                await self.async_update()
+            return
+        self._control_config = control_config
+        if (
+            self._heat_operation is not None
+            and self._cfg().get("thermal_intelligence_enabled") is True
+        ):
+            try:
+                await self._save_pilot_store()
+                await self._flush_pilot_store()
+            except Exception:
+                _LOGGER.exception("Passive heat history cleanup failed")
+        if self._cfg().get("thermal_intelligence_enabled") is not True:
+            try:
+                self._plan_audit.cancel_plans("disabled")
+                await self._save_pilot_store()
+                await self._flush_pilot_store()
+                self._pilot_store = None
+            except Exception:
+                _LOGGER.exception("Passive plan audit cleanup failed")
+        self._setup_power_telemetry()
+        self._heat_operation = None
+        self._heat_operation_signature = None
+        self._heat_operation_detail = {}
+        self._pilot_saved = None
+        self._pilot = None
+        self._pilot_sources = None
+        self._pilot_price_available = False
+        self._pilot_forecast_available = False
+        self._pilot_price_forecast = False
+        self._pilot_grid_marginal = {
+            "status": "unavailable",
+            "reason": "options_changed",
+        }
+        self._pilot_plan = self._unavailable_pilot_plan("options_changed")
+        self._pilot_plan_next = None
+        self._pilot_weather_raw = None
+        self._pilot_restore = None
+        self._pilot_saved = None
+        if self._cfg().get("thermal_intelligence_enabled") is True:
+            await self._load_pilot_store()
+        if self._update_in_progress:
+            self._options_update_pending = True
+            return
         await self.async_update()
 
     async def _handle_ha_started(self, event) -> None:
         """Run when HA is fully started and entities are ready."""
+        self._remove_start_listener = None
+        now = dt_util.now()
+        fired = getattr(event, "time_fired", None)
+        # Producers may report after the event but before this coroutine runs.
+        self._temperature_reported_after = (
+            fired
+            if isinstance(fired, datetime)
+            and fired.utcoffset() is not None
+            and fired <= now
+            else now
+        )
         await self.async_update()
         self.async_write_ha_state()
 
@@ -654,6 +1137,12 @@ class PumpSteerSensor(RestoreEntity):
             "target_temperature": target,
             "outdoor_temperature": outdoor,
             "price_category": price_category,
+            "current_price": (
+                round(self._current_price, 4)
+                if self._current_price is not None
+                else None
+            ),
+            "current_price_unit": self._current_price_unit,
             "aggressiveness": aggressiveness,
             "p30": round(self._p30, 3),
             "p80": round(self._p80, 3),
@@ -672,21 +1161,173 @@ class PumpSteerSensor(RestoreEntity):
                 if self._last_pi_result is not None
                 else None
             ),
+            "adaptive_braking": dict(self._adaptive_braking),
+            "adaptive_model_state": {
+                "context": self._adaptive_context,
+                "configuration": self._adaptive_configuration,
+                "evidence": self._thermal_model.adaptive_snapshot(),
+            },
             "thermal_k": round(self._thermal_model.k, 4),
+            "thermal_k_restore": self._thermal_model.k,
             "thermal_k_valid": self._thermal_model.is_valid,
             "thermal_k_samples": self._thermal_model.sample_count,
             "thermal_pending_samples": self._thermal_model.pending_samples,
+            "thermal_confidence": round(self._thermal_model.confidence, 3),
+            "thermal_confidence_percent": round(
+                self._thermal_model.confidence * 100, 1
+            ),
+            "thermal_fit_rmse_c_per_hour": (
+                round(self._thermal_model.fit_rmse, 3)
+                if self._thermal_model.fit_rmse is not None
+                else None
+            ),
+            "thermal_learning_active": self._thermal_learning_active,
+            "thermal_learning_reason": self._thermal_learning_reason,
+            "thermal_learning_sessions": self._thermal_model.learning_sessions,
+            "thermal_validated_sessions": self._thermal_model.validated_sessions,
+            "thermal_validation_basis": VALIDATION_BASIS,
+            "thermal_fixed_horizon_audit": (
+                self._plan_audit.fixed_summary(self._fixed_audit_identity(self._cfg()))
+                if self._cfg().get("thermal_intelligence_enabled") is True
+                else None
+            ),
+            "thermal_conditional_drop_60m_c": (
+                self._thermal_model.predict_bounded_drop(indoor, outdoor, 60)
+                if self._thermal_learning_active
+                and self._thermal_model.is_valid
+                and indoor is not None
+                and outdoor is not None
+                else None
+            ),
+            "thermal_conditional_forecast_status": "experimental_unvalidated",
+            "thermal_prediction_mae_c": (
+                round(self._thermal_model.prediction_mae, 3)
+                if self._thermal_model.prediction_mae is not None
+                else None
+            ),
+            "thermal_last_prediction_error_c": (
+                round(self._thermal_model.last_prediction_error, 3)
+                if self._thermal_model.last_prediction_error is not None
+                else None
+            ),
+            "thermal_last_session_duration_minutes": (
+                round(self._thermal_model.last_session_duration_minutes, 1)
+                if self._thermal_model.last_session_duration_minutes is not None
+                else None
+            ),
+            "thermal_last_session_actual_drop_c": (
+                round(self._thermal_model.last_session_actual_drop, 3)
+                if self._thermal_model.last_session_actual_drop is not None
+                else None
+            ),
+            "thermal_last_session_predicted_drop_c": (
+                round(self._thermal_model.last_session_predicted_drop, 3)
+                if self._thermal_model.last_session_predicted_drop is not None
+                else None
+            ),
         }
 
-    def _enter_safe_mode(
+    def _update_thermal_learning(
+        self,
+        *,
+        active: bool,
+        reason: str,
+        now: datetime,
+        indoor: float,
+        outdoor: float,
+    ) -> None:
+        """Observe stable braking without changing the heat pump control path."""
+        adaptive = self._cfg().get("adaptive_braking_enabled") is True
+        if adaptive and active:
+            if self._thermal_model._external_disturbance:
+                self._thermal_learning_active = False
+                self._thermal_learning_reason = (
+                    self._thermal_model._external_disturbance
+                )
+                return
+            if not self._adaptive_learning_available:
+                self._thermal_model.cancel_validation_session()
+                active, reason = False, "temperature_observation_missing"
+            elif not self._adaptive_new_report:
+                return
+        was_active = self._thermal_learning_active
+        self._thermal_learning_active = active
+        self._thermal_learning_reason = reason
+
+        if not active:
+            if self._thermal_model.validation_session_active:
+                self._thermal_model.end_validation_session(now, indoor)
+            return
+
+        if not was_active and self._cfg().get("thermal_intelligence_enabled") is True:
+            cfg = self._cfg()
+            if self._thermal_model.is_valid:
+                self._plan_audit.issue_fixed(
+                    now,
+                    indoor,
+                    outdoor,
+                    self._thermal_model.k,
+                    self._fixed_audit_identity(cfg),
+                )
+        if not was_active:
+            # Never infer the stable brake cooling rate from earlier PI/ramp history.
+            self._thermal_model.reset_temp_history(
+                self._adaptive_report if adaptive else now, indoor
+            )
+
+        if not self._thermal_model.validation_session_active:
+            self._thermal_model.start_validation_session(
+                self._adaptive_report if adaptive else now,
+                indoor,
+                outdoor,
+                adaptive_observations=adaptive,
+                screen_external_heat=adaptive
+                and (
+                    self._cfg().get("external_heat_sources") is True
+                    or bool(self._cfg().get("thermal_external_heat_entity"))
+                ),
+            )
+        elif not self._thermal_model.update_validation_session(
+            self._adaptive_report if adaptive else now, indoor, outdoor
+        ):
+            # An interrupted session is discarded, then restarted next cycle.
+            self._thermal_learning_reason = "observation_gap"
+
+        self._thermal_model.collect_braking_sample(indoor, outdoor)
+
+    async def _enter_safe_mode(
         self,
         reason: str,
         outdoor: Optional[float],
         now: datetime,
     ) -> None:
+        self._control_modifier_state = None
+        self._adaptive_braking = {
+            "state": "base",
+            "reason": "safe_mode",
+            "multiplier": 1.0,
+        }
+        self._adaptive_inputs_fresh = False
+        self._control_signal_snapshot = {}
+        self._control_applied_kind = None
+        self._pilot_plan = self._unavailable_pilot_plan("safe_mode")
+        self._pilot_detector = None
+        self._pilot_detection_after = now
+        self._pilot_plan_next = None
+        self._pilot_weather_raw = None
+        if self._pilot is not None:
+            if self._cfg().get("thermal_intelligence_enabled") is True:
+                self._pilot.reset_interval()
+                self._pilot.status = "suspended_safe"
+            else:
+                self._pilot = None
+                self._pilot_sources = None
+        self._thermal_model.cancel_validation_session()
+        self._thermal_learning_active = False
+        self._thermal_learning_reason = "safe_mode"
         if not self._safe_mode_warned:
             _LOGGER.warning(
-                "PumpSteer entered SAFE MODE: %s — optimization paused, sending real outdoor temp",
+                "PumpSteer entered SAFE MODE: %s — optimization paused",
                 reason,
             )
             self._safe_mode_warned = True
@@ -695,9 +1336,11 @@ class PumpSteerSensor(RestoreEntity):
             _LOGGER.debug("PumpSteer safe mode still active: %s", reason)
 
         self._pi.reset(now)
+        self._pi_precool_paused = False
         self._last_pi_result = None
         self._brake_ramp = 0.0
         self._preheat_ramp = 0.0
+        self._preheat_last_t = None
         self._brake_last_t = None
         self._brake_last_expensive_t = None
         self._was_braking_last_cycle = False
@@ -711,13 +1354,349 @@ class PumpSteerSensor(RestoreEntity):
                 "last_updated": now.isoformat(),
                 "outdoor_temperature": outdoor,
             }
+            await self._push_validated_temperature(
+                outdoor, self._cfg(), {"real_outdoor_entity": outdoor}
+            )
         else:
             self._state = None
             self._attributes = {
                 "mode": MODE_SAFE,
                 "status": f"safe_mode (no data): {reason}",
                 "last_updated": now.isoformat(),
+                "receiver_state": "unverified",
             }
+        if self._cfg().get("thermal_intelligence_enabled") is True:
+            try:
+                self._plan_audit.cancel_plans("safe_mode")
+                await self._save_pilot_store()
+            except Exception:
+                _LOGGER.exception("Passive plan audit cleanup failed in safe mode")
+
+    def _temperature_cutoff(self, cfg, *, outdoor=False):
+        """Use a configured HA-report age, without claiming physical freshness.
+
+        The lifecycle startup gate remains in force. The age limit is a bound
+        on HA reports, not a claim about physical sampling.
+        """
+        # Before HA lifecycle setup, offline callers can lack report timestamps.
+        # A running integration always establishes a startup cutoff.
+        configured_default = (
+            DEFAULT_OUTDOOR_REPORT_MAX_AGE_MINUTES
+            if outdoor
+            else DEFAULT_TEMPERATURE_REPORT_MAX_AGE_MINUTES
+        )
+        if outdoor:
+            legacy_limit = safe_float(cfg.get("temperature_report_max_age_minutes"))
+            if legacy_limit is not None and legacy_limit > 0:
+                configured_default = min(configured_default, legacy_limit)
+        key = (
+            "outdoor_temperature_report_max_age_minutes"
+            if outdoor
+            else "temperature_report_max_age_minutes"
+        )
+        default = (
+            configured_default if self._temperature_reported_after is not None else 0
+        )
+        minutes = safe_float(cfg.get(key, default))
+        if minutes is None or minutes <= 0:
+            if self._temperature_reported_after is None:
+                return None
+            minutes = configured_default
+        cutoff = dt_util.now().astimezone(timezone.utc) - timedelta(minutes=minutes)
+        if self._temperature_reported_after is not None:
+            cutoff = max(cutoff, self._temperature_reported_after)
+        return cutoff
+
+    def _temperature_state(self, cfg, key):
+        """Read the selected control temperatures and their actual HA reports."""
+        from types import SimpleNamespace
+
+        cutoff = self._temperature_cutoff(cfg, outdoor=key == "real_outdoor_entity")
+        if key == "real_outdoor_entity":
+            primary, backup = (
+                cfg.get("real_outdoor_entity"),
+                cfg.get("outdoor_temp_entity_2"),
+            )
+            active = getattr(self, "_outdoor_active_entity", None)
+            if (
+                active == backup
+                and backup
+                and get_temperature(self.hass, backup, cutoff) is not None
+                and (getattr(self.hass.states.get(backup), "attributes", {}) or {}).get(
+                    "unit_of_measurement"
+                )
+                in (None, "°C")
+            ):
+                return self.hass.states.get(backup)
+            for entity_id in (primary, backup):
+                state = self.hass.states.get(entity_id) if entity_id else None
+                unit = (getattr(state, "attributes", {}) or {}).get(
+                    "unit_of_measurement"
+                )
+                if get_temperature(self.hass, entity_id, cutoff) is not None and (
+                    entity_id != backup or unit in (None, "°C")
+                ):
+                    return state
+            return None
+        ids = [
+            cfg.get("indoor_temp_entity"),
+            cfg.get("indoor_temp_entity_2"),
+            cfg.get("indoor_temp_entity_3"),
+        ]
+        if not any(ids[1:]):
+            return (
+                self.hass.states.get(ids[0])
+                if get_temperature(self.hass, ids[0], cutoff) is not None
+                else None
+            )
+        rows = []
+        seen = set()
+        for index, entity_id in enumerate(ids, 1):
+            if not entity_id or entity_id in seen:
+                continue
+            seen.add(entity_id)
+            weight = safe_float(cfg.get(f"indoor_temp_weight_{index}", 1))
+            value = get_temperature(self.hass, entity_id, cutoff)
+            state = self.hass.states.get(entity_id)
+            unit = (getattr(state, "attributes", {}) or {}).get("unit_of_measurement")
+            if (
+                value is None
+                or weight is None
+                or weight <= 0
+                or unit not in (None, "°C")
+            ):
+                continue
+            rows.append((entity_id, weight, value, state))
+        if not rows:
+            return None
+        total = sum(row[1] for row in rows)
+        value = sum(row[1] * row[2] for row in rows) / total
+        timestamps = [getattr(row[3], "last_reported", None) for row in rows]
+        changes = [getattr(row[3], "last_changed", None) for row in rows]
+
+        def timestamp(values, operation):
+            try:
+                return (
+                    operation(values, key=lambda v: v.timestamp())
+                    if all(
+                        isinstance(v, datetime) and v.utcoffset() is not None
+                        for v in values
+                    )
+                    else None
+                )
+            except (TypeError, ValueError):
+                return None
+
+        return SimpleNamespace(
+            state=str(value),
+            attributes={
+                "unit_of_measurement": "°C",
+                "source_temperatures_used": {r[0]: r[2] for r in rows},
+                "source_weights": {r[0]: r[1] for r in rows},
+                "physical_measurement_time": "unknown",
+                "oldest_component_report": timestamp(timestamps, min),
+            },
+            last_reported=timestamp(timestamps, max),
+            last_changed=timestamp(changes, max),
+            last_updated=timestamp(changes, max),
+        )
+
+    def _update_outdoor_selection(self, cfg):
+        """Switch immediately on failure; require two good cycles to fail back."""
+        primary = cfg.get("real_outdoor_entity")
+        backup = cfg.get("outdoor_temp_entity_2")
+        cutoff = self._temperature_cutoff(cfg, outdoor=True)
+        good_primary = get_temperature(self.hass, primary, cutoff) is not None
+        backup_state = self.hass.states.get(backup) if backup else None
+        backup_unit = (getattr(backup_state, "attributes", {}) or {}).get(
+            "unit_of_measurement"
+        )
+        good_backup = get_temperature(
+            self.hass, backup, cutoff
+        ) is not None and backup_unit in (None, "°C")
+        active = getattr(self, "_outdoor_active_entity", None)
+        recovery = getattr(self, "_outdoor_primary_recovery", 0)
+        if active == backup and backup and good_backup:
+            recovery = recovery + 1 if good_primary else 0
+            active = primary if recovery >= 2 else backup
+        else:
+            active = primary if good_primary else backup if good_backup else None
+            recovery = 0
+        self._outdoor_active_entity = active
+        self._outdoor_primary_recovery = recovery
+
+    def _temperature_value(self, cfg, key):
+        state = self._temperature_state(cfg, key)
+        return safe_float(getattr(state, "state", None))
+
+    def _temperature_identity(self, cfg):
+        inside = self._temperature_state(cfg, "indoor_temp_entity")
+        outside = self._temperature_state(cfg, "real_outdoor_entity")
+        attrs = getattr(inside, "attributes", {}) or {}
+        weights = attrs.get("source_weights")
+        components = attrs.get("source_temperatures_used")
+        inside_identity = (
+            tuple(sorted(weights.items()))
+            if isinstance(weights, dict)
+            else (cfg.get("indoor_temp_entity"), tuple(sorted(components)))
+            if isinstance(components, dict)
+            and all(isinstance(k, str) for k in components)
+            else cfg.get("indoor_temp_entity")
+        )
+        outside_id = None
+        for key in ("real_outdoor_entity", "outdoor_temp_entity_2"):
+            if outside is not None and self.hass.states.get(cfg.get(key)) is outside:
+                outside_id = cfg.get(key)
+                break
+        outside_attrs = getattr(outside, "attributes", {}) or {}
+        return inside_identity, outside_id, outside_attrs.get("selected_source")
+
+    def _temperature_inputs_match(self, cfg, expected) -> bool:
+        current_cfg = self._cfg()
+        return (
+            not self._temperature_unloaded
+            and current_cfg == cfg
+            and (
+                not any(
+                    cfg.get(k)
+                    for k in (
+                        "indoor_temp_entity_2",
+                        "indoor_temp_entity_3",
+                        "outdoor_temp_entity_2",
+                    )
+                )
+                or not hasattr(self, "_temperature_cycle_identity")
+                or self._temperature_cycle_identity == self._temperature_identity(cfg)
+            )
+            and all(
+                value is not None
+                and current_cfg.get(key) == cfg.get(key)
+                and self._temperature_value(cfg, key) == value
+                for key, value in expected.items()
+            )
+        )
+
+    async def _temperature_interrupted(self, cfg) -> None:
+        self._input_temperatures = {}
+        # Options invalidation is retried; it must not reset PI/ramp history.
+        if self._cfg() != cfg:
+            return
+        # No receiver reset/bypass is implied: its physical fallback is unknown.
+        await self._enter_safe_mode(
+            "Temperature inputs changed during update", None, dt_util.now()
+        )
+        self._attributes["temperature_input_status"] = "interrupted"
+
+    async def _push_validated_temperature(self, fake_temp, cfg, expected) -> None:
+        if not cfg.get("ohmigo_entity") and not cfg.get("modbus_service"):
+            return
+        temperature_interrupted = False
+        optional_interrupted = False
+        signal_snapshot = getattr(self, "_control_signal_snapshot", {})
+
+        def signals_match(override=None):
+            if not signal_snapshot:
+                return True
+            from .control_intelligence import (
+                SIGNALS,
+                evaluate_limits,
+                external_heat_status,
+            )
+
+            states = {
+                cfg[key]: self.hass.states.get(cfg[key])
+                for key in SIGNALS.values()
+                if cfg.get(key)
+            }
+            external = cfg.get("thermal_external_heat_entity")
+            if external in signal_snapshot:
+                states[external] = self.hass.states.get(external)
+            if override is not None:
+                states[override[0]] = override[1]
+            external_matches = (
+                external not in signal_snapshot
+                or external_heat_status(
+                    dt_util.now(),
+                    cfg,
+                    states,
+                    measured_after=getattr(self, "_temperature_reported_after", None),
+                )
+                == "verified_inactive"
+            )
+            current = evaluate_limits(
+                dt_util.now(),
+                cfg,
+                states,
+                measured_after=getattr(self, "_temperature_reported_after", None),
+            )
+            applied = getattr(self, "_control_applied_kind", None)
+            return external_matches and (
+                current[applied] == self._control_intelligence[applied]
+                if applied
+                else external in signal_snapshot
+            )
+
+        def check():
+            nonlocal temperature_interrupted, optional_interrupted
+            temperature_interrupted = (
+                temperature_interrupted
+                or not self._temperature_inputs_match(cfg, expected)
+            )
+            optional_interrupted = optional_interrupted or not signals_match()
+            return not temperature_interrupted and not optional_interrupted
+
+        @callback
+        def optional_changed(event):
+            nonlocal optional_interrupted
+            entity = event.data.get("entity_id")
+            if entity in signal_snapshot:
+                optional_interrupted = optional_interrupted or not signals_match(
+                    (entity, event.data.get("new_state"))
+                )
+
+        if check():
+            indoor = self._temperature_state(cfg, "indoor_temp_entity")
+            indoor_attrs = getattr(indoor, "attributes", {}) or {}
+            contributors = indoor_attrs.get("source_weights")
+            sources = (
+                list(contributors)
+                if isinstance(contributors, dict)
+                else (
+                    [cfg["indoor_temp_entity"]]
+                    if indoor is not None and cfg.get("indoor_temp_entity")
+                    else []
+                )
+            )
+            outside_id = self._temperature_identity(cfg)[1]
+            if outside_id:
+                sources.append(outside_id)
+            if signal_snapshot:
+                from homeassistant.helpers.event import async_track_state_change_event
+
+                unsubscribe = async_track_state_change_event(
+                    self.hass, list(signal_snapshot), optional_changed
+                )
+            else:
+                unsubscribe = lambda: None
+            try:
+                self._ohmigo_last_push = await async_push_ohmigo(
+                    self.hass,
+                    self._config_entry,
+                    fake_temp,
+                    self._ohmigo_last_push,
+                    temperature_check=check,
+                    temperature_sources=sources,
+                )
+            finally:
+                unsubscribe()
+        check()
+        if temperature_interrupted:
+            await self._temperature_interrupted(cfg)
+        elif optional_interrupted:
+            # This command was based on an observation that no longer supports
+            # it. Keep normal PI/ramp state; the next regular cycle recalculates.
+            self._attributes["control_signal_status"] = "interrupted"
+            self._attributes["receiver_state"] = "unverified"
 
     def _update_brake_ramp(
         self,
@@ -734,29 +1713,19 @@ class PumpSteerSensor(RestoreEntity):
         HA restart — never causes a large jump in brake_ramp in a single step.
         This applies equally to ramp-in and ramp-out.
         """
-        if self._brake_last_t is None:
-            dt_seconds = _BRAKE_RAMP_MAX_DT_SECONDS
-        else:
-            dt_seconds = max((now - self._brake_last_t).total_seconds(), 1.0)
-            dt_seconds = min(dt_seconds, _BRAKE_RAMP_MAX_DT_SECONDS)
-
-        self._brake_last_t = now
-
-        if brake_requested:
-            self._brake_last_expensive_t = now
-            rate = 1.0 / (ramp_in * 60.0)
-            self._brake_ramp += dt_seconds * rate
-        else:
-            hold_active = (
-                self._brake_last_expensive_t is not None
-                and (now - self._brake_last_expensive_t).total_seconds()
-                < hold_minutes * 60.0
+        self._brake_ramp, self._brake_last_t, self._brake_last_expensive_t = (
+            brake_ramp_step(
+                self._brake_ramp,
+                self._brake_last_t,
+                self._brake_last_expensive_t,
+                brake_requested,
+                now,
+                ramp_in,
+                ramp_out,
+                hold_minutes,
+                max_dt_seconds=_BRAKE_RAMP_MAX_DT_SECONDS,
             )
-            if not hold_active:
-                rate = 1.0 / (ramp_out * 60.0)
-                self._brake_ramp -= dt_seconds * rate
-
-        self._brake_ramp = max(0.0, min(1.0, self._brake_ramp))
+        )
         return self._brake_ramp
 
     def _update_preheat_ramp(
@@ -764,18 +1733,373 @@ class PumpSteerSensor(RestoreEntity):
         preheat_requested: bool,
         ramp_in: float,
         ramp_out: float,
+        dt_seconds: float = 60.0,
     ) -> float:
         """Update preheat ramp factor for smooth preheat entry and exit."""
-        step_up = 1.0 / max(ramp_in, 1.0)
-        step_down = 1.0 / max(ramp_out, 1.0)
-
-        if preheat_requested:
-            self._preheat_ramp += step_up
-        else:
-            self._preheat_ramp -= step_down
-
-        self._preheat_ramp = max(0.0, min(1.0, self._preheat_ramp))
+        self._preheat_ramp = preheat_ramp_step(
+            self._preheat_ramp,
+            preheat_requested,
+            ramp_in,
+            ramp_out,
+            dt_seconds,
+            max_dt_seconds=_PREHEAT_RAMP_MAX_DT_SECONDS,
+        )
         return self._preheat_ramp
+
+    def _prepare_adaptive_observation(self, cfg, now, identity):
+        """HA report evidence is observed response, never physical heat delivery."""
+        configured = []
+        for index, key in enumerate(
+            ("indoor_temp_entity", "indoor_temp_entity_2", "indoor_temp_entity_3"), 1
+        ):
+            entity = cfg.get(key)
+            weight = safe_float(cfg.get(f"indoor_temp_weight_{index}", 1))
+            if (
+                entity
+                and weight is not None
+                and weight > 0
+                and entity not in [row[0] for row in configured]
+            ):
+                configured.append((entity, weight))
+        settings = (
+            cfg.get("brake_delta_c", BRAKE_DELTA_C),
+            self._aggressiveness(cfg),
+            cfg.get("external_heat_sources", False),
+        )
+        configured_sources = (
+            configured,
+            cfg.get("real_outdoor_entity"),
+            cfg.get("outdoor_temp_entity_2"),
+            settings,
+        )
+        if cfg.get("thermal_external_heat_entity"):
+            configured_sources += (cfg["thermal_external_heat_entity"],)
+        configuration = repr(configured_sources)
+        old_configuration = getattr(self, "_adaptive_configuration", None)
+        if old_configuration is not None and configuration != old_configuration:
+            # A changed configured house/weight/control setup invalidates experience.
+            self._thermal_model = ThermalModel()
+            self._adaptive_context = None
+            self._adaptive_temperature_evidence = {}
+        if configuration != old_configuration:
+            if old_configuration is not None or self._adaptive_context is None:
+                self._adaptive_configuration = configuration
+            self._adaptive_report = None
+            self._adaptive_component_reports = {}
+            self._adaptive_seen_reports = {}
+            self._adaptive_sparse_sources = set()
+        indoor = self._temperature_state(cfg, "indoor_temp_entity")
+        indoor_attrs = getattr(indoor, "attributes", {}) or {}
+        contributors = indoor_attrs.get("source_temperatures_used")
+        contributors = (
+            list(contributors)
+            if isinstance(contributors, dict)
+            else [cfg.get("indoor_temp_entity")]
+            if indoor is not None
+            else []
+        )
+        context = repr((identity, *settings))
+        complete = bool(
+            configured
+            and set(contributors) == {row[0] for row in configured}
+            and self._temperature_state(cfg, "real_outdoor_entity") is not None
+        )
+        if complete and old_configuration is None:
+            # Legacy summaries identify the trained contributors but not configured
+            # availability/priority. Compare against configured source variants,
+            # not merely whichever outdoor source happened to report first.
+            from ast import literal_eval
+
+            legacy_matches = self._adaptive_context is None
+            try:
+                if (
+                    isinstance(self._adaptive_context, str)
+                    and len(self._adaptive_context) < 4096
+                ):
+                    saved_identity, *saved_settings = literal_eval(
+                        self._adaptive_context
+                    )
+                    expected_inside = (
+                        tuple(sorted(configured))
+                        if cfg.get("indoor_temp_entity_2")
+                        or cfg.get("indoor_temp_entity_3")
+                        else cfg.get("indoor_temp_entity")
+                    )
+                    legacy_matches = (
+                        tuple(saved_settings) == settings
+                        and saved_identity[0] == expected_inside
+                        and saved_identity[1]
+                        in (
+                            cfg.get("real_outdoor_entity"),
+                            cfg.get("outdoor_temp_entity_2"),
+                        )
+                    )
+            except (ValueError, TypeError, SyntaxError, IndexError, RecursionError):
+                legacy_matches = False
+            if not legacy_matches:
+                self._thermal_model = ThermalModel()
+                self._adaptive_context = None
+            self._adaptive_configuration = configuration
+        if not complete or (
+            self._adaptive_context is not None and context != self._adaptive_context
+        ):
+            # Missing/partial reports or a temporary fallback are not a new house.
+            # Retain experience but never learn/use it for a different composition.
+            self._adaptive_inputs_fresh = False
+            self._adaptive_learning_available = False
+            self._adaptive_new_report = False
+            self._adaptive_observation_reason = "temperature_composition_unavailable"
+            self._adaptive_observation_after = now
+            self._thermal_model.cancel_validation_session()
+            return
+        if self._adaptive_context is None:
+            self._adaptive_context = context
+        from .control_intelligence import _timestamp, verified_signal_value
+
+        evidence = self._adaptive_temperature_evidence
+        accepted = getattr(self, "_adaptive_component_reports", {})
+        observations = {}
+        valid = True
+        attribute = cfg.get("control_measurement_time_attribute", "measurement_time")
+        for entity in contributors:
+            source = self.hass.states.get(entity)
+            value = safe_float(getattr(source, "state", None))
+            report = getattr(source, "last_reported", None)
+            attrs = getattr(source, "attributes", {}) or {}
+            previous = evidence.get(entity)
+            if (
+                value is None
+                or not isinstance(report, datetime)
+                or report.utcoffset() is None
+                or report.timestamp() > now.timestamp()
+            ):
+                valid = False
+                continue
+            observed = previous.get("observed_at") if previous else None
+            clock = previous.get("clock") if previous else None
+            authoritative = (
+                cfg.get("control_signals_verified") is True
+                and attribute
+                not in {"last_seen", "last_reported", "last_updated", "last_changed"}
+                and (attribute in attrs or clock is not None)
+            )
+            if authoritative:
+                source_time = _timestamp(attrs.get(attribute))
+                if (
+                    previous
+                    and clock is not None
+                    and source_time == clock
+                    and value == previous["value"]
+                ):
+                    pass  # unchanged measurement clock is not a new observation
+                elif verified_signal_value(
+                    now,
+                    source,
+                    attribute=attribute,
+                    measured_after=self._temperature_reported_after,
+                ) is not None and (clock is None or source_time > clock):
+                    observed = datetime.fromtimestamp(source_time, timezone.utc)
+                    clock = source_time
+                else:
+                    valid = False
+                    continue  # stale/invalid explicit time must never fall back to HA receipt
+            elif previous and value != previous["value"]:
+                if report.timestamp() <= previous["receipt"].timestamp():
+                    valid = False
+                    continue
+                observed = report  # observed value change; NOT a verified physical sampling time
+            evidence[entity] = {
+                "value": value,
+                "receipt": report,
+                "observed_at": observed,
+                "clock": clock,
+            }
+            if (
+                observed is None
+                or (
+                    getattr(self, "_adaptive_observation_after", None) is not None
+                    and observed.timestamp()
+                    <= self._adaptive_observation_after.timestamp()
+                )
+                or not 0
+                <= now.timestamp() - observed.timestamp()
+                <= ADAPTIVE_LEARNING_MAX_GAP_MINUTES * 60
+            ):
+                valid = False
+            else:
+                observations[entity] = observed
+        self._adaptive_learning_available = valid and len(observations) == len(
+            contributors
+        )
+        horizon = min(45.0, self._thermal_model.adaptive_horizon_minutes)
+        self._adaptive_inputs_fresh = self._adaptive_learning_available and all(
+            now.timestamp() - at.timestamp() <= horizon * 60
+            for at in observations.values()
+        )
+        self._adaptive_observation_reason = (
+            "temperature_observation_missing"
+            if not self._adaptive_learning_available
+            else "temperature_observation_too_old"
+        )
+        self._adaptive_new_report = bool(
+            self._adaptive_learning_available
+            and all(
+                entity not in accepted
+                or observations[entity].timestamp() > accepted[entity].timestamp()
+                for entity in contributors
+            )
+        )
+        if self._adaptive_new_report:
+            self._adaptive_component_reports = dict(observations)
+            self._adaptive_report = max(
+                observations.values(), key=lambda at: at.timestamp()
+            )
+
+    def _adaptive_brake_multiplier(
+        self, now, cfg, indoor, outdoor, comfort_floor, ramp_in, ramp_out, eligible
+    ):
+        enabled = cfg.get("adaptive_braking_enabled") is True
+        model = getattr(self, "_adaptive_evidence_model", self._thermal_model)
+        reason = "disabled"
+        predicted = None
+        requested = 1.0
+        external_status = "not_configured"
+        if enabled:
+            from .control_intelligence import external_heat_status
+
+            states = getattr(self, "_control_observation_states", None)
+            if states is None:
+                entity = cfg.get("thermal_external_heat_entity")
+                states = {entity: self.hass.states.get(entity)} if entity else {}
+            external_status = external_heat_status(
+                now,
+                cfg,
+                states,
+                measured_after=getattr(self, "_temperature_reported_after", None),
+            )
+            if external_status in ("verified_active", "unknown"):
+                model.mark_external_disturbance(
+                    "external_heat_verified_active"
+                    if external_status == "verified_active"
+                    else "external_heat_signal_unavailable"
+                )
+            elif (
+                cfg.get("external_heat_sources") is True
+                or cfg.get("thermal_external_heat_entity")
+            ) and eligible:
+                model.screen_possible_external_heat(now)
+            reason = model.adaptive_reason(now, indoor - outdoor)
+            if not getattr(self, "_adaptive_inputs_fresh", False):
+                reason = getattr(
+                    self,
+                    "_adaptive_observation_reason",
+                    "temperature_reports_unavailable",
+                )
+            if reason == "qualified" and eligible:
+                predicted = model.predict_drop(
+                    indoor, outdoor, model.adaptive_horizon_minutes
+                )
+                # The model describes unmodified braking, not causal heat output.
+                # Reduce only: retain a 0.2 C reserve plus 0.2 C validation allowance.
+                budget = max(0.0, indoor - comfort_floor - 0.4)
+                if predicted > budget and predicted > 0:
+                    requested = 1.0 - 0.25 * min(1.0, (predicted - budget) / predicted)
+            elif reason == "qualified":
+                reason = "outside_price_braking"
+        history = getattr(self, "_control_modifier_state", None) or {}
+        if enabled or "adaptive" in history:
+            multiplier = self._control_modifier_multiplier(
+                now, "adaptive", requested, True, ramp_in, ramp_out
+            )
+        else:
+            multiplier = 1.0
+        self._adaptive_braking = {
+            "state": "adapting"
+            if multiplier < 1 and requested < 1
+            else "returning_to_base"
+            if multiplier < 1
+            else "learned"
+            if reason == "qualified"
+            else "collecting"
+            if enabled
+            else "base",
+            "reason": reason,
+            "multiplier": round(multiplier, 6),
+            "predicted_drop_30m_c": round(predicted, 3)
+            if predicted is not None
+            else None,
+        }
+        if enabled:
+            self._adaptive_braking["prediction_horizon_minutes"] = (
+                model.adaptive_horizon_minutes if predicted is not None else None
+            )
+            self._adaptive_braking["predicted_drop_c"] = (
+                round(predicted, 3) if predicted is not None else None
+            )
+            if model.adaptive_horizon_minutes != 30:
+                self._adaptive_braking["predicted_drop_30m_c"] = None
+            self._adaptive_braking["external_heat"] = external_status
+            if multiplier < 1 and external_status == "verified_inactive":
+                snapshot = dict(getattr(self, "_control_signal_snapshot", {}) or {})
+                snapshot[cfg["thermal_external_heat_entity"]] = (
+                    "external_heat",
+                    "verified_inactive",
+                )
+                self._control_signal_snapshot = snapshot
+        return multiplier
+
+    def _control_modifier_multiplier(
+        self, now, kind, target, enabled, ramp_in, ramp_out
+    ):
+        """Ramp only the optional correction; stale observations are never reused."""
+        history = dict(getattr(self, "_control_modifier_state", None) or {})
+        previous_kind = kind if kind == "adaptive" else history.get("_last_kind")
+        if not enabled:
+            history.pop(kind, None)
+            if history:
+                history["_last_kind"] = kind
+            self._control_modifier_state = history or None
+            return 1.0
+        previous = history.get(kind)
+        maximum = 0.25 if kind == "adaptive" else 0.5 if kind == "brake" else 1.0
+        requested = max(0.0, min(maximum, 1.0 - target))
+        if previous is None:
+            current, elapsed = 0.0, 60.0
+            previous_time = now
+        else:
+            current, previous_time = previous
+            gap = max(0.0, now.timestamp() - previous_time.timestamp())
+            # A correction from a previous phase is no longer output history
+            # after a full ramp-out period spent in another phase.
+            if previous_kind != kind and gap >= max(float(ramp_out), 10.0) * 60.0:
+                current = 0.0
+            elapsed = min(60.0, gap)
+        duration = ramp_in if requested > current else ramp_out
+        step = maximum * elapsed / (max(float(duration), 10.0) * 60.0)
+        current = (
+            min(requested, current + step)
+            if requested > current
+            else max(requested, current - step)
+        )
+        timestamp = (
+            now if now.timestamp() >= previous_time.timestamp() else previous_time
+        )
+        history[kind] = (current, timestamp)
+        if kind != "adaptive":
+            history["_last_kind"] = kind
+        self._control_modifier_state = history
+        if (
+            kind != "adaptive"
+            and getattr(self, "_control_intelligence", None) is not None
+        ):
+            self._control_intelligence["transition"] = (
+                "returning_to_base"
+                if requested == 0 and current > 0
+                else "ramping"
+                if abs(current - requested) > 1e-9
+                else "settled"
+            )
+        return 1.0 - current
 
     def _pi_output(
         self,
@@ -799,7 +2123,7 @@ class PumpSteerSensor(RestoreEntity):
             outdoor_temp=outdoor,
             aggressiveness=1.0,
             update_time=now,
-            braking_active=freeze_integral,
+            braking_active=freeze_integral or self._pi_precool_paused,
             kp=kp,
             ki=ki,
             kd=kd,
@@ -812,30 +2136,387 @@ class PumpSteerSensor(RestoreEntity):
             decay_per_minute_on_brake=0.98,
         )
 
+        self._pi_precool_paused = False
         self._last_pi_result = result
         return -result.offset
 
     async def async_update(self) -> None:
         """Update sensor state."""
+        # Options/startup invoke this directly, outside HA's polling update guard.
+        if self._update_in_progress:
+            return
+        self._update_in_progress = True
         try:
-            await self._do_update()
-        except Exception as err:
-            _LOGGER.exception("PumpSteer update failed: %s", err)
-            self._last_pi_result = None
-            self._state = None
-            self._attributes = {
-                "status": "error",
-                "last_error": str(err),
-                "last_updated": dt_util.now().isoformat(),
+            while True:
+                self._options_update_pending = False
+                self._input_temperatures = {}
+                try:
+                    if self._temperature_unloaded or not getattr(
+                        self.hass, "is_running", True
+                    ):
+                        await self._enter_safe_mode(
+                            "Waiting for Home Assistant startup", None, dt_util.now()
+                        )
+                        return
+                    await self._do_update()
+                except Exception as err:
+                    self._input_temperatures = {}
+                    if self._pilot is not None:
+                        self._pilot.reset_interval()
+                    self._pilot_status = "update_error"
+                    self._thermal_model.cancel_validation_session()
+                    self._thermal_learning_active = False
+                    self._thermal_learning_reason = "update_error"
+                    _LOGGER.exception("PumpSteer update failed: %s", err)
+                    self._last_pi_result = None
+                    self._state = None
+                    self._attributes = {
+                        "status": "error",
+                        "last_error": str(err),
+                        "last_updated": dt_util.now().isoformat(),
+                    }
+                if not self._options_update_pending:
+                    break
+        except asyncio.CancelledError:
+            self._input_temperatures = {}
+            raise
+        finally:
+            self._update_in_progress = False
+            async_dispatcher_send(self.hass, self._input_temperature_signal)
+
+    def _queue_zone_notification(self, monitor, alert, service):
+        """Deliver outside the control task; acknowledge only a current event."""
+        if not hasattr(self, "_zone_notify_tasks"):
+            self._zone_notify_tasks = {}
+        key = (alert["slot"], alert["event"])
+        pending = self._zone_notify_tasks.get(key)
+        if pending is not None:
+            if pending[0]["generation"] is alert["generation"]:
+                return
+            pending[1].cancel()
+        create_task = getattr(self.hass, "async_create_task", asyncio.create_task)
+        task = create_task(self._send_zone_notification(monitor, alert, service))
+        self._zone_notify_tasks[key] = (alert, task)
+
+        def done(finished):
+            if self._zone_notify_tasks.get(key, (None, None))[1] is finished:
+                self._zone_notify_tasks.pop(key, None)
+
+        task.add_done_callback(done)
+
+    async def _send_zone_notification(self, monitor, alert, service):
+        try:
+            if self._temperature_unloaded or not monitor.notification_current(alert):
+                return
+            event, slot = alert["event"], alert["slot"]
+            from .extra_zones import zone_notification_message
+
+            payload = monitor.notification_payload(
+                alert, dt_util.now(), self.hass.states
+            )
+            if payload is None:
+                return
+            language = getattr(getattr(self.hass, "config", None), "language", "sv")
+            message = zone_notification_message(payload, language)
+            async with asyncio.timeout(30):
+                await self.hass.services.async_call(
+                    "notify",
+                    service[7:],
+                    {"message": message},
+                    blocking=True,
+                )
+            if getattr(self, "_extra_zones", None) is not monitor:
+                return
+            acknowledged = monitor.mark_delivered(alert)
+            if acknowledged is None:
+                return
+            diagnostic = self._zone_diagnostics[str(slot)]
+            for related in payload.get("related_events", ()):
+                if monitor.notification_current({**alert, "event": related}):
+                    monitor.mark_sent(slot, related)
+                    acknowledged["notifications_sent"][related] = True
+            diagnostic.update(acknowledged)
+            diagnostic["notification_sent"] = acknowledged["notifications_sent"].get(
+                "temperature", False
+            )
+            async_dispatcher_send(self.hass, self._input_temperature_signal)
+            if getattr(self, "platform", None) is not None:
+                self.async_write_ha_state()
+        except Exception:
+            _LOGGER.warning(
+                "Zone notification failed for slot %s", alert["slot"], exc_info=True
+            )
+
+    async def _send_heatpump_alarm(self, monitor, event, service, generation):
+        try:
+            if self._temperature_unloaded or not monitor.current(event):
+                return
+            from .notify import async_send_notification, heatpump_alarm_message
+
+            async with asyncio.timeout(30):
+                route = await async_send_notification(
+                    self.hass,
+                    self._config_entry,
+                    "PumpSteer",
+                    heatpump_alarm_message(self.hass, event),
+                    f"pumpsteer_{self._config_entry.entry_id}_heatpump_fault",
+                    confirmed=True,
+                    persistent_existing=monitor.persistent,
+                )
+            if getattr(
+                self, "_heatpump_alarm", None
+            ) is monitor and monitor.mark_delivered(event, generation):
+                monitor.persistent = route == "persistent"
+                self._heatpump_alarm_status = {
+                    **self._heatpump_alarm_status,
+                    "sent": monitor.sent,
+                    "persistent": monitor.persistent,
+                    "recovery_pending": monitor.recovery_pending,
+                }
+                async_dispatcher_send(self.hass, self._input_temperature_signal)
+                if getattr(self, "platform", None) is not None:
+                    self.async_write_ha_state()
+        except Exception:
+            _LOGGER.warning("Heat pump alarm notification failed", exc_info=True)
+
+    def _observe_heatpump(self, now, cfg):
+        """Read optional diagnostics and fault state; never influence control."""
+        alarm_entity = cfg.get("thermal_alarm_entity")
+        if alarm_entity:
+            from .heatpump_alarm import HeatPumpAlarm
+
+            monitor = getattr(self, "_heatpump_alarm", None)
+            numeric_options = {
+                "numeric_verified": cfg.get("thermal_alarm_numeric_verified") is True,
+                "numeric_normal": cfg.get("thermal_alarm_numeric_normal"),
             }
+            if monitor is None or not monitor.matches_config(
+                alarm_entity, **numeric_options
+            ):
+                task = getattr(self, "_heatpump_alarm_task", None)
+                if task is not None:
+                    task.cancel()
+                monitor = self._heatpump_alarm = HeatPumpAlarm(
+                    alarm_entity,
+                    getattr(self, "_heatpump_alarm_restore", None),
+                    self._temperature_reported_after,
+                    **numeric_options,
+                )
+                self._heatpump_alarm_restore = {}
+            self._heatpump_alarm_status, event = monitor.observe(
+                now, self.hass.states.get(alarm_entity)
+            )
+            task = getattr(self, "_heatpump_alarm_task", None)
+            service = cfg.get("notify_service")
+            if event and (task is None or task.done()):
+                create_task = getattr(
+                    self.hass, "async_create_task", asyncio.create_task
+                )
+                self._heatpump_alarm_event = event
+                self._heatpump_alarm_task = create_task(
+                    self._send_heatpump_alarm(
+                        monitor, event, service, monitor.generation
+                    )
+                )
+        else:
+            task = getattr(self, "_heatpump_alarm_task", None)
+            if task is not None:
+                task.cancel()
+            self._heatpump_alarm = None
+            self._heatpump_alarm_status = {}
+            self._heatpump_alarm_restore = {}
+
+        keys = {
+            "balance": "thermal_balance_entity",
+            "supply_target": "thermal_supply_target_entity",
+            "supply": "thermal_supply_temp_entity",
+            "return": "thermal_return_temp_entity",
+            "compressor": "thermal_compressor_entity",
+            "hot_water": "thermal_hot_water_mode_entity",
+            "brine_pump": "thermal_brine_pump_entity",
+            "circulation_pump": "thermal_circulation_pump_entity",
+            "brine_in": "thermal_brine_in_entity",
+            "brine_out": "thermal_brine_out_entity",
+            "auxiliary": "thermal_aux_heat_entity",
+        }
+        if any(cfg.get(k) for k in keys.values()):
+            from .heatpump_telemetry import HeatPumpTelemetry
+
+            signature = tuple(cfg.get(k) for k in keys.values()) + (
+                cfg.get("thermal_balance_kind"),
+            )
+            if getattr(self, "_heatpump_signature", None) != signature:
+                self._heatpump_telemetry = HeatPumpTelemetry()
+                self._heatpump_signature = signature
+            states = {
+                key: self.hass.states.get(cfg.get(option)) if cfg.get(option) else None
+                for key, option in keys.items()
+            }
+            self._heatpump_diagnostics = self._heatpump_telemetry.observe(
+                now,
+                states,
+                balance_kind=cfg.get("thermal_balance_kind"),
+                configured={key for key, option in keys.items() if cfg.get(option)},
+            )
+        else:
+            self._heatpump_diagnostics = None
+            self._heatpump_signature = None
 
     async def _do_update(self) -> None:
         """Run the main control state machine."""
         now = dt_util.now()
+        self._control_signal_snapshot = {}
+        self._control_applied_kind = None
+        self._control_intelligence = None
+        self._consume_power_report(now)
+        # Advance the clock on every control cycle, including branches that
+        # pause the preheat ramp. Never count a backwards clock interval twice.
+        preheat_dt_seconds = 60.0
+        if self._preheat_last_t is not None:
+            preheat_dt_seconds = max(
+                0.0, now.timestamp() - self._preheat_last_t.timestamp()
+            )
+        if self._preheat_last_t is None or preheat_dt_seconds > 0.0:
+            self._preheat_last_t = now
         cfg = self._cfg()
 
-        indoor = safe_float(get_state(self.hass, cfg.get("indoor_temp_entity")))
-        outdoor = safe_float(get_state(self.hass, cfg.get("real_outdoor_entity")))
+        try:
+            self._observe_heatpump(now, cfg)
+        except Exception:
+            _LOGGER.exception("Passive heat pump telemetry failed")
+
+        self._update_outdoor_selection(cfg)
+
+        if any(cfg.get(f"zone_{i}_entity") for i in range(1, 5)):
+            try:
+                from .extra_zones import ExtraZones
+
+                if not hasattr(self, "_extra_zones"):
+                    self._extra_zones = ExtraZones(
+                        getattr(self, "_zone_restore", None)
+                        or self._attributes.get("extra_temperature_zones"),
+                        started_at=self._temperature_reported_after,
+                    )
+                    self._zone_restore = {}
+                    self._attributes.pop("extra_temperature_zones", None)
+                zones = [
+                    {
+                        field: cfg.get(f"zone_{i}_{field}")
+                        for field in (
+                            "name",
+                            "entity",
+                            "threshold",
+                            "enabled",
+                            "climate",
+                            "profile",
+                            "comfort_threshold",
+                            "notify_service",
+                            "alarm_delay_minutes",
+                        )
+                    }
+                    for i in range(1, 5)
+                ]
+                self._zone_diagnostics, alerts = self._extra_zones.observe(
+                    now,
+                    zones,
+                    self.hass.states,
+                    outdoor=self._temperature_state(cfg, "real_outdoor_entity"),
+                    outdoor_max_age_minutes=max(
+                        0,
+                        (
+                            now - self._temperature_cutoff(cfg, outdoor=True)
+                        ).total_seconds()
+                        / 60,
+                    )
+                    if self._temperature_cutoff(cfg, outdoor=True) is not None
+                    else 0,
+                    climate_temperature_unit=getattr(
+                        getattr(getattr(self.hass, "config", None), "units", None),
+                        "temperature_unit",
+                        None,
+                    ),
+                )
+                for alert in alerts:
+                    slot = alert["slot"]
+                    service = zones[slot - 1].get("notify_service") or cfg.get(
+                        "zone_notify_service", ""
+                    )
+                    if isinstance(service, str) and service.startswith("notify."):
+                        self._queue_zone_notification(self._extra_zones, alert, service)
+            except Exception:
+                _LOGGER.exception("Passive extra zone monitoring failed")
+        else:
+            for _, task in list(getattr(self, "_zone_notify_tasks", {}).values()):
+                task.cancel()
+            self._zone_diagnostics = {}
+            self._zone_restore = {}
+            self._attributes.pop("extra_temperature_zones", None)
+            if hasattr(self, "_extra_zones"):
+                del self._extra_zones
+
+        indoor = self._temperature_value(cfg, "indoor_temp_entity")
+        outdoor = self._temperature_value(cfg, "real_outdoor_entity")
+        identity = self._temperature_identity(cfg)
+        previous = getattr(self, "_temperature_identity_previous", None)
+        if previous is not None and identity != previous:
+            self._thermal_model.cancel_validation_session()
+            if cfg.get("adaptive_braking_enabled") is True:
+                self._thermal_model.record_temp(now, None)
+            elif indoor is not None:
+                self._thermal_model.reset_temp_history(now, indoor)
+            self._plan_audit.cancel_plans("temperature_source_changed")
+            self._plan_audit.fixed_pending = None
+            if self._pilot is not None:
+                self._pilot.reset_interval()
+        self._temperature_identity_previous = identity
+        self._temperature_cycle_identity = identity
+        indoor_state = self._temperature_state(cfg, "indoor_temp_entity")
+        indoor_attrs = getattr(indoor_state, "attributes", {}) or {}
+        active = indoor_attrs.get("source_temperatures_used")
+        if not any(
+            cfg.get(key) for key in ("indoor_temp_entity_2", "indoor_temp_entity_3")
+        ) or not isinstance(active, dict):
+            active = (
+                {cfg.get("indoor_temp_entity"): indoor} if indoor is not None else {}
+            )
+        configured = [
+            cfg.get(k)
+            for k in (
+                "indoor_temp_entity",
+                "indoor_temp_entity_2",
+                "indoor_temp_entity_3",
+            )
+            if cfg.get(k)
+        ]
+        self._temperature_coverage = {
+            "indoor_active": list(active),
+            "indoor_configured": len(configured),
+            "indoor_coverage": "complete"
+            if len(active) == len(configured)
+            else "reduced",
+            "outdoor_active": identity[1],
+            "physical_measurement_time": "unknown",
+        }
+        if cfg.get("thermal_intelligence_enabled") is True:
+            try:
+                if indoor is None or outdoor is None:
+                    self._plan_audit.fixed_pending = None
+                else:
+                    self._plan_audit.observe_fixed(
+                        now,
+                        self._temperature_state(cfg, "indoor_temp_entity"),
+                        self._fixed_audit_identity(cfg),
+                    )
+                await self._save_pilot_store()
+            except Exception:
+                self._plan_audit.fixed_pending = None
+                _LOGGER.debug("Passive fixed-horizon audit unavailable", exc_info=True)
+        self._input_temperatures = {
+            "indoor_temperature": indoor,
+            "outdoor_temperature": outdoor,
+        }
+        if cfg.get("thermal_intelligence_enabled") is True:
+            self._plan_cycle_identity = self._plan_current_identity(cfg)
         target = self._helper_value_with_fallback(
             helper_key="target_temperature",
             cfg=cfg,
@@ -849,7 +2530,25 @@ class PumpSteerSensor(RestoreEntity):
         aggressiveness = self._aggressiveness(cfg)
         house_inertia = self._house_inertia(cfg)
 
-        self._thermal_model.record_temp(now, indoor if indoor is not None else 0.0)
+        adaptive_enabled = cfg.get("adaptive_braking_enabled") is True
+        previous_enabled = getattr(self, "_adaptive_previous_enabled", None)
+        if previous_enabled is not None and adaptive_enabled != previous_enabled:
+            self._thermal_model.reset_observation_policy(adaptive_enabled)
+            self._adaptive_temperature_evidence = {}
+            self._adaptive_component_reports = {}
+            self._adaptive_report = None
+        self._adaptive_previous_enabled = adaptive_enabled
+        if adaptive_enabled:
+            self._prepare_adaptive_observation(cfg, now, identity)
+            if self._adaptive_new_report:
+                self._thermal_model.record_temp(
+                    self._adaptive_report, indoor, adaptive_reports=True
+                )
+            elif not self._adaptive_learning_available:
+                self._thermal_model.record_temp(now, None)
+        else:
+            self._adaptive_inputs_fresh = False
+            self._thermal_model.record_temp(now, indoor)
 
         if indoor is None or outdoor is None:
             missing = []
@@ -861,7 +2560,7 @@ class PumpSteerSensor(RestoreEntity):
                 missing.append(
                     f"outdoor sensor '{cfg.get('real_outdoor_entity') or 'not configured'}'"
                 )
-            self._enter_safe_mode(
+            await self._enter_safe_mode(
                 "Missing sensors: " + ", ".join(missing),
                 outdoor,
                 now,
@@ -871,6 +2570,9 @@ class PumpSteerSensor(RestoreEntity):
         holiday = await async_update_holiday(
             self.hass, self._config_entry.entry_id, self._config_entry
         )
+        self._pilot_holiday_current = (
+            bool(holiday) if cfg.get("thermal_intelligence_enabled") is True else None
+        )
         if holiday:
             target = HOLIDAY_TEMP
 
@@ -878,11 +2580,21 @@ class PumpSteerSensor(RestoreEntity):
             cfg,
             now,
         )
+        self._pilot_price_context = (
+            (tuple(categories), tuple(prices), interval_minutes, current_slot)
+            if cfg.get("thermal_intelligence_enabled") is True and categories
+            else None
+        )
+
+        expected = {"indoor_temp_entity": indoor, "real_outdoor_entity": outdoor}
+        if not self._temperature_inputs_match(cfg, expected):
+            await self._temperature_interrupted(cfg)
+            return
 
         if not prices:
             today_entity_id = cfg.get("electricity_price_entity") or "not configured"
             tomorrow_entity_id = cfg.get("price_tomorrow_entity") or today_entity_id
-            self._enter_safe_mode(
+            await self._enter_safe_mode(
                 f"No price data from today='{today_entity_id}', "
                 f"tomorrow='{tomorrow_entity_id}'",
                 outdoor,
@@ -910,6 +2622,7 @@ class PumpSteerSensor(RestoreEntity):
         # Compute ThermalOutlook for preheat gating (block 5b).
         # Reuses the same weather entity already used by _forecast_temps.
         self._last_outlook = None
+        self._pilot_weather_raw = None
         _cfg_weather = cfg.get("weather_entity")
         _cfg_price = cfg.get("electricity_price_entity")
         if _cfg_weather and _cfg_price:
@@ -921,6 +2634,11 @@ class PumpSteerSensor(RestoreEntity):
                     price_entity_id=_cfg_price,
                     weather_entity_id=_cfg_weather,
                     horizon_hours=24,
+                    **(
+                        {"raw_weather_callback": self._capture_pilot_weather}
+                        if cfg.get("thermal_intelligence_enabled") is True
+                        else {}
+                    ),
                 )
                 self._last_outlook = analyze_thermal_outlook(
                     _outlook_points,
@@ -929,12 +2647,155 @@ class PumpSteerSensor(RestoreEntity):
             except Exception as _err:
                 _LOGGER.debug("ThermalOutlook computation failed: %s", _err)
 
+        if not self._temperature_inputs_match(cfg, expected):
+            await self._temperature_interrupted(cfg)
+            return
+
+        await self._run_control_logic(
+            now=now,
+            cfg=cfg,
+            indoor=indoor,
+            outdoor=outdoor,
+            target=target,
+            summer_threshold=summer_threshold,
+            aggressiveness=aggressiveness,
+            holiday=holiday,
+            categories=categories,
+            current_slot=current_slot,
+            current_cat=current_cat,
+            upcoming=upcoming,
+            ramp_in=ramp_in,
+            ramp_out=ramp_out,
+            comfort_floor=comfort_floor,
+            comfort_floor_reached=comfort_floor_reached,
+            forecast_temps=forecast_temps,
+            interval_minutes=interval_minutes,
+            preheat_dt_seconds=preheat_dt_seconds,
+        )
+
+    def _control_event(self, event, **details):
+        log_event(event, **details)
+
+    async def _run_control_logic(
+        self,
+        *,
+        now,
+        cfg,
+        indoor,
+        outdoor,
+        target,
+        summer_threshold,
+        aggressiveness,
+        holiday,
+        categories,
+        current_slot,
+        current_cat,
+        upcoming,
+        ramp_in,
+        ramp_out,
+        comfort_floor,
+        comfort_floor_reached,
+        forecast_temps,
+        interval_minutes,
+        preheat_dt_seconds,
+    ):
+        """Run the existing mode decisions on the supplied control state."""
+        from .control_intelligence import SIGNALS, evaluate_limits
+
+        if (
+            cfg.get("control_aux_preheat_limit") is True
+            or cfg.get("control_balance_brake_limit") is True
+        ):
+            states = getattr(self, "_control_observation_states", None)
+            if states is None:
+                states = {
+                    cfg[key]: self.hass.states.get(cfg[key])
+                    for key in SIGNALS.values()
+                    if cfg.get(key)
+                }
+            limits = evaluate_limits(
+                now,
+                cfg,
+                states,
+                measured_after=getattr(self, "_temperature_reported_after", None),
+            )
+            self._control_intelligence = limits
+            attribute = cfg.get(
+                "control_measurement_time_attribute", "measurement_time"
+            )
+            signal_snapshot = (
+                {
+                    entity: (
+                        state.state,
+                        state.last_reported,
+                        state.attributes.get(attribute),
+                    )
+                    for entity, state in states.items()
+                    if state is not None
+                }
+                if limits["active"]
+                else {}
+            )
+        else:
+            limits = {"preheat_multiplier": 1.0, "brake_multiplier": 1.0}
+            self._control_intelligence = None
+            signal_snapshot = {}
+        common_sources = {
+            cfg.get(SIGNALS[k]) for k in ("compressor", "heating", "hot_water", "brine")
+        }
+        balance_sources = {
+            cfg.get(SIGNALS[k]) for k in ("heating", "hot_water", "balance")
+        }
+        preheat_snapshot = (
+            {
+                k: v
+                for k, v in signal_snapshot.items()
+                if k in common_sources or k == cfg.get(SIGNALS["auxiliary"])
+            }
+            if limits.get("active")
+            else {}
+        )
+        brake_snapshot = (
+            {k: v for k, v in signal_snapshot.items() if k in balance_sources}
+            if limits.get("active")
+            else {}
+        )
+        self._control_signal_snapshot = {}
+        self._control_applied_kind = None
+
+        if (
+            cfg.get("adaptive_braking_enabled") is True
+            and current_cat != PRICE_EXPENSIVE
+            and self._brake_ramp <= 0
+        ):
+            getattr(
+                self, "_adaptive_evidence_model", self._thermal_model
+            ).clear_external_disturbance()
+
         # 1. Summer mode.
         if outdoor >= summer_threshold:
+            self._control_modifier_state = None
+            self._adaptive_braking = {
+                "state": "base",
+                "reason": "control_phase_reset"
+                if cfg.get("adaptive_braking_enabled") is True
+                else "disabled",
+                "multiplier": 1.0,
+                "predicted_drop_30m_c": None,
+            }
+            self._update_thermal_learning(
+                active=False,
+                reason="summer_mode",
+                now=now,
+                indoor=indoor,
+                outdoor=outdoor,
+            )
             self._pi.reset(now)
+            self._pi_precool_paused = False
             self._last_pi_result = None
             self._brake_ramp = 0.0
             self._preheat_ramp = 0.0
+            self._preheat_last_t = None
             self._brake_last_t = None
             self._brake_last_expensive_t = None
             self._was_braking_last_cycle = False
@@ -959,6 +2820,26 @@ class PumpSteerSensor(RestoreEntity):
 
         # 2. Precool.
         if self._should_precool(summer_threshold, forecast_temps):
+            self._control_modifier_state = None
+            self._adaptive_braking = {
+                "state": "base",
+                "reason": "control_phase_reset"
+                if cfg.get("adaptive_braking_enabled") is True
+                else "disabled",
+                "multiplier": 1.0,
+                "predicted_drop_30m_c": None,
+            }
+            self._update_thermal_learning(
+                active=False,
+                reason="precool",
+                now=now,
+                indoor=indoor,
+                outdoor=outdoor,
+            )
+            # Keep PI memory and its clock current, but do not use its output.
+            self._pi_output(target, indoor, outdoor, now, cfg, freeze_integral=True)
+            # The interval until the first resume also belongs to precool.
+            self._pi_precool_paused = True
             brake_temp = self._brake_temp(outdoor)
             factor = self._update_brake_ramp(
                 True,
@@ -989,15 +2870,34 @@ class PumpSteerSensor(RestoreEntity):
 
         # 3. Aggressiveness 0 -> pure PI, no price logic.
         if aggressiveness == 0:
+            self._control_modifier_state = None
+            self._adaptive_braking = {
+                "state": "base",
+                "reason": "control_phase_reset"
+                if cfg.get("adaptive_braking_enabled") is True
+                else "disabled",
+                "multiplier": 1.0,
+                "predicted_drop_30m_c": None,
+            }
+            self._update_thermal_learning(
+                active=False,
+                reason="price_control_disabled",
+                now=now,
+                indoor=indoor,
+                outdoor=outdoor,
+            )
             if self._prev_aggressiveness != 0:
-                _LOGGER.debug(
-                    "Aggressiveness changed to 0 (was %s): resetting PI integral once",
-                    self._prev_aggressiveness,
-                )
+                if not getattr(self, "_control_passive", False):
+                    _LOGGER.debug(
+                        "Aggressiveness changed to 0 (was %s): resetting PI integral once",
+                        self._prev_aggressiveness,
+                    )
                 self._pi.reset(now)
+                self._pi_precool_paused = False
                 self._last_pi_result = None
                 self._brake_ramp = 0.0
                 self._preheat_ramp = 0.0
+                self._preheat_last_t = None
                 self._brake_last_t = None
                 self._brake_last_expensive_t = None
                 self._was_braking_last_cycle = False
@@ -1026,12 +2926,13 @@ class PumpSteerSensor(RestoreEntity):
             brake_hold = float(cfg.get("brake_hold_minutes", BRAKE_HOLD_MINUTES))
 
             if comfort_floor_reached:
-                _LOGGER.info(
-                    "Comfort floor reached (%.1f < %.1f), releasing brake",
-                    indoor,
-                    comfort_floor,
-                )
-                log_event(
+                if not getattr(self, "_control_passive", False):
+                    _LOGGER.info(
+                        "Comfort floor reached (%.1f < %.1f), releasing brake",
+                        indoor,
+                        comfort_floor,
+                    )
+                self._control_event(
                     "COMFORT_FLOOR_RELEASE",
                     indoor=round(indoor, 1),
                     floor=round(comfort_floor, 1),
@@ -1049,13 +2950,29 @@ class PumpSteerSensor(RestoreEntity):
                 hold_minutes=brake_hold,
             )
 
+            if factor > 0 and limits["brake_multiplier"] < 1:
+                self._control_signal_snapshot = brake_snapshot
+                self._control_applied_kind = "brake_multiplier"
+            multiplier = self._control_modifier_multiplier(
+                now,
+                "brake",
+                limits["brake_multiplier"],
+                cfg.get("control_balance_brake_limit") is True,
+                ramp_in,
+                ramp_out,
+            )
+            adaptive_multiplier = self._adaptive_brake_multiplier(
+                now,
+                cfg,
+                indoor,
+                outdoor,
+                comfort_floor,
+                ramp_in,
+                ramp_out,
+                brake_requested and multiplier == 1.0,
+            )
+            factor *= multiplier * adaptive_multiplier
             if factor > 0.0:
-                self._thermal_model.collect_braking_sample(indoor, outdoor)
-
-                # Mark that this cycle had active braking so we can fit the thermal
-                # model once the brake phase has fully ended.
-                self._was_braking_last_cycle = True
-
                 pi_demand = self._pi_output(
                     target,
                     indoor,
@@ -1064,15 +2981,56 @@ class PumpSteerSensor(RestoreEntity):
                     cfg,
                     freeze_integral=True,
                 )
+
+                # Learn only from actual, stable heating-season price braking.
+                # Ramp-in, comfort-floor release and precooling are not training.
+                learning_active = (
+                    brake_requested
+                    and multiplier == 1.0
+                    and adaptive_multiplier == 1.0
+                    and factor
+                    >= (0.99 if cfg.get("adaptive_braking_enabled") is True else 0.75)
+                    and outdoor <= summer_threshold - 2.0
+                    and indoor - outdoor >= 2.0
+                )
+                learning_reason = (
+                    "active"
+                    if learning_active
+                    else "comfort_floor"
+                    if not brake_requested
+                    else "brake_ramp_not_stable"
+                    if factor < 0.75
+                    else "outdoor_too_warm"
+                    if outdoor > summer_threshold - 2.0
+                    else "small_indoor_outdoor_difference"
+                )
+                self._update_thermal_learning(
+                    active=learning_active,
+                    reason=learning_reason,
+                    now=now,
+                    indoor=indoor,
+                    outdoor=outdoor,
+                )
+
+                # Mark that this cycle had active braking so we can fit the thermal
+                # model once the brake phase has fully ended.
+                self._was_braking_last_cycle = True
                 pi_fake = max(MIN_FAKE_TEMP, min(MAX_FAKE_TEMP, outdoor - pi_demand))
                 brake_temp = self._brake_temp(outdoor, delta_c=brake_delta)
                 fake_temp = pi_fake + (brake_temp - pi_fake) * factor
                 mode = MODE_BRAKING
             else:
+                self._update_thermal_learning(
+                    active=False,
+                    reason="brake_inactive",
+                    now=now,
+                    indoor=indoor,
+                    outdoor=outdoor,
+                )
                 # Brake phase has ended before this branch. Fit the thermal model only
                 # once, using the samples collected during the completed brake phase.
                 if self._was_braking_last_cycle:
-                    if self._thermal_model.pending_samples >= 20:
+                    if self._thermal_model.should_refit():
                         self._thermal_model.fit()
                     self._was_braking_last_cycle = False
 
@@ -1101,6 +3059,16 @@ class PumpSteerSensor(RestoreEntity):
                 now,
             )
             return
+
+        # The price brake is over; close the last stable learning session.
+        # This runs before any pre-brake, preheat or normal-mode early return.
+        self._update_thermal_learning(
+            active=False,
+            reason="price_not_expensive",
+            now=now,
+            indoor=indoor,
+            outdoor=outdoor,
+        )
 
         # 5. Pre-brake / preheating before expensive period.
         #
@@ -1134,6 +3102,7 @@ class PumpSteerSensor(RestoreEntity):
         # The bridge is price-only and must never override the comfort floor.
         bridge_short_dip = (
             upcoming
+            and self._was_braking_last_cycle
             and minutes_until_expensive is not None
             and minutes_until_expensive <= brake_hold
             and self._brake_ramp > 0.0
@@ -1149,6 +3118,20 @@ class PumpSteerSensor(RestoreEntity):
                 and not bridge_short_dip
             ):
                 factor = self._update_brake_ramp(True, now, ramp_in, ramp_out)
+                if factor > 0 and limits["brake_multiplier"] < 1:
+                    self._control_signal_snapshot = brake_snapshot
+                    self._control_applied_kind = "brake_multiplier"
+                multiplier = self._control_modifier_multiplier(
+                    now,
+                    "brake",
+                    limits["brake_multiplier"],
+                    cfg.get("control_balance_brake_limit") is True,
+                    ramp_in,
+                    ramp_out,
+                )
+                factor *= multiplier * self._adaptive_brake_multiplier(
+                    now, cfg, indoor, outdoor, comfort_floor, ramp_in, ramp_out, False
+                )
                 pi_demand = self._pi_output(
                     target,
                     indoor,
@@ -1211,10 +3194,23 @@ class PumpSteerSensor(RestoreEntity):
                 and self._preheat_enabled(cfg)
                 and headroom_factor > 0.0
             ):
+                # Preheat replaces the brake output, so the old phase is over.
+                # Do not let its hidden ramp revive as a later short-dip hold.
+                self._brake_ramp = 0.0
+                if getattr(self, "_control_modifier_state", None):
+                    self._control_modifier_state.pop("brake", None)
+                self._brake_last_t = None
+                self._brake_last_expensive_t = None
+                if self._was_braking_last_cycle:
+                    if self._thermal_model.should_refit():
+                        self._thermal_model.fit()
+                    self._was_braking_last_cycle = False
+
                 preheat_factor = self._update_preheat_ramp(
                     True,
                     ramp_in=max(ramp_in, 10.0),
                     ramp_out=max(ramp_out, 10.0),
+                    dt_seconds=preheat_dt_seconds,
                 )
 
                 base_demand = self._pi_output(target, indoor, outdoor, now, cfg)
@@ -1224,12 +3220,34 @@ class PumpSteerSensor(RestoreEntity):
                     else 1.0
                 )
                 boost = PREHEAT_BOOST_C * preheat_factor * strength * headroom_factor
+                if boost > 0 and limits["preheat_multiplier"] < 1:
+                    self._control_signal_snapshot = preheat_snapshot
+                    self._control_applied_kind = "preheat_multiplier"
+                multiplier = self._control_modifier_multiplier(
+                    now,
+                    "preheat",
+                    limits["preheat_multiplier"],
+                    cfg.get("control_aux_preheat_limit") is True,
+                    ramp_in,
+                    ramp_out,
+                )
+                boost *= multiplier
                 boosted_demand = base_demand + boost
                 fake_temp = max(
                     MIN_FAKE_TEMP,
                     min(MAX_FAKE_TEMP, outdoor - boosted_demand),
                 )
 
+                # Preheat does not apply adaptive braking; discard stale display
+                # status without changing the independent control/ramp state.
+                self._adaptive_braking = {
+                    "state": "base",
+                    "reason": "preheating"
+                    if cfg.get("adaptive_braking_enabled") is True
+                    else "disabled",
+                    "multiplier": 1.0,
+                    "predicted_drop_30m_c": None,
+                }
                 await self._set_state(
                     fake_temp,
                     MODE_PREHEAT,
@@ -1261,13 +3279,19 @@ class PumpSteerSensor(RestoreEntity):
                 )
                 return
 
-        if bridge_short_dip:
-            log_event(
-                "BRIDGE_SHORT_DIP",
+        if bridge_short_dip and not self._bridge_short_dip_active:
+            self._control_event(
+                "BRIDGE_SHORT_DIP_START",
                 brake_factor=round(self._brake_ramp, 3),
                 minutes_until_expensive=round(minutes_until_expensive, 1),
                 bridge_limit_minutes=round(brake_hold, 1),
             )
+        elif not bridge_short_dip and self._bridge_short_dip_active:
+            self._control_event(
+                "BRIDGE_SHORT_DIP_END",
+                brake_factor=round(self._brake_ramp, 3),
+            )
+        self._bridge_short_dip_active = bridge_short_dip
 
         # 6. Normal PI control.
         # A genuine short dip holds the current brake factor unchanged. Longer
@@ -1278,7 +3302,10 @@ class PumpSteerSensor(RestoreEntity):
             False,
             ramp_in=max(ramp_in, 10.0),
             ramp_out=max(ramp_out, 10.0),
+            dt_seconds=preheat_dt_seconds,
         )
+        if self._preheat_ramp <= 0 and getattr(self, "_control_modifier_state", None):
+            self._control_modifier_state.pop("preheat", None)
 
         preheat_headroom = self._preheat_headroom(aggressiveness)
         preheat_ceiling = target + preheat_headroom
@@ -1287,9 +3314,6 @@ class PumpSteerSensor(RestoreEntity):
             target,
             preheat_headroom,
         )
-
-        pi_demand = self._pi_output(target, indoor, outdoor, now, cfg)
-        pi_fake = max(MIN_FAKE_TEMP, min(MAX_FAKE_TEMP, outdoor - pi_demand))
 
         brake_should_hold = bridge_short_dip
 
@@ -1307,9 +3331,38 @@ class PumpSteerSensor(RestoreEntity):
                 hold_minutes=0.0,
             )
 
+        if factor > 0 and limits["brake_multiplier"] < 1:
+            self._control_signal_snapshot = brake_snapshot
+            self._control_applied_kind = "brake_multiplier"
+        multiplier = self._control_modifier_multiplier(
+            now,
+            "brake",
+            limits["brake_multiplier"],
+            cfg.get("control_balance_brake_limit") is True,
+            ramp_in,
+            ramp_out,
+        )
+        factor *= multiplier * self._adaptive_brake_multiplier(
+            now,
+            cfg,
+            indoor,
+            outdoor,
+            comfort_floor,
+            ramp_in,
+            ramp_out,
+            bridge_short_dip and multiplier == 1.0,
+        )
+
+        # Hold and ramp-out still limit heating through the brake overlay.
+        # Resume integration only once that overlay has fully released.
+        pi_demand = self._pi_output(
+            target, indoor, outdoor, now, cfg, freeze_integral=factor > 0.0
+        )
+        pi_fake = max(MIN_FAKE_TEMP, min(MAX_FAKE_TEMP, outdoor - pi_demand))
+
         # Fit the thermal model once after a completed brake phase has fully ramped out.
         if self._was_braking_last_cycle and factor <= 0.0:
-            if self._thermal_model.pending_samples >= 20:
+            if self._thermal_model.should_refit():
                 self._thermal_model.fit()
             self._was_braking_last_cycle = False
 
@@ -1320,7 +3373,13 @@ class PumpSteerSensor(RestoreEntity):
         else:
             fake_temp = pi_fake
 
-        mode = MODE_HOLIDAY if holiday else MODE_PI
+        mode = (
+            MODE_HOLIDAY
+            if holiday
+            else MODE_BRAKE_HOLD
+            if brake_should_hold
+            else MODE_PI
+        )
         await self._set_state(
             fake_temp,
             mode,
@@ -1357,6 +3416,9 @@ class PumpSteerSensor(RestoreEntity):
         cfg: Dict[str, Any],
         now: datetime,
     ) -> Tuple[List[float], List[str], int, int]:
+        self._current_price = None
+        self._current_price_unit = None
+
         today_entity_id = cfg.get("electricity_price_entity")
         tomorrow_entity_id = cfg.get("price_tomorrow_entity") or today_entity_id
 
@@ -1369,13 +3431,9 @@ class PumpSteerSensor(RestoreEntity):
 
         today_attr = get_attr(self.hass, today_entity_id, "today")
         today_raw_attr = get_attr(self.hass, today_entity_id, "raw_today")
-        raw_today = (
-            today_attr
-            if isinstance(today_attr, list)
-            else today_raw_attr
-            if isinstance(today_raw_attr, list)
-            else []
-        )
+        # Prefer a timestamped source when both numeric and detailed data exist.
+        # A shortened numeric list can otherwise mimic a different valid interval.
+        raw_today = self._prefer_timestamped_prices(today_attr, today_raw_attr)
 
         tomorrow_attr = get_attr(self.hass, tomorrow_entity_id, "tomorrow")
         tomorrow_raw_attr = get_attr(self.hass, tomorrow_entity_id, "raw_tomorrow")
@@ -1383,23 +3441,20 @@ class PumpSteerSensor(RestoreEntity):
         fallback_tomorrow_raw_attr = get_attr(
             self.hass, today_entity_id, "raw_tomorrow"
         )
-        raw_tomorrow = (
-            tomorrow_attr
-            if isinstance(tomorrow_attr, list)
-            else (
-                tomorrow_raw_attr
-                if isinstance(tomorrow_raw_attr, list)
-                else (
-                    fallback_tomorrow_attr
-                    if isinstance(fallback_tomorrow_attr, list)
-                    else (
-                        fallback_tomorrow_raw_attr
-                        if isinstance(fallback_tomorrow_raw_attr, list)
-                        else []
-                    )
-                )
+        if isinstance(tomorrow_attr, list) or isinstance(tomorrow_raw_attr, list):
+            raw_tomorrow = self._prefer_timestamped_prices(
+                tomorrow_attr, tomorrow_raw_attr
             )
-        )
+        else:
+            raw_tomorrow = self._prefer_timestamped_prices(
+                fallback_tomorrow_attr, fallback_tomorrow_raw_attr
+            )
+
+        # Nord Pool sorts the repeated DST hour by local wall-clock time, which
+        # interleaves +02:00 and +01:00 slots. Order by real (UTC) start so a
+        # correct 25-hour day validates; gaps and duplicates are still rejected.
+        raw_today = self._sort_by_utc_start(raw_today)
+        raw_tomorrow = self._sort_by_utc_start(raw_tomorrow)
 
         prices_raw = [*raw_today, *raw_tomorrow]
 
@@ -1442,41 +3497,63 @@ class PumpSteerSensor(RestoreEntity):
                 )
             return [], [], 60, 0
 
-        prices: List[float] = []
-        invalid_entries = 0
-        for item in prices_raw:
-            value = PumpSteerSensor._extract_price(item)
-            if value is not None and math.isfinite(value):
-                prices.append(value)
-            else:
-                invalid_entries += 1
-
-        if not prices:
+        # A list position is a time slot. Dropping a malformed entry would
+        # silently move every later price to an earlier time (or even day).
+        interval_minutes = detect_price_interval_minutes(raw_today)
+        today_prices = self._parse_price_day(raw_today)
+        if (
+            today_prices
+            and self._has_slot_timestamps(raw_today)
+            and self._has_slot_timestamps(raw_tomorrow)
+            and not self._price_day_matches_slots(raw_today, now, interval_minutes)
+        ):
+            # Just after midnight the price sensor may still expose yesterday as
+            # "today" while "tomorrow" already holds today's timestamped slots.
+            # Use those slots instead of entering safe mode until it rolls over.
+            rollover_interval = detect_price_interval_minutes(raw_tomorrow)
+            rollover_prices = self._parse_price_day(raw_tomorrow)
+            if rollover_prices and self._price_day_matches_slots(
+                raw_tomorrow, now, rollover_interval
+            ):
+                _LOGGER.debug(
+                    "Price sensor not rolled over yet; using its 'tomorrow' slots "
+                    "as today (today='%s')",
+                    today_entity_id,
+                )
+                raw_today, raw_tomorrow = raw_tomorrow, []
+                interval_minutes = rollover_interval
+                today_prices = rollover_prices
+        if not today_prices or not self._price_day_matches_slots(
+            raw_today, now, interval_minutes
+        ):
             self._set_price_issue(
-                "no_usable_prices",
+                "invalid_today_prices",
                 (
-                    "PumpSteer price parsing failed: received raw entries but parsed 0 "
-                    f"usable numeric prices (today='{today_entity_id}', "
-                    f"tomorrow='{tomorrow_entity_id}', raw_count={len(prices_raw)}, "
-                    f"invalid_count={invalid_entries})"
+                    "PumpSteer price parsing failed: today's price list has missing, "
+                    f"invalid or misaligned slots (today='{today_entity_id}'); "
+                    "cannot safely map prices to time slots"
                 ),
             )
             return [], [], 60, 0
-        self._clear_price_issue(today_entity_id, tomorrow_entity_id)
 
-        if invalid_entries > 0:
-            _LOGGER.debug(
-                "PumpSteer price parsing skipped %d invalid entries (today='%s', tomorrow='%s')",
-                invalid_entries,
-                today_entity_id,
-                tomorrow_entity_id,
+        tomorrow_prices = self._parse_price_day(raw_tomorrow)
+        if tomorrow_prices and not self._price_day_matches_slots(
+            raw_tomorrow, now + timedelta(days=1), interval_minutes
+        ):
+            tomorrow_prices = None
+        if tomorrow_prices is None:
+            self._set_price_issue(
+                "invalid_tomorrow_prices",
+                (
+                    "PumpSteer ignoring tomorrow's price list because it has missing, "
+                    f"invalid or misaligned slots (tomorrow='{tomorrow_entity_id}'); "
+                    "using today's prices only"
+                ),
             )
+        else:
+            self._clear_price_issue(today_entity_id, tomorrow_entity_id)
 
-        today_prices: List[float] = []
-        for item in raw_today:
-            value = PumpSteerSensor._extract_price(item)
-            if value is not None and math.isfinite(value):
-                today_prices.append(value)
+        prices = today_prices + (tomorrow_prices or [])
 
         # Cache price thresholds once per calendar day per entity.
         # Recomputing hourly caused mid-slot reclassification: P80 could shift
@@ -1490,16 +3567,30 @@ class PumpSteerSensor(RestoreEntity):
             or self._price_thresholds_cached_date != today_date
         )
 
+        due = price_cache_refresh_due(
+            now=now,
+            entity_id=today_entity_id,
+            today_prices=today_prices,
+            cached_date=self._price_thresholds_cached_date,
+            cached_entity_id=self._price_thresholds_entity_id,
+        )
+        thresholds = await async_get_price_thresholds(today_prices) if due else None
+        transition = price_cache_transition(
+            now=now,
+            entity_id=today_entity_id,
+            today_prices=today_prices,
+            cached_date=self._price_thresholds_cached_date,
+            cached_entity_id=self._price_thresholds_entity_id,
+            cached_p30=self._cached_p30,
+            cached_p80=self._cached_p80,
+            thresholds=thresholds,
+        )
+        self._cached_p30, self._cached_p80 = transition.p30, transition.p80
+        self._price_thresholds_cached_date = transition.date
+        self._price_thresholds_entity_id = transition.entity_id
         if recalc_thresholds:
             midnight_grace = now.hour == 0 and now.minute < 15
-
-            if today_prices and not midnight_grace:
-                self._cached_p30, self._cached_p80 = await async_get_price_thresholds(
-                    today_prices,
-                )
-                self._price_thresholds_cached_date = today_date
-                self._price_thresholds_entity_id = today_entity_id
-
+            if transition.refreshed:
                 _LOGGER.debug(
                     "Recomputed price thresholds: p30=%.3f p80=%.3f for entity %s (date=%s)",
                     self._cached_p30,
@@ -1531,8 +3622,6 @@ class PumpSteerSensor(RestoreEntity):
             self._p80 = 0.0
 
         categories = classify_price_list(prices, self._p30, self._p80)
-        interval_source = raw_today if raw_today else prices_raw
-        interval_minutes = detect_price_interval_minutes(interval_source)
         categories = filter_short_peaks(
             categories,
             interval_minutes,
@@ -1540,11 +3629,113 @@ class PumpSteerSensor(RestoreEntity):
         )
         current_slot = compute_price_slot_index(now, interval_minutes, len(prices))
 
+        # Capture the exact price value from the same parsed price snapshot and
+        # slot index used for this control cycle's price classification. This
+        # lets notifications and diagnostics report the price that actually
+        # drove the mode decision, without re-reading a separate entity later.
+        if 0 <= current_slot < len(prices):
+            self._current_price = prices[current_slot]
+
+        unit = get_attr(self.hass, today_entity_id, "unit_of_measurement")
+        if isinstance(unit, str) and unit.strip():
+            self._current_price_unit = unit.strip()
+
         return prices, categories, interval_minutes, current_slot
 
     @staticmethod
+    def _sort_by_utc_start(items: List[Any]) -> List[Any]:
+        """Sort fully timestamped, timezone-aware slots by their UTC start.
+
+        Anything else is returned unchanged so the slot validator can reject it.
+        Each price keeps its own timestamp, so sorting never moves a price
+        to another slot.
+        """
+        keyed = []
+        for item in items:
+            if not isinstance(item, dict) or "start" not in item:
+                return items
+            try:
+                start = datetime.fromisoformat(str(item["start"]))
+            except (TypeError, ValueError):
+                return items
+            if start.utcoffset() is None:
+                return items
+            keyed.append((start.astimezone(timezone.utc), item))
+        keyed.sort(key=lambda pair: pair[0])
+        return [item for _, item in keyed]
+
+    @staticmethod
+    def _has_slot_timestamps(items: Any) -> bool:
+        """True when every entry carries an explicit slot start time."""
+        return (
+            isinstance(items, list)
+            and bool(items)
+            and all(isinstance(item, dict) and "start" in item for item in items)
+        )
+
+    @staticmethod
+    def _prefer_timestamped_prices(values: Any, detailed: Any) -> List[Any]:
+        """Prefer explicit slot identity without rejecting numeric-only sensors."""
+        if isinstance(detailed, list) and any(
+            isinstance(item, dict) and ("start" in item or "end" in item)
+            for item in detailed
+        ):
+            return detailed
+        if isinstance(values, list):
+            return values
+        return detailed if isinstance(detailed, list) else []
+
+    @staticmethod
+    def _price_day_matches_slots(
+        items: List[Any], day: datetime, interval_minutes: int
+    ) -> bool:
+        """Require a complete day and check explicit timestamps when supplied."""
+        start = day.replace(hour=0, minute=0, second=0, microsecond=0)
+        end = start + timedelta(days=1)
+        if start.utcoffset() is not None:
+            # Count elapsed slots, including 23/25-hour DST days.
+            start = start.astimezone(timezone.utc)
+            end = end.astimezone(timezone.utc)
+        interval = timedelta(minutes=interval_minutes)
+        if interval * len(items) != end - start:
+            return False
+        # Mixed timestamped and timestamp-free entries cannot be verified safely.
+        has_timestamps = any(
+            isinstance(item, dict) and ("start" in item or "end" in item)
+            for item in items
+        )
+        for index, item in enumerate(items):
+            if not has_timestamps:
+                continue
+            if not isinstance(item, dict) or "start" not in item or "end" not in item:
+                return False
+            try:
+                slot_start = datetime.fromisoformat(str(item.get("start")))
+                slot_end = datetime.fromisoformat(str(item.get("end")))
+            except (TypeError, ValueError):
+                return False
+            if (
+                slot_start != start + interval * index
+                or slot_end != start + interval * (index + 1)
+            ):
+                return False
+        return True
+
+    @staticmethod
+    def _parse_price_day(items: List[Any]) -> Optional[List[float]]:
+        """Parse a day atomically so invalid slots cannot shift later prices."""
+        prices: List[float] = []
+        for item in items:
+            value = PumpSteerSensor._extract_price(item)
+            if value is None or not math.isfinite(value):
+                return None
+            prices.append(value)
+        return prices
+
+    @staticmethod
     def _extract_price(item: Any) -> Optional[float]:
-        if item is None:
+        # bool is an int subclass, but never a valid electricity price.
+        if item is None or isinstance(item, bool):
             return None
 
         if isinstance(item, dict):
@@ -1567,6 +3758,17 @@ class PumpSteerSensor(RestoreEntity):
 
         return None
 
+    def _close_short_dip(self, mode):
+        # Close an active bridge when another control branch takes over before
+        # the normal-control bridge block is reached.
+        if self._bridge_short_dip_active and mode != MODE_BRAKE_HOLD:
+            self._control_event(
+                "BRIDGE_SHORT_DIP_END",
+                brake_factor=round(self._brake_ramp, 3),
+                new_mode=mode,
+            )
+            self._bridge_short_dip_active = False
+
     async def _set_state(
         self,
         fake_temp: float,
@@ -1574,6 +3776,8 @@ class PumpSteerSensor(RestoreEntity):
         extra: Dict[str, Any],
         now: datetime,
     ) -> None:
+        self._close_short_dip(mode)
+
         if self._safe_mode_warned and mode != MODE_SAFE:
             _LOGGER.info(
                 "PumpSteer exited SAFE MODE and returned to normal control (mode=%s)",
@@ -1604,12 +3808,1992 @@ class PumpSteerSensor(RestoreEntity):
             **extra,
         }
 
-        self._ohmigo_last_push = await async_push_ohmigo(
-            self.hass,
-            self._config_entry,
+        cfg = self._cfg()
+        expected = {
+            key: extra.get(
+                attribute,
+                self._temperature_value(cfg, key),
+            )
+            for key, attribute in (
+                ("indoor_temp_entity", "indoor_temperature"),
+                ("real_outdoor_entity", "outdoor_temperature"),
+            )
+        }
+        await self._push_validated_temperature(
             fake_temp,
-            self._ohmigo_last_push,
+            cfg,
+            expected,
         )
+        if cfg.get("thermal_intelligence_enabled") is True:
+            try:
+                if self._pilot_store_read_failed:
+                    await self._load_pilot_store()
+                if self._temperature_inputs_match(cfg, expected):
+                    self._observe_plan_outcomes(cfg, dt_util.now())
+                    sample = self._observe_pilot(cfg, now, mode)
+                    if sample is not None and self._pilot is not None:
+                        import asyncio
+                        import copy
+                        from .ohmigo import _switch_entity_id
+
+                        observed_pilot = self._pilot
+                        entities = [
+                            cfg.get(key)
+                            for key in (
+                                "indoor_temp_entity",
+                                "indoor_temp_entity_2",
+                                "indoor_temp_entity_3",
+                                "real_outdoor_entity",
+                                "outdoor_temp_entity_2",
+                                "electricity_price_entity",
+                                "price_tomorrow_entity",
+                                "thermal_heat_activity_entity",
+                                "thermal_supply_temp_entity",
+                                "thermal_heating_mode_entity",
+                                "thermal_hot_water_mode_entity",
+                                "thermal_compressor_entity",
+                                "thermal_return_temp_entity",
+                                "thermal_power_entity",
+                                "ohmigo_entity",
+                                "ohmigo_relay_entity",
+                            )
+                        ]
+                        entities.append(
+                            _switch_entity_id(self.hass, self._config_entry.entry_id)
+                        )
+
+                        def snapshot():
+                            states = [
+                                self.hass.states.get(entity) if entity else None
+                                for entity in entities
+                            ]
+                            return tuple(
+                                (
+                                    getattr(state, "state", None),
+                                    getattr(state, "last_reported", None),
+                                    getattr(state, "last_changed", None),
+                                    repr(getattr(state, "attributes", None)),
+                                )
+                                for state in states
+                            )
+
+                        before = snapshot()
+                        fitted_pump = copy.deepcopy(observed_pilot.manager.pump)
+                        try:
+                            await asyncio.to_thread(fitted_pump.add_interval, sample)
+                        except asyncio.CancelledError:
+                            if self._pilot is observed_pilot:
+                                observed_pilot.reset_interval()
+                                self._pilot_plan = {
+                                    "planning_status": "unavailable",
+                                    "reason": "learning_cancelled",
+                                }
+                                self._pilot_plan_next = None
+                            raise
+                        if self._pilot is not observed_pilot:
+                            return
+                        if (
+                            self._temperature_unloaded
+                            or snapshot() != before
+                            or self._cfg() != cfg
+                            or not self._temperature_inputs_match(cfg, expected)
+                        ):
+                            observed_pilot.reset_interval()
+                            self._pilot_grid_marginal = {
+                                "status": "unavailable",
+                                "reason": "inputs_changed_during_learning",
+                            }
+                            self._pilot_plan = {
+                                "planning_status": "unavailable",
+                                "reason": "inputs_changed_during_learning",
+                            }
+                            self._pilot_plan_next = None
+                            return
+                        observed_pilot.manager.pump = fitted_pump
+                    await self._save_pilot_store()
+                    try:
+                        await self._plan_pilot(cfg, now, extra, fake_temp)
+                    except Exception:
+                        _LOGGER.exception(
+                            "Passive plan failed; standard control continues"
+                        )
+                        self._pilot_plan = {
+                            "planning_status": "unavailable",
+                            "reason": "planning_error",
+                        }
+                        self._pilot_plan_next = None
+                else:
+                    self._pilot_grid_marginal = {
+                        "status": "unavailable",
+                        "reason": "temperature_changed_during_update",
+                    }
+                    self._plan_audit.cancel_plans("temperature_changed_during_update")
+                    await self._save_pilot_store()
+                    if self._pilot is not None:
+                        self._pilot.reset_interval()
+                        self._pilot_status = "temperature_changed_during_update"
+            except Exception:
+                _LOGGER.exception(
+                    "Passive thermal diagnostics failed; standard control continues"
+                )
+                self._pilot = None
+                self._pilot_status = "learning_error"
+                self._pilot_price_available = False
+                self._pilot_forecast_available = False
+                self._pilot_price_forecast = False
+                self._pilot_grid_marginal = {
+                    "status": "unavailable",
+                    "reason": "learning_error",
+                }
+                self._pilot_plan = {
+                    "planning_status": "unavailable",
+                    "reason": "planning_error",
+                }
+        elif self._pilot is not None:
+            self._pilot = None
+            self._pilot_sources = None
+
+    def _stop_power_telemetry(self):
+        if self._power_unsubscribe is not None:
+            self._power_unsubscribe()
+            self._power_unsubscribe = None
+        if self._power_ledger is not None:
+            self._power_ledger.reset_anchor()
+        self._power_signature = None
+        self._power_last_report = None
+
+    def _heating_mode_state(self, cfg):
+        """Interpret the configured polarity without changing report timestamps."""
+        from types import SimpleNamespace
+
+        entity_id = cfg.get("thermal_heating_mode_entity")
+        state = self.hass.states.get(entity_id) if entity_id else None
+        if cfg.get("thermal_heating_mode_inverted") is not True or getattr(
+            state, "state", None
+        ) not in ("on", "off"):
+            return state
+        return SimpleNamespace(
+            state="off" if state.state == "on" else "on",
+            last_reported=getattr(state, "last_reported", None),
+            last_changed=getattr(state, "last_changed", None),
+            last_updated=getattr(state, "last_updated", None),
+            attributes=getattr(state, "attributes", {}),
+        )
+
+    def _record_power_snapshot(self, when):
+        """Read existing HA in-memory states; preserve their actual report times."""
+        cfg = self._cfg()
+        today, tomorrow = (
+            cfg.get("electricity_price_entity"),
+            cfg.get("price_tomorrow_entity"),
+        )
+        power = self.hass.states.get(cfg.get("thermal_power_entity"))
+        try:
+            self._power_ledger.observe(
+                when,
+                power,
+                self._heating_mode_state(cfg),
+                self.hass.states.get(cfg.get("thermal_hot_water_mode_entity"))
+                if cfg.get("thermal_hot_water_mode_entity")
+                else None,
+                (
+                    self.hass.states.get(today) if today else None,
+                    self.hass.states.get(tomorrow)
+                    if tomorrow and tomorrow != today
+                    else None,
+                ),
+                heating_configured=bool(cfg.get("thermal_heating_mode_entity")),
+                hot_water_configured=bool(cfg.get("thermal_hot_water_mode_entity")),
+            )
+            from .pilot_forecast import _timestamp
+
+            reported = _timestamp(getattr(power, "last_reported", None))
+            instant = _timestamp(when)
+            if (
+                reported is not None
+                and instant is not None
+                and reported <= instant
+                and (
+                    self._power_last_report is None
+                    or reported > self._power_last_report
+                )
+            ):
+                self._power_last_report = reported
+        except Exception:
+            self._power_ledger.reset_anchor()
+            _LOGGER.exception(
+                "Passive power telemetry failed; standard control continues"
+            )
+
+    def _record_energy_report(self, entity_id, state, when, energy_ids):
+        """Process the event's own state, not a later state already in HA."""
+        from .pilot_forecast import _timestamp
+
+        try:
+            cfg = self._cfg()
+            price_ids = (
+                cfg.get("electricity_price_entity"),
+                cfg.get("price_tomorrow_entity"),
+            )
+            prices = tuple(
+                self.hass.states.get(key) if key else None for key in price_ids
+            )
+            clock = _timestamp(when)
+            report = _timestamp(getattr(state, "last_reported", None))
+            if clock is not None:
+                self._power_ledger.sync_energy_prices(prices, clock)
+            if state is None and clock is not None:
+                self._power_ledger.observe_energy(
+                    clock, {entity_id: None}, prices, meter_ids=energy_ids
+                )
+            elif report is not None and clock is not None and report <= clock:
+                self._power_ledger.observe_energy(
+                    report, {entity_id: state}, prices, meter_ids=energy_ids
+                )
+        except Exception:
+            self._power_ledger.reset_anchor(gap=True)
+            _LOGGER.exception(
+                "Passive energy telemetry failed; standard control continues"
+            )
+
+    def _consume_power_report(self, now):
+        """Catch new HA reports during the existing control cycle, without polling APIs."""
+        if (
+            self._power_ledger is None
+            or self._temperature_unloaded
+            or self._cfg().get("thermal_intelligence_enabled") is not True
+        ):
+            return
+        from .pilot_forecast import _timestamp
+
+        energy_ids = self._cfg().get("thermal_energy_entities") or []
+        if energy_ids:
+            try:
+                for entity_id in energy_ids:
+                    state = self.hass.states.get(entity_id)
+                    if self._power_ledger.can_poll_energy(entity_id, state):
+                        self._record_energy_report(entity_id, state, now, energy_ids)
+            except Exception:
+                self._power_ledger.reset_anchor(gap=True)
+                _LOGGER.exception(
+                    "Passive energy telemetry failed; standard control continues"
+                )
+            return
+
+        state = self.hass.states.get(self._cfg().get("thermal_power_entity"))
+        report = _timestamp(getattr(state, "last_reported", None))
+        clock = _timestamp(now)
+        if (
+            report is None
+            or clock is None
+            or report > clock
+            or (
+                self._power_last_report is not None
+                and report <= self._power_last_report
+            )
+        ):
+            return
+        anchor = self._power_ledger.anchor
+        if anchor is None or report > anchor["time"]:
+            self._record_power_snapshot(report)
+
+    def _setup_power_telemetry(self):
+        """Subscribe only to selected states; the normal cycle catches unchanged reports."""
+        cfg = self._cfg()
+        power_id = cfg.get("thermal_power_entity")
+        energy_ids = tuple(cfg.get("thermal_energy_entities") or ())
+        keys = (
+            "thermal_power_entity",
+            "thermal_heating_mode_entity",
+            "thermal_hot_water_mode_entity",
+            "electricity_price_entity",
+            "price_tomorrow_entity",
+        )
+        entities = tuple(cfg.get(key) for key in keys)
+        signature = entities + (
+            energy_ids,
+            cfg.get("thermal_heating_mode_inverted") is True,
+        )
+        if (
+            cfg.get("thermal_intelligence_enabled") is True
+            and self._power_signature == signature
+            and self._power_unsubscribe is not None
+        ):
+            return
+        self._stop_power_telemetry()
+        self._power_ledger = None
+        if (
+            cfg.get("thermal_intelligence_enabled") is not True
+            or (
+                not energy_ids
+                and (
+                    not isinstance(power_id, str) or not power_id.startswith("sensor.")
+                )
+            )
+            or any(
+                not isinstance(entity, str) or not entity.startswith("sensor.")
+                for entity in energy_ids
+            )
+        ):
+            return
+        from homeassistant.helpers.event import async_track_state_change_event
+        from .pilot_power_ledger import PowerLedger
+
+        self._power_signature = signature
+        self._power_ledger = PowerLedger(started_after=dt_util.now())
+        entity_ids = list(
+            dict.fromkeys(value for value in (*entities, *energy_ids) if value)
+        )
+
+        @callback
+        def changed(event):
+            if (
+                self._temperature_unloaded
+                or self._power_ledger is None
+                or self._cfg().get("thermal_intelligence_enabled") is not True
+            ):
+                return
+            entity_id = event.data.get("entity_id")
+            if energy_ids:
+                if entity_id in energy_ids:
+                    state = (
+                        event.data.get("new_state")
+                        if "new_state" in event.data
+                        else self.hass.states.get(entity_id)
+                    )
+                    self._record_energy_report(
+                        entity_id, state, event.time_fired, energy_ids
+                    )
+                elif entity_id in (
+                    cfg.get("electricity_price_entity"),
+                    cfg.get("price_tomorrow_entity"),
+                ):
+                    try:
+                        prices = tuple(
+                            (
+                                event.data.get("new_state")
+                                if "new_state" in event.data
+                                else self.hass.states.get(key)
+                            )
+                            if key == entity_id
+                            else self.hass.states.get(key)
+                            if key
+                            else None
+                            for key in (
+                                cfg.get("electricity_price_entity"),
+                                cfg.get("price_tomorrow_entity"),
+                            )
+                        )
+                        self._power_ledger.invalidate_energy_prices(
+                            prices, event.time_fired
+                        )
+                    except Exception:
+                        self._power_ledger.invalidate_energy_prices()
+                        _LOGGER.exception("Passive energy price telemetry failed")
+                return
+            if entity_id == power_id:
+                previous_report = self._power_last_report
+                self._consume_power_report(event.time_fired)
+                if self._power_last_report == previous_report:
+                    self._power_ledger.reset_anchor(gap=True)
+            elif entity_id in entity_ids:
+                # Do not infer the power or its mode at a non-power event. A
+                # later fresh power report starts a new qualified interval.
+                self._power_ledger.reset_anchor(gap=True)
+
+        self._power_unsubscribe = async_track_state_change_event(
+            self.hass, entity_ids, changed
+        )
+
+    async def _load_pilot_store(self):
+        """Restore only historical model evidence, never a fresh measurement."""
+        try:
+            from homeassistant.helpers.storage import Store
+
+            if self._pilot_store is None:
+                self._pilot_store = Store(
+                    self.hass, 1, f"pumpsteer.pilot.{self._config_entry.entry_id}"
+                )
+            try:
+                saved = await self._pilot_store.async_load()
+            except Exception:
+                saved = None
+                self._pilot_store_read_failed = (
+                    self._pilot_store_read_failed or self._pilot_persisted is None
+                )
+                _LOGGER.warning(
+                    "Passive thermal history could not be read", exc_info=True
+                )
+            else:
+                self._pilot_store_read_failed = False
+                if saved is not None and (
+                    not isinstance(saved, dict) or saved.get("version") != 1
+                ):
+                    # Do not replace a payload written by an unknown version.
+                    self._pilot_store_read_failed = True
+            if self._pilot_store_read_failed:
+                return
+            if isinstance(saved, dict) and saved.get("version") == 1:
+                if self._pilot_persisted is None:
+                    self._pilot_persisted = saved
+            if (
+                isinstance(self._pilot_persisted, dict)
+                and self._pilot_persisted.get("version") == 1
+            ):
+                self._pilot_restore = self._pilot_persisted
+                if not self._plan_audit_loaded:
+                    audit = self._plan_audit
+                    if not (
+                        audit.plan_pending
+                        or audit.plan_records
+                        or audit.plan_unverifiable
+                    ):
+                        audit.restore_plan(
+                            self._pilot_persisted.get("plan_audit"), dt_util.now()
+                        )
+            self._plan_audit_loaded = True
+        except Exception:
+            self._pilot_restore = None
+            _LOGGER.warning(
+                "Passive thermal history could not be restored", exc_info=True
+            )
+
+    async def _flush_pilot_store(self):
+        """Finish any pending history write before this instance is discarded."""
+        if (
+            not self._pilot_store_read_failed
+            and self._pilot_store is not None
+            and self._pilot_persisted is not None
+        ):
+            if (
+                self._heat_operation is not None
+                and self._heat_operation_signature is not None
+            ):
+                payload = dict(self._pilot_persisted)
+                payload["heat_operation"] = {
+                    "sources": list(self._heat_operation_signature),
+                    "samples": self._heat_operation.export(),
+                }
+                self._pilot_persisted = payload
+            await self._pilot_store.async_save(self._pilot_persisted)
+
+    async def _save_pilot_store(self):
+        """Save bounded model or plan evidence, only when it changes."""
+        pilot = self._pilot
+        if self._pilot_store is None or self._pilot_store_read_failed:
+            return
+        model_available = pilot is not None and (
+            pilot.house_intervals or pilot.manager.pump.history
+        )
+        operation = self._heat_operation
+        operation_samples = operation.export() if operation is not None else None
+        operation_available = bool(
+            operation_samples and any(operation_samples.values())
+        )
+        plan_data = self._plan_audit.export_plan()
+        if (
+            not model_available
+            and not operation_available
+            and not (
+                plan_data["records"]
+                or plan_data["pending_count"]
+                or plan_data["unverifiable"]
+                or plan_data["fixed_v1"]
+            )
+        ):
+            return
+        pump_last = (
+            pilot.manager.pump.history[-1][0]
+            if model_available and pilot.manager.pump.history
+            else None
+        )
+        audit_last = (
+            pilot.audit.records[-1]["observed"]
+            if model_available and pilot.audit.records
+            else None
+        )
+        audit_pending = (
+            pilot.audit.pending["issued"].isoformat()
+            if model_available and pilot.audit.pending
+            else None
+        )
+        plan_last = (
+            plan_data["records"][-1]["observed"] if plan_data["records"] else None
+        )
+        key = (
+            self._pilot_sources,
+            pilot.house_intervals if model_available else None,
+            pump_last,
+            audit_last,
+            audit_pending,
+            plan_last,
+            plan_data["pending_count"],
+            plan_data["unverifiable"],
+            len(plan_data["fixed_v1"]),
+            plan_data["fixed_v1"][-1]["observed"] if plan_data["fixed_v1"] else None,
+            self._heat_operation_signature if operation_available else None,
+            operation.sample_count // 18 if operation_available else None,
+        )
+        if key == self._pilot_saved:
+            return
+        payload = dict(self._pilot_persisted or {})
+        payload.update(version=1, plan_audit=plan_data)
+        if operation_available:
+            payload["heat_operation"] = {
+                "sources": list(self._heat_operation_signature),
+                "samples": operation_samples,
+            }
+        if model_available:
+            payload.update(
+                sources=list(self._pilot_sources),
+                identity=pilot.source_identity,
+                house=pilot.manager.model.export_state(),
+                pump=pilot.manager.pump.export_state(),
+                forecast_audit=pilot.audit.export_state(),
+            )
+        try:
+            self._pilot_store.async_delay_save(lambda: payload, 30)
+            self._pilot_saved = key
+            self._pilot_persisted = payload
+        except Exception:
+            _LOGGER.warning("Passive thermal history could not be saved", exc_info=True)
+
+    def _restore_pilot_history(self, pilot, signature, now):
+        saved, self._pilot_restore = self._pilot_restore, None
+        if not isinstance(saved, dict):
+            return
+        old_sources = saved.get("sources")
+        old_pump = saved.get("pump")
+        compatible_legacy = (
+            isinstance(old_sources, list)
+            and len(old_sources) == 4
+            and list(signature[:4]) == old_sources
+            and isinstance(old_pump, dict)
+            and not old_pump.get("history")
+        )
+        if old_sources != list(signature) and not compatible_legacy:
+            return
+        house, pump = saved.get("house"), old_pump
+        if not isinstance(house, dict) or not isinstance(pump, dict):
+            return
+
+        def finite_tree(value):
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return math.isfinite(value)
+            if isinstance(value, str):
+                try:
+                    return math.isfinite(float(value))
+                except ValueError:
+                    return True
+            if isinstance(value, dict):
+                return all(finite_tree(child) for child in value.values())
+            if isinstance(value, (list, tuple)):
+                return all(finite_tree(child) for child in value)
+            return True
+
+        if not finite_tree(house) or not finite_tree(pump):
+            return
+        rows = house.get("observations")
+        if not isinstance(rows, list) or len(rows) > 336:
+            return
+        if any(
+            not isinstance(row, dict)
+            or not isinstance(row.get("end"), (int, float))
+            or not 0 <= row["end"] <= now.timestamp()
+            for row in rows
+        ):
+            return
+        pump_rows = pump.get("history", [])
+        if not isinstance(pump_rows, list) or len(pump_rows) > 288:
+            return
+        if any(
+            not isinstance(row, (list, tuple))
+            or not row
+            or not isinstance(row[0], (int, float))
+            or not 0 <= row[0] <= now.timestamp()
+            for row in pump_rows
+        ):
+            return
+        try:
+            from .pilot_passive import PilotPassive
+
+            restored = PilotPassive()
+            if not restored.manager.model.restore(house):
+                return
+            restored.manager.pump.restore(pump)
+            restored.manager.pump.ready = False
+            restored.audit.restore(saved.get("forecast_audit"), now)
+            pilot.manager = restored.manager
+            pilot.audit = restored.audit
+            identity = saved.get("identity")
+            if isinstance(identity, (tuple, list)) and len(identity) == 2:
+                first = (
+                    tuple(identity[0])
+                    if isinstance(identity[0], (list, tuple))
+                    else None
+                )
+                pilot.source_identity = (first, identity[1])
+            pilot.house_intervals = len(pilot.manager.model.history)
+            pilot.status = "restored_unvalidated"
+            pump_last = (
+                pilot.manager.pump.history[-1][0]
+                if pilot.manager.pump.history
+                else None
+            )
+            audit_last = (
+                pilot.audit.records[-1]["observed"] if pilot.audit.records else None
+            )
+            self._pilot_saved = (
+                signature,
+                pilot.house_intervals,
+                pump_last,
+                audit_last,
+                None,
+            )
+        except (TypeError, ValueError, KeyError, OverflowError):
+            _LOGGER.warning("Passive thermal history was invalid and was ignored")
+
+    def _capture_pilot_weather(self, rows):
+        """Capture only the forecast already fetched for the normal outlook."""
+        self._pilot_weather_raw = rows
+
+    def _fixed_audit_identity(self, cfg):
+        return (
+            cfg.get("indoor_temp_entity") or "",
+            repr((cfg.get("real_outdoor_entity"), self._plan_source_identity(cfg))),
+        )
+
+    def _plan_source_identity(self, cfg):
+        """Identify selected HA sources without asserting physical freshness."""
+        inside = self._temperature_state(cfg, "indoor_temp_entity")
+        outside = self._temperature_state(cfg, "real_outdoor_entity")
+        inside_attrs = getattr(inside, "attributes", {}) or {}
+        outside_attrs = getattr(outside, "attributes", {}) or {}
+        components = inside_attrs.get("source_temperatures_used")
+        if isinstance(components, dict) and all(isinstance(k, str) for k in components):
+            components = tuple(sorted(components))
+        else:
+            components = None
+        selected = outside_attrs.get("selected_source")
+        return (
+            components,
+            selected if isinstance(selected, str) else None,
+            self._temperature_identity(cfg)
+            if any(
+                cfg.get(k)
+                for k in (
+                    "indoor_temp_entity_2",
+                    "indoor_temp_entity_3",
+                    "outdoor_temp_entity_2",
+                )
+            )
+            else cfg.get("real_outdoor_entity"),
+        )
+
+    def _plan_current_identity(self, cfg):
+        """Do not label restored or absent sources as the current identity."""
+        if any(
+            self._temperature_value(cfg, key) is None
+            for key in ("indoor_temp_entity", "real_outdoor_entity")
+        ):
+            return None
+        return self._plan_source_identity(cfg)
+
+    def _observe_plan_outcomes(self, cfg, now):
+        if not self._plan_audit.plan_pending:
+            return
+        identity = self._plan_current_identity(cfg)
+        if identity is None or identity != self._plan_cycle_identity:
+            self._plan_audit.cancel_plans("source_changed_during_cycle")
+            return
+        source = cfg.get("indoor_temp_entity")
+        self._plan_audit.observe_plan(
+            now,
+            self._temperature_state(cfg, "indoor_temp_entity"),
+            source,
+            identity,
+            reported_after=self._temperature_reported_after,
+        )
+
+    def _capture_replay_context(self, cfg, now, aggression):
+        """Freeze existing HA inputs for an isolated passive control replay."""
+        import copy
+        from homeassistant.helpers import entity_registry as er
+        from .control_replay import ControlReplayState
+        from .holiday import _get_entity_ids, _get_datetime
+        from .pilot_passive import PilotPassive
+
+        price_context = self._pilot_price_context
+        if not price_context:
+            return None, ()
+        categories, active_prices, interval, slot = price_context
+        known = True
+        holiday_ids = ()
+        preheat_id = None
+        start = end = None
+        boolean_on = False
+        try:
+            holiday_ids = _get_entity_ids(self.hass, self._config_entry.entry_id)
+            boolean_id, start_id, end_id = holiday_ids
+            for entity_id in holiday_ids:
+                if entity_id:
+                    state = self.hass.states.get(entity_id)
+                    if (
+                        state is None
+                        or getattr(state, "state", None)
+                        in (None, "unknown", "unavailable", "")
+                        or (getattr(state, "attributes", {}) or {}).get("restored")
+                    ):
+                        known = False
+            if boolean_id:
+                boolean = self.hass.states.get(boolean_id)
+                boolean_on = getattr(boolean, "state", None) == "on"
+                if getattr(boolean, "state", None) not in ("on", "off"):
+                    known = False
+            start = _get_datetime(self.hass, start_id)
+            end = _get_datetime(self.hass, end_id)
+            dates_valid = start is not None and end is not None and end > start
+            expected_holiday = start <= now < end if dates_valid else boolean_on
+            known = known and expected_holiday == self._pilot_holiday_current
+            registry = er.async_get(self.hass)
+            preheat_id = registry.async_get_entity_id(
+                "switch", DOMAIN, f"{self._config_entry.entry_id}_preheat_enabled"
+            )
+            if preheat_id:
+                state = self.hass.states.get(preheat_id)
+                if getattr(state, "state", None) not in ("on", "off") or (
+                    getattr(state, "attributes", {}) or {}
+                ).get("restored"):
+                    known = False
+        except (AttributeError, TypeError, ValueError, KeyError):
+            known = False
+
+        qualified = True
+        for key in ("indoor_temp_entity", "real_outdoor_entity"):
+            source = self._temperature_state(cfg, key)
+            report = PilotPassive._report(
+                source,
+                now,
+                temperature=True,
+                reported_after=self._temperature_reported_after,
+            )
+            changed = getattr(source, "last_changed", None)
+            try:
+                if (
+                    report is None
+                    or changed is None
+                    or changed.tzinfo is None
+                    or changed > report[0]
+                ):
+                    qualified = False
+            except (TypeError, AttributeError):
+                qualified = False
+
+        return {
+            "state": ControlReplayState.from_sensor(self),
+            "cfg": copy.deepcopy(cfg),
+            "categories": categories,
+            "active_prices": active_prices,
+            "price_entity_id": cfg.get("electricity_price_entity"),
+            "cached_price_date": self._price_thresholds_cached_date,
+            "cached_price_entity_id": self._price_thresholds_entity_id,
+            "cached_p30": self._cached_p30,
+            "cached_p80": self._cached_p80,
+            "interval_minutes": interval,
+            "current_slot": slot,
+            "summer_threshold": self._helper_value_with_fallback(
+                helper_key="summer_threshold",
+                cfg=cfg,
+                default=float(DEFAULT_SUMMER_THRESHOLD),
+            ),
+            "configured_target": self._helper_value_with_fallback(
+                helper_key="target_temperature",
+                cfg=cfg,
+                default=float(DEFAULT_TARGET_TEMP),
+            ),
+            "aggressiveness": aggression,
+            "house_inertia": self._house_inertia(cfg),
+            "preheat_enabled": self._preheat_enabled(cfg),
+            "calendar_tz": now.tzinfo,
+            "holiday_context_known": known,
+            "holiday_start": start,
+            "holiday_end": end,
+            "holiday_boolean_on": boolean_on,
+            "inputs_qualified": qualified,
+        }, tuple(holiday_ids or ()) + (preheat_id,)
+
+    def _unavailable_pilot_plan(self, reason):
+        """Keep the last issued comparison as history, never as a current plan."""
+        previous = self._pilot_plan
+        comparison = previous.get("comparison", {})
+        historical = comparison.get("historical_reference")
+        if (
+            historical is None
+            and previous.get("planning_status")
+            in {"validated_passive", "hypothetical_unvalidated"}
+            and previous.get("forecast_start")
+        ):
+            historical = {
+                **comparison,
+                "status": "historical",
+                "forecast_start": previous["forecast_start"],
+                "issued_at": previous.get("issued_at"),
+                "pilot_plan": {
+                    **{
+                        key: previous[key]
+                        for key in (
+                            "planning_status",
+                            "reason",
+                            "horizon_minutes",
+                            "forecast_coverage",
+                            "cost_kind",
+                            "response_status",
+                            "duties",
+                            "temperatures",
+                            "comfort_status",
+                            "validation",
+                            "assumed_model",
+                            "forecast_quality",
+                            "monitoring_forecast",
+                            "initial_context",
+                            "plan_outcome_revision",
+                            "plan_outcome_status",
+                            "plan_outcome_reason",
+                        )
+                        if key in previous
+                    },
+                    "outcome_evaluation": "not_evaluated",
+                },
+            }
+        result = {"planning_status": "unavailable", "reason": reason}
+        if historical is not None:
+            result["comparison"] = {
+                "baseline": "unavailable",
+                "baseline_reason": reason,
+                "shared_control_status": "unavailable",
+                "savings": "unverified",
+                "recovery": "unknown",
+                "heat_storage": "unknown",
+                "historical_reference": historical,
+            }
+        return result
+
+    async def _plan_pilot(self, cfg, now, extra, command):
+        """Run a bounded diagnostic only; it never changes the control output."""
+        from .pilot_runtime_plan import _optional_control_needs_future_evidence
+
+        if _optional_control_needs_future_evidence(
+            {"cfg": cfg},
+            modifier_state=getattr(self, "_control_modifier_state", None),
+        ):
+            # Apply before cached-plan reuse and even when price context could
+            # not be captured. No future genuine optional evidence is available.
+            self._pilot_plan = self._unavailable_pilot_plan(
+                "optional_control_future_evidence_unavailable"
+            )
+            self._pilot_plan_next = None
+            self._pilot_plan_signature = None
+            return
+        if self._pilot_store_read_failed:
+            self._pilot_plan = self._unavailable_pilot_plan("history_unavailable")
+            return
+        price_id = cfg.get("electricity_price_entity")
+        tomorrow_id = cfg.get("price_tomorrow_entity")
+        weather_id = cfg.get("weather_entity")
+        weather_state = self.hass.states.get(weather_id) if weather_id else None
+        weather_attrs = getattr(weather_state, "attributes", {}) or {}
+        unit = weather_attrs.get("temperature_unit")
+        if getattr(weather_state, "state", None) in (None, "unknown", "unavailable"):
+            unit = None
+        from .pilot_forecast import price_window, source_is_current
+        from .pilot_runtime_plan import _weather_intervals
+
+        if not source_is_current(weather_state, now):
+            unit = None
+
+        price_state = self.hass.states.get(price_id) if price_id else None
+        tomorrow_state = (
+            self.hass.states.get(tomorrow_id)
+            if tomorrow_id and tomorrow_id != price_id
+            else None
+        )
+        prices = price_window((price_state, tomorrow_state), now, timedelta(hours=2))
+        weather = (
+            _weather_intervals(
+                self._pilot_weather_raw,
+                now,
+                current_outdoor=extra.get("outdoor_temperature"),
+            )
+            if unit == "°C"
+            else None
+        )
+        if prices is None or weather is None:
+            self._pilot_plan = self._unavailable_pilot_plan(
+                "price_forecast_unavailable"
+                if prices is None
+                else "weather_forecast_unavailable"
+            )
+            self._pilot_plan_next = None
+            self._pilot_plan_signature = None
+            return
+        target = extra.get("target_temperature")
+        aggression = extra.get("aggressiveness")
+        replay_context, replay_entities = self._capture_replay_context(
+            cfg, now, aggression
+        )
+
+        def replay_signature():
+            if replay_context is None:
+                return None
+            inside = self._temperature_state(cfg, "indoor_temp_entity")
+            outside = self._temperature_state(cfg, "real_outdoor_entity")
+            inside_attrs = getattr(inside, "attributes", {}) or {}
+            outside_attrs = getattr(outside, "attributes", {}) or {}
+            components = inside_attrs.get("source_temperatures_used")
+            components = (
+                tuple(sorted(components))
+                if isinstance(components, dict)
+                and all(isinstance(key, str) for key in components)
+                else None
+            )
+            entities = []
+            for entity_id in replay_entities:
+                entity = self.hass.states.get(entity_id) if entity_id else None
+                entities.append(
+                    (
+                        getattr(entity, "state", None),
+                        getattr(entity, "last_changed", None),
+                        (getattr(entity, "attributes", {}) or {}).get("restored"),
+                    )
+                )
+            return (
+                replay_context["summer_threshold"],
+                replay_context["configured_target"],
+                replay_context["house_inertia"],
+                replay_context["preheat_enabled"],
+                replay_context["holiday_context_known"],
+                replay_context["holiday_start"],
+                replay_context["holiday_end"],
+                replay_context["holiday_boolean_on"],
+                self._pilot_holiday_current,
+                replay_context["inputs_qualified"],
+                replay_context["cached_price_date"],
+                replay_context["cached_price_entity_id"],
+                replay_context["cached_p30"],
+                replay_context["cached_p80"],
+                components,
+                outside_attrs.get("selected_source"),
+                tuple(entities),
+            )
+
+        def pi_result_signature(result):
+            return (
+                (result.offset, result.p_term, result.i_term, result.error)
+                if result is not None
+                else None
+            )
+
+        replay_state = replay_context["state"] if replay_context is not None else None
+        replay_state_signature = (
+            (
+                replay_state.pi._integral,
+                replay_state.pi._last_time,
+                replay_state.pi._last_error,
+                replay_state.pi_precool_paused,
+                pi_result_signature(replay_state.last_pi_result),
+                replay_state.brake_ramp,
+                replay_state.preheat_ramp,
+                replay_state.brake_last_t,
+                replay_state.brake_last_expensive_t,
+                replay_state.preheat_last_t,
+                replay_state.was_braking_last_cycle,
+                replay_state.prev_aggressiveness,
+                replay_state.bridge_short_dip_active,
+                replay_state.thermal_pending_samples,
+                replay_state.thermal_should_refit,
+            )
+            if replay_state is not None
+            else None
+        )
+        signature = (
+            repr(getattr(price_state, "attributes", None)),
+            repr(getattr(tomorrow_state, "attributes", None)),
+            repr(self._pilot_weather_raw),
+            unit,
+            extra.get("indoor_temperature"),
+            extra.get("outdoor_temperature"),
+            command,
+            target,
+            aggression,
+            cfg.get("pid_output_clamp", PID_OUTPUT_CLAMP),
+            replay_signature(),
+        )
+        if self._pilot_plan_next is not None and now < self._pilot_plan_next:
+            if signature != self._pilot_plan_signature:
+                self._pilot_plan = self._unavailable_pilot_plan(
+                    "context_changed_waiting_for_replan"
+                )
+            elif (
+                replay_state_signature != self._pilot_replay_state_signature
+                and self._pilot_plan.get("planning_status")
+                in {"validated_passive", "hypothetical_unvalidated"}
+            ):
+                # A cached reference was issued for another PI/ramp state. Do
+                # not rerun the optimizer on every control cycle or expose the
+                # stale modeled path as a current comparison.
+                self._pilot_plan = self._unavailable_pilot_plan(
+                    "control_state_changed_waiting_for_replan"
+                )
+            return
+        self._pilot_plan_next = now + timedelta(minutes=30)
+        self._pilot_plan_signature = signature
+        self._pilot_replay_state_signature = replay_state_signature
+        if (
+            not isinstance(target, (int, float))
+            or aggression not in COMFORT_FLOOR_BY_AGGRESSIVENESS
+        ):
+            self._pilot_plan = {
+                "planning_status": "unavailable",
+                "reason": "comfort_context_unavailable",
+            }
+            return
+        from .pilot_runtime_plan import hypothetical_plan
+
+        from functools import partial
+
+        response_context = None
+        response_scope = None
+        pilot = self._pilot
+        pilot_sources = self._pilot_sources
+        if pilot is not None and pilot.manager.pump.ready:
+            initial_response = pilot.manager.response_state(now.timestamp())
+            if initial_response is not None:
+                response_context = (pilot.manager.pump.parameters, initial_response)
+                observed = pilot.manager.pump.history[:-16]
+                if observed:
+                    response_scope = {
+                        "request_min": min(row[1] for row in observed),
+                        "request_max": max(row[1] for row in observed),
+                        "heat_min": min(row[2] for row in observed),
+                        "heat_max": max(row[2] for row in observed),
+                    }
+        pi_reference = None
+        if (
+            self._attributes.get("mode") == MODE_PI
+            and self._last_pi_result is not None
+            and self._brake_ramp == 0
+            and self._preheat_ramp == 0
+            and (aggression == 0 or self._pilot_price_context is not None)
+        ):
+            import copy
+
+            pi_reference = {
+                "controller": copy.deepcopy(self._pi),
+                "kp": safe_float(cfg.get("pid_kp", PID_KP)),
+                "ki": safe_float(cfg.get("pid_ki", PID_KI)),
+                "kd": safe_float(cfg.get("pid_kd", PID_KD)),
+                "integral_clamp": safe_float(
+                    cfg.get("pid_integral_clamp", PID_INTEGRAL_CLAMP)
+                ),
+                "summer_threshold": self._helper_value_with_fallback(
+                    helper_key="summer_threshold",
+                    cfg=cfg,
+                    default=float(DEFAULT_SUMMER_THRESHOLD),
+                ),
+                "calendar_tz": now.tzinfo,
+            }
+            if aggression != 0:
+                categories, active_prices, interval, slot = self._pilot_price_context
+                pi_reference.update(
+                    categories=categories,
+                    active_prices=active_prices,
+                    interval_minutes=interval,
+                    current_slot=slot,
+                    price_lookahead_minutes=PRICE_LOOKAHEAD_HOURS * 60,
+                )
+        task = partial(
+            hypothetical_plan,
+            now=now,
+            indoor=extra.get("indoor_temperature"),
+            outdoor=extra.get("outdoor_temperature"),
+            command=command,
+            target=target,
+            floor=self._comfort_floor(target, aggression),
+            ceiling=target + self._preheat_headroom(aggression),
+            price_states=(price_state, tomorrow_state),
+            weather_rows=self._pilot_weather_raw,
+            weather_unit=unit,
+            output_clamp=safe_float(cfg.get("pid_output_clamp", PID_OUTPUT_CLAMP)),
+            entity_min=MIN_FAKE_TEMP,
+            entity_max=MAX_FAKE_TEMP,
+            response_context=response_context,
+            response_scope=response_scope,
+            pi_reference=pi_reference,
+            replay_context=replay_context,
+        )
+        import asyncio
+        from .ohmigo import _switch_entity_id
+
+        state_ids = [
+            cfg.get(key)
+            for key in (
+                "indoor_temp_entity",
+                "indoor_temp_entity_2",
+                "indoor_temp_entity_3",
+                "real_outdoor_entity",
+                "outdoor_temp_entity_2",
+                "electricity_price_entity",
+                "price_tomorrow_entity",
+                "weather_entity",
+                "thermal_heat_activity_entity",
+                "thermal_supply_temp_entity",
+                "thermal_heating_mode_entity",
+                "thermal_hot_water_mode_entity",
+                "thermal_compressor_entity",
+                "thermal_return_temp_entity",
+                "thermal_power_entity",
+                "ohmigo_entity",
+                "ohmigo_relay_entity",
+            )
+        ]
+        state_ids.extend(
+            (
+                _switch_entity_id(self.hass, self._config_entry.entry_id),
+                self._number_entity_id("target_temperature"),
+                self._number_entity_id("aggressiveness"),
+                self._number_entity_id("summer_threshold"),
+                self._number_entity_id("house_inertia"),
+            )
+        )
+        state_ids.extend(replay_entities)
+
+        def state_snapshot():
+            values = []
+            for entity_id in state_ids:
+                state = self.hass.states.get(entity_id) if entity_id else None
+                values.append(
+                    (
+                        getattr(state, "state", None),
+                        getattr(state, "last_reported", None),
+                        getattr(state, "last_changed", None),
+                        repr(getattr(state, "attributes", None)),
+                    )
+                )
+            return tuple(values)
+
+        def control_snapshot():
+            return (
+                self._pi._integral,
+                self._pi._last_time,
+                self._pi._last_error,
+                self._pi_precool_paused,
+                pi_result_signature(self._last_pi_result),
+                self._brake_ramp,
+                self._preheat_ramp,
+                self._brake_last_t,
+                self._brake_last_expensive_t,
+                self._preheat_last_t,
+                self._was_braking_last_cycle,
+                self._prev_aggressiveness,
+                self._bridge_short_dip_active,
+                self._thermal_model.pending_samples,
+            )
+
+        snapshot = state_snapshot()
+        control_before = control_snapshot()
+        config_snapshot = dict(cfg)
+
+        cached_house = (
+            self._pilot_house_candidate
+            if self._pilot_house_candidate_owner is pilot
+            and self._pilot_house_candidate_at is not None
+            and timedelta(0)
+            <= now - self._pilot_house_candidate_at
+            <= timedelta(hours=3)
+            else None
+        )
+
+        def evaluate():
+            fresh_house = (
+                pilot.validated_house(now.timestamp())
+                if response_context is not None
+                and cfg.get("external_heat_sources") is not True
+                else None
+            )
+            house = (cached_house or fresh_house) if fresh_house is not None else None
+            return task(house_context=house), house
+
+        result, house = await asyncio.to_thread(evaluate)
+        expected = {
+            "indoor_temp_entity": extra.get("indoor_temperature"),
+            "real_outdoor_entity": extra.get("outdoor_temperature"),
+        }
+        if (
+            self._cfg().get("thermal_intelligence_enabled") is not True
+            or self._pilot is not pilot
+            or self._pilot_sources != pilot_sources
+            or self._cfg() != config_snapshot
+            or state_snapshot() != snapshot
+            or control_snapshot() != control_before
+            or not self._temperature_inputs_match(cfg, expected)
+        ):
+            self._pilot_grid_marginal = {
+                "status": "unavailable",
+                "reason": "inputs_changed_during_planning",
+            }
+            self._pilot_plan = {
+                "planning_status": "unavailable",
+                "reason": "inputs_changed_during_planning",
+            }
+            self._pilot_plan_next = None
+            return
+        issued_at = dt_util.now()
+        if issued_at < now or issued_at - now > timedelta(minutes=1):
+            self._pilot_grid_marginal = {
+                "status": "unavailable",
+                "reason": "planning_result_delayed",
+            }
+            self._pilot_plan = {
+                "planning_status": "unavailable",
+                "reason": "planning_result_delayed",
+            }
+            self._pilot_plan_next = None
+            return
+        if house is not None and pilot is not None:
+            if cached_house is None:
+                self._pilot_house_candidate = dict(house)
+                self._pilot_house_candidate_at = now
+                self._pilot_house_candidate_owner = pilot
+            import hashlib
+
+            raw = "pilot-house-v1:" + ":".join(
+                format(house[key], ".17g") for key in ("loss", "gain", "background")
+            )
+            revision = hashlib.sha256(raw.encode()).hexdigest()[:16]
+            quality = pilot.audit.summary(revision)
+            result["forecast_quality"] = quality
+            validated = result.get("planning_status") == "validated_passive"
+            degraded = quality["status"] == "degraded"
+            if degraded:
+                result = {
+                    "planning_status": "unavailable",
+                    "reason": "forecast_quality_degraded",
+                    "forecast_quality": quality,
+                }
+            if (
+                validated
+                and pilot.last_indoor_report is not None
+                and timedelta(0)
+                <= issued_at - pilot.last_indoor_report
+                <= timedelta(minutes=5)
+                and pilot.manager.recent
+            ):
+                tick, _, observed_heat = pilot.manager.recent[-1]
+                if 0 <= issued_at.timestamp() - tick <= 60:
+                    if pilot.audit.issue(
+                        issued_at,
+                        extra.get("indoor_temperature"),
+                        extra.get("outdoor_temperature"),
+                        observed_heat,
+                        house["loss"],
+                        house["gain"],
+                        house["background"],
+                        revision,
+                        source_identity=pilot.source_identity,
+                        source_reported=pilot.last_indoor_report,
+                    ):
+                        if not degraded:
+                            result["monitoring_forecast"] = {
+                                "kind": "conditional_unchanged_heat_and_outdoor",
+                                "horizon_minutes": 15,
+                                "temperature": round(
+                                    pilot.audit.pending["forecast"], 2
+                                ),
+                                "initial_temperature": pilot.audit.pending["indoor"],
+                                "rate_c_per_hour": pilot.audit.pending["rate"],
+                                "valid_horizon_minutes": [10, 20],
+                                "source_reported_at": pilot.audit.pending[
+                                    "source_reported"
+                                ].isoformat(),
+                                "physical_measurement_time": "unknown",
+                                "model_revision": revision,
+                            }
+                        await self._save_pilot_store()
+        result["forecast_start"] = now.isoformat()
+        result["issued_at"] = issued_at.isoformat()
+        self._pilot_plan = result
+        if result.get("planning_status") in {
+            "validated_passive",
+            "hypothetical_unvalidated",
+        }:
+            from .pilot_passive import PilotPassive
+            import hashlib
+
+            source = cfg.get("indoor_temp_entity")
+            report = PilotPassive._report(
+                self._temperature_state(cfg, "indoor_temp_entity"),
+                issued_at,
+                temperature=True,
+                reported_after=self._temperature_reported_after,
+            )
+            result["plan_outcome_status"] = "unverifiable"
+            result["plan_outcome_reason"] = "initial_temperature_report_unavailable"
+            identity = self._plan_current_identity(cfg)
+            if identity is None or identity != self._plan_cycle_identity:
+                result["plan_outcome_reason"] = "source_changed_during_cycle"
+            elif result.get("initial_context") is None:
+                result["plan_outcome_reason"] = "initial_context_unavailable"
+            elif report is not None:
+                result["plan_outcome_reason"] = "invalid_plan_metadata"
+                model = tuple(
+                    (house or {}).get(key) for key in ("loss", "gain", "background")
+                )
+                response = (
+                    tuple(sorted(vars(response_context[0]).items()))
+                    if response_context
+                    else None
+                )
+                revision = hashlib.sha256(
+                    repr(
+                        ("pilot-plan-v1", result["planning_status"], model, response)
+                    ).encode()
+                ).hexdigest()[:16]
+                if self._plan_audit.issue_plan(
+                    forecast_start=now,
+                    issued_at=issued_at,
+                    temperatures=result.get("temperatures"),
+                    revision=revision,
+                    status=result["planning_status"],
+                    source_entity=source,
+                    source_identity=identity,
+                    source_reported=report[0],
+                    initial_context=result.get("initial_context"),
+                ):
+                    result["plan_outcome_revision"] = revision
+                    result["plan_outcome_status"] = "awaiting_reports"
+                    result.pop("plan_outcome_reason", None)
+                    await self._save_pilot_store()
+
+    def _observe_pilot(self, cfg, now, mode):
+        """Passive learning from explicitly selected delivered-house-heat state."""
+        self._pilot_operating_mode = "unknown"
+        self._pilot_operating_quality = "insufficient_evidence"
+        self._heat_operation_detail = {}
+        if cfg.get("thermal_intelligence_enabled") is not True:
+            self._pilot = None
+            self._pilot_sources = None
+            self._heat_operation = None
+            self._heat_operation_signature = None
+            return
+        price_state = self.hass.states.get(cfg.get("electricity_price_entity"))
+        from .pilot_forecast import price_window, source_is_current
+
+        tomorrow = cfg.get("price_tomorrow_entity")
+        tomorrow_state = (
+            self.hass.states.get(tomorrow)
+            if tomorrow and tomorrow != cfg.get("electricity_price_entity")
+            else None
+        )
+        from .pilot_marginal import grid_import_forecast
+
+        price_intervals = price_window(
+            (price_state, tomorrow_state), now, timedelta(hours=2)
+        )
+        self._pilot_price_forecast = price_intervals is not None
+        self._pilot_grid_marginal = (
+            grid_import_forecast(
+                (price_state, tomorrow_state),
+                now,
+                timedelta(hours=2),
+                intervals=price_intervals,
+            )
+            if price_intervals is not None
+            else {"status": "unavailable", "reason": "price_forecast_unavailable"}
+        )
+        price_unit = (getattr(price_state, "attributes", {}) or {}).get(
+            "unit_of_measurement"
+        )
+        self._pilot_price_available = (
+            self._current_price is not None
+            and source_is_current(price_state, now)
+            and isinstance(price_unit, str)
+            and bool(price_unit.strip())
+        )
+        self._pilot_forecast_available = self._last_outlook is not None and (
+            self._last_outlook.night_min_temp is not None
+            or self._last_outlook.day_max_temp is not None
+        )
+        if self._pilot_store_read_failed:
+            self._pilot_status = "history_unavailable"
+            return None
+        method = cfg.get("thermal_detection_method")
+        heat_id = cfg.get("thermal_heat_activity_entity")
+        aliased_heat = bool(
+            method in {"automatic", "verified"}
+            and heat_id
+            and heat_id
+            in {
+                cfg.get("thermal_compressor_entity"),
+                cfg.get("thermal_heating_mode_entity"),
+                cfg.get("thermal_hot_water_mode_entity"),
+            }
+        )
+        source = None if aliased_heat else heat_id
+        if method == "manual":
+            source = None
+        supply = cfg.get("thermal_supply_temp_entity")
+        radiator_mode = cfg.get("thermal_heating_mode_entity")
+        hot_water_mode = cfg.get("thermal_hot_water_mode_entity")
+        threshold = safe_float(cfg.get("thermal_supply_threshold", 30))
+        use_supply = (
+            not source
+            and method not in {"automatic", "verified"}
+            and supply
+            and radiator_mode
+            and threshold is not None
+            and 0 <= threshold <= 60
+        )
+        if use_supply:
+            source = supply
+        signature = (
+            cfg.get("indoor_temp_entity"),
+            cfg.get("real_outdoor_entity"),
+            source,
+            cfg.get("external_heat_sources") is True,
+        )
+        if use_supply:
+            signature += (
+                radiator_mode,
+                threshold,
+                cfg.get("thermal_heating_mode_inverted") is True,
+            )
+        if hot_water_mode:
+            signature += ("hot_water_mode", hot_water_mode)
+        if method == "automatic":
+            signature += ("detection_method", method)
+            signature += tuple(
+                cfg.get(k)
+                for k in (
+                    "thermal_compressor_entity",
+                    "thermal_return_temp_entity",
+                    "thermal_power_entity",
+                    "thermal_heating_mode_entity",
+                    "thermal_heating_mode_inverted",
+                    "thermal_supply_temp_entity",
+                )
+            )
+        signature += (
+            cfg.get("ohmigo_entity"),
+            cfg.get("ohmigo_relay_entity"),
+            safe_float(cfg.get("pid_output_clamp", PID_OUTPUT_CLAMP)),
+        )
+        if any(
+            cfg.get(k)
+            for k in (
+                "indoor_temp_entity_2",
+                "indoor_temp_entity_3",
+                "outdoor_temp_entity_2",
+            )
+        ):
+            signature += (repr(self._temperature_identity(cfg)),)
+        if signature != self._pilot_sources:
+            self._pilot = None
+            self._pilot_detector = None
+            self._pilot_sources = signature
+            self._pilot_hot_water_checked_at = None
+            self._pilot_operation_checked_at = None
+        self._pilot_heat_source = (
+            "supply_temperature_indicator"
+            if use_supply
+            else "binary_heat_indicator"
+            if isinstance(source, str) and source.startswith("binary_sensor.")
+            else "unavailable"
+        )
+        operation = None
+        if method == "automatic":
+            from .heat_operation import HeatOperation
+
+            operation_signature = tuple(
+                cfg.get(k)
+                for k in (
+                    "thermal_heat_activity_entity",
+                    "thermal_compressor_entity",
+                    "thermal_heating_mode_entity",
+                    "thermal_heating_mode_inverted",
+                    "thermal_hot_water_mode_entity",
+                    "thermal_power_entity",
+                    "thermal_supply_temp_entity",
+                    "thermal_return_temp_entity",
+                )
+            )
+            if (
+                self._heat_operation is None
+                or operation_signature != self._heat_operation_signature
+            ):
+                self._heat_operation = HeatOperation()
+                self._heat_operation_signature = operation_signature
+                saved = (self._pilot_persisted or {}).get("heat_operation")
+                if isinstance(saved, dict) and saved.get("sources") == list(
+                    operation_signature
+                ):
+                    self._heat_operation.restore(saved.get("samples"))
+
+            def source_state(key):
+                from types import SimpleNamespace
+
+                entity = cfg.get(key)
+                if not entity:
+                    return None
+                return self.hass.states.get(entity) or SimpleNamespace(
+                    state="unavailable", attributes={}
+                )
+
+            radiator = self._heating_mode_state(cfg)
+            if radiator is None and cfg.get("thermal_heating_mode_entity"):
+                radiator = source_state("thermal_heating_mode_entity")
+            operation = self._heat_operation.observe(
+                now,
+                heat=None
+                if aliased_heat
+                else source_state("thermal_heat_activity_entity"),
+                compressor=source_state("thermal_compressor_entity"),
+                radiator=radiator,
+                water=source_state("thermal_hot_water_mode_entity"),
+                power=source_state("thermal_power_entity"),
+                supply=source_state("thermal_supply_temp_entity"),
+                return_temp=source_state("thermal_return_temp_entity"),
+                reported_after=self._temperature_reported_after,
+            )
+            if aliased_heat:
+                operation["reason"] = "heat_signal_aliases_operating_mode"
+            self._heat_operation_detail = operation
+            self._pilot_operating_mode = operation["mode"]
+            self._pilot_operating_quality = operation["quality"]
+            # Independent operating transitions can happen between controller
+            # cycles even if the verified heat indicator repeats unchanged.
+            from .pilot_forecast import _timestamp
+            from .pilot_passive import PilotPassive
+
+            role_states = [
+                source_state(key)
+                for key in ("thermal_compressor_entity", "thermal_heating_mode_entity")
+                if cfg.get(key)
+            ]
+            checked = self._pilot_operation_checked_at
+            instant = _timestamp(now)
+            valid = True
+            changed_since = False
+            for state in role_states:
+                report = PilotPassive._report(
+                    state, now, reported_after=self._temperature_reported_after
+                )
+                changed = _timestamp(getattr(state, "last_changed", None))
+                if report is None or changed is None or changed > _timestamp(report[0]):
+                    valid = False
+                    break
+                if checked is not None and changed > checked:
+                    changed_since = True
+            if not valid:
+                operation["learning_qualified"] = False
+                operation["learning_reason"] = "operating_context_unavailable"
+            if checked is not None and (
+                not valid or changed_since or instant < checked
+            ):
+                if self._pilot is not None:
+                    self._pilot.reset_interval()
+                if self._pilot_plan.get("planning_status") == "validated_passive":
+                    self._pilot_plan = {
+                        "planning_status": "unavailable",
+                        "reason": "operation_context_changed",
+                    }
+            self._pilot_operation_checked_at = (
+                instant if valid and role_states else None
+            )
+        if not use_supply and (
+            not isinstance(source, str) or not source.startswith("binary_sensor.")
+        ):
+            if operation is not None:
+                if self._pilot is None:
+                    from .pilot_passive import PilotPassive
+
+                    self._pilot = PilotPassive()
+                self._pilot.observe_indicated(
+                    now,
+                    self._temperature_state(cfg, "indoor_temp_entity"),
+                    self._temperature_state(cfg, "real_outdoor_entity"),
+                    operation,
+                    reported_after=self._temperature_reported_after,
+                )
+                operation["temperature_observation_status"] = (
+                    self._pilot.indicated_house.last_status
+                )
+                operation["indicated_observation_intervals"] = len(
+                    self._pilot.indicated_observations
+                )
+                operation["latest_indicated_interval"] = (
+                    self._pilot.indicated_observations[-1]
+                    if self._pilot.indicated_observations
+                    else None
+                )
+            if hot_water_mode:
+                from .pilot_forecast import _timestamp
+                from .pilot_passive import PilotPassive
+
+                state = self.hass.states.get(hot_water_mode)
+                report = PilotPassive._report(
+                    state, now, reported_after=self._temperature_reported_after
+                )
+                changed = _timestamp(getattr(state, "last_changed", None))
+                if (
+                    report is not None
+                    and changed is not None
+                    and changed <= _timestamp(report[0])
+                    and report[1] == 1.0
+                ):
+                    self._pilot_operating_mode = "hot_water"
+                    self._pilot_operating_quality = (
+                        "reported_mode_not_physical_confirmation"
+                    )
+            self._pilot_status = "heat_signal_not_configured"
+            return
+        try:
+            heat_state = self.hass.states.get(source)
+            hot_water_status = None
+            if hot_water_mode:
+                from .pilot_forecast import _timestamp
+                from .pilot_passive import PilotPassive
+
+                state = self.hass.states.get(hot_water_mode)
+                report = PilotPassive._report(
+                    state, now, reported_after=self._temperature_reported_after
+                )
+                changed = _timestamp(getattr(state, "last_changed", None))
+                if report is None or changed is None or changed > _timestamp(report[0]):
+                    hot_water_status = "hot_water_mode_unavailable"
+                    self._pilot_hot_water_checked_at = None
+                elif report[1] != 0.0:
+                    hot_water_status = "hot_water_active"
+                if hot_water_status is None:
+                    previous = self._pilot_hot_water_checked_at
+                    if previous is not None and (
+                        changed > previous or _timestamp(now) < previous
+                    ):
+                        if self._pilot is not None:
+                            self._pilot.reset_interval()
+                        self._pilot_detector = None
+                        if (
+                            self._pilot_plan.get("planning_status")
+                            == "validated_passive"
+                        ):
+                            self._pilot_plan = {
+                                "planning_status": "unavailable",
+                                "reason": "hot_water_mode_changed",
+                            }
+                    self._pilot_hot_water_checked_at = _timestamp(now)
+                else:
+                    self._pilot_hot_water_checked_at = None
+            if hot_water_status is not None:
+                # A conflicting or unknown water mode cannot establish
+                # radiator heat; reset the supply detector as well.
+                self._pilot_detector = None
+                heat_state = None
+                if self._pilot_plan.get("planning_status") == "validated_passive":
+                    self._pilot_plan = {
+                        "planning_status": "unavailable",
+                        "reason": hot_water_status,
+                    }
+            elif use_supply:
+                from types import SimpleNamespace
+                from .pilot_passive import SupplyHeatDetector
+
+                if self._pilot_detector is None:
+                    self._pilot_detector = SupplyHeatDetector(threshold)
+                after = self._temperature_reported_after
+                if self._pilot_detection_after is not None and (
+                    after is None or self._pilot_detection_after > after
+                ):
+                    after = self._pilot_detection_after
+                detected = self._pilot_detector.observe(
+                    now,
+                    heat_state,
+                    self._heating_mode_state(cfg),
+                    reported_after=after,
+                )
+                heat_state = (
+                    None
+                    if detected is None
+                    else SimpleNamespace(
+                        state="on" if detected else "off",
+                        last_reported=self._pilot_detector.last_report,
+                        last_changed=self._pilot_detector.changed_at,
+                        attributes={},
+                    )
+                )
+            if operation is not None and not operation["learning_qualified"]:
+                heat_state = None
+            if operation is not None:
+                pass
+            elif hot_water_status == "hot_water_active":
+                self._pilot_operating_mode = "hot_water"
+                self._pilot_operating_quality = (
+                    "reported_mode_not_physical_confirmation"
+                )
+            elif hot_water_status is None and heat_state is not None:
+                from .pilot_passive import PilotPassive
+
+                observation = PilotPassive._report(
+                    heat_state, now, reported_after=self._temperature_reported_after
+                )
+                if observation is not None:
+                    if observation[1]:
+                        self._pilot_operating_mode = "radiator_heating"
+                        self._pilot_operating_quality = (
+                            "heat_indicator_not_measured_output"
+                        )
+                    else:
+                        self._pilot_operating_quality = (
+                            "no_heat_detected_idle_unverified"
+                        )
+            if self._pilot is None:
+                from .pilot_passive import PilotPassive
+
+                self._pilot = PilotPassive()
+                self._restore_pilot_history(self._pilot, signature, now)
+            if operation is not None:
+                self._pilot.observe_indicated(
+                    now,
+                    self._temperature_state(cfg, "indoor_temp_entity"),
+                    self._temperature_state(cfg, "real_outdoor_entity"),
+                    operation,
+                    reported_after=self._temperature_reported_after,
+                )
+                operation["temperature_observation_status"] = (
+                    self._pilot.indicated_house.last_status
+                )
+                operation["indicated_observation_intervals"] = len(
+                    self._pilot.indicated_observations
+                )
+                operation["latest_indicated_interval"] = (
+                    self._pilot.indicated_observations[-1]
+                    if self._pilot.indicated_observations
+                    else None
+                )
+            if mode in {"normal", "preheating", "pre_braking", "braking", "brake_hold"}:
+                paired = self._pilot.audit.observe(
+                    now,
+                    self._temperature_state(cfg, "indoor_temp_entity"),
+                    self._temperature_state(cfg, "real_outdoor_entity"),
+                    heat_state,
+                )
+                if paired:
+                    revision = self._pilot.audit.records[-1]["revision"]
+                    quality = self._pilot.audit.summary(revision)
+                    if quality["status"] == "degraded":
+                        self._pilot_plan = {
+                            "planning_status": "unavailable",
+                            "reason": "forecast_quality_degraded",
+                            "forecast_quality": quality,
+                        }
+                        self._pilot_plan_next = None
+            else:
+                self._pilot.audit.pending = None
+            self._pilot.observe(
+                now,
+                self._temperature_state(cfg, "indoor_temp_entity"),
+                self._temperature_state(cfg, "real_outdoor_entity"),
+                heat_state,
+                mode,
+                reported_after=self._temperature_reported_after,
+            )
+            command_entity = cfg.get("ohmigo_entity")
+            from .ohmigo import _switch_entity_id
+
+            switch_id = _switch_entity_id(self.hass, self._config_entry.entry_id)
+            relay_id = cfg.get("ohmigo_relay_entity")
+            switch_state = self.hass.states.get(switch_id) if switch_id else None
+            relay_state = self.hass.states.get(relay_id) if relay_id else None
+            # HA states indicate configured Push and Active, not physical receipt.
+            command_allowed = self._pilot._report(
+                switch_state, now, reported_after=self._temperature_reported_after
+            ) == (
+                getattr(switch_state, "last_reported", None),
+                1.0,
+            ) and self._pilot._report(
+                relay_state, now, reported_after=self._temperature_reported_after
+            ) == (getattr(relay_state, "last_reported", None), 1.0)
+            sample = self._pilot.observe_response(
+                now,
+                self._temperature_state(cfg, "real_outdoor_entity"),
+                heat_state,
+                self.hass.states.get(command_entity)
+                if command_entity and command_allowed
+                else None,
+                mode,
+                output_clamp=safe_float(cfg.get("pid_output_clamp", PID_OUTPUT_CLAMP)),
+                reported_after=self._temperature_reported_after,
+                defer_fit=True,
+            )
+            self._pilot_status = hot_water_status or self._pilot.status
+            return sample
+        except Exception:
+            _LOGGER.exception(
+                "Passive thermal intelligence failed; standard control continues"
+            )
+            self._pilot_operating_mode = "unknown"
+            self._pilot_operating_quality = "insufficient_evidence"
+            self._pilot = None
+            self._pilot_status = "learning_error"
+
+
+class PumpSteerThermalStatusSensor(SensorEntity):
+    """Compact passive status, updated only when its summary changes."""
+
+    _attr_has_entity_name = True
+    _attr_should_poll = False
+    _unrecorded_attributes = frozenset(
+        {"extra_temperature_zones", "heat_pump_telemetry", "heat_pump_alarm"}
+    )
+    _attr_translation_key = "thermal_intelligence"
+    _attr_icon = "mdi:brain"
+    _attr_device_class = "enum"
+    _attr_options = [
+        "disabled",
+        "waiting",
+        "learning",
+        "hypothetical_plan",
+        "validated_plan",
+        "unavailable",
+    ]
+    _attr_native_value = None
+
+    def __init__(self, controller: PumpSteerSensor) -> None:
+        self._controller = controller
+        self._attr_unique_id = f"{controller.unique_id}_thermal_intelligence"
+        self._attr_device_info = controller._attr_device_info
+        self._summary = {}
+
+    @property
+    def extra_state_attributes(self):
+        return self._summary
+
+    async def async_added_to_hass(self):
+        await super().async_added_to_hass()
+        self.async_on_remove(
+            async_dispatcher_connect(
+                self.hass,
+                self._controller._input_temperature_signal,
+                self._async_update_from_controller,
+            )
+        )
+        if not self._controller._update_in_progress:
+            self._async_update_from_controller()
+
+    @callback
+    def _async_update_from_controller(self):
+        controller = self._controller
+        cfg = controller._cfg()
+        enabled = cfg.get("thermal_intelligence_enabled") is True
+        attrs = controller.extra_state_attributes
+        plan = attrs.get("thermal_intelligence_plan_detail") or {}
+        planning_status = plan.get("planning_status", "unavailable")
+        reason = attrs.get("thermal_intelligence_reason")
+        if not enabled:
+            state = "disabled"
+        elif controller._temperature_unloaded or attrs.get("mode") == "safe_mode":
+            state = "unavailable"
+        elif planning_status == "hypothetical_unvalidated":
+            state = "hypothetical_plan"
+        elif planning_status == "validated_passive":
+            state = "validated_plan"
+        elif reason in ("learning_error", "update_error", "history_unavailable"):
+            state = "unavailable"
+        elif attrs.get("thermal_intelligence_learning_intervals", 0) and attrs.get(
+            "thermal_intelligence_status"
+        ) in {
+            "learning",
+            "insufficient_history",
+            "insufficient_weather_variation",
+            "gain_frozen",
+            "ill_conditioned",
+        }:
+            state = "learning"
+        else:
+            state = "waiting"
+        summary = {
+            "enabled": enabled,
+            "passive": True,
+            "planning_status": planning_status if enabled else "unavailable",
+            "reason": reason if enabled else None,
+            "plan_reason": plan.get("reason") if enabled else None,
+            "price_forecast": attrs.get("thermal_intelligence_price_forecast"),
+            "heat_source": attrs.get("thermal_intelligence_heat_source"),
+            "operating_mode": attrs.get(
+                "thermal_intelligence_operating_mode", "unknown"
+            ),
+            "operating_quality": attrs.get(
+                "thermal_intelligence_operating_quality", "insufficient_evidence"
+            ),
+            "operation_detail": attrs.get("thermal_intelligence_operation_detail", {}),
+            "heat_entity": cfg.get("thermal_heat_activity_entity")
+            or cfg.get("thermal_supply_temp_entity"),
+            "radiator_mode_entity": cfg.get("thermal_heating_mode_entity"),
+            "hot_water_entity": cfg.get("thermal_hot_water_mode_entity"),
+            "learning_intervals": attrs.get(
+                "thermal_intelligence_learning_intervals", 0
+            ),
+            "model": attrs.get("thermal_intelligence_model"),
+        }
+        if getattr(controller, "_zone_diagnostics", None):
+            summary["extra_temperature_zones"] = controller._zone_diagnostics
+        if getattr(controller, "_heatpump_diagnostics", None) is not None:
+            summary["heat_pump_telemetry"] = controller._heatpump_diagnostics
+        if getattr(controller, "_heatpump_alarm_status", None):
+            summary["heat_pump_alarm"] = controller._heatpump_alarm_status
+        if state != self._attr_native_value or summary != self._summary:
+            self._attr_native_value = state
+            self._summary = summary
+            self.async_write_ha_state()
+
+
+class PumpSteerInputTemperatureSensor(SensorEntity):
+    """Expose one qualified control input without reading its source again."""
+
+    _attr_has_entity_name = True
+    _attr_should_poll = False
+    _attr_native_unit_of_measurement = "°C"
+    _attr_device_class = "temperature"
+    _attr_state_class = "measurement"
+    _attr_native_value = None
+
+    def __init__(self, controller: PumpSteerSensor, key: str) -> None:
+        self._controller = controller
+        self._key = key
+        self._attr_translation_key = key
+        self._attr_unique_id = f"{controller.unique_id}_{key}"
+        self._attr_device_info = controller._attr_device_info
+
+    @property
+    def available(self) -> bool:
+        return self._attr_native_value is not None
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        self.async_on_remove(
+            async_dispatcher_connect(
+                self.hass,
+                self._controller._input_temperature_signal,
+                self._async_update_from_controller,
+            )
+        )
+        if not self._controller._update_in_progress:
+            self._async_update_from_controller()
+
+    @callback
+    def _async_update_from_controller(self) -> None:
+        value = self._controller._input_temperatures.get(self._key)
+        if value != self._attr_native_value:
+            self._attr_native_value = value
+            self.async_write_ha_state()
 
 
 class ThermalOutlookSensor(SensorEntity):
@@ -1713,4 +5897,13 @@ async def async_setup_entry(
     await hass.async_add_executor_job(setup_pump_log)
     sensor = PumpSteerSensor(hass, config_entry)
     outlook_sensor = ThermalOutlookSensor(hass, config_entry)
-    async_add_entities([sensor, outlook_sensor], update_before_add=False)
+    async_add_entities(
+        [
+            sensor,
+            outlook_sensor,
+            PumpSteerInputTemperatureSensor(sensor, "indoor_temperature"),
+            PumpSteerInputTemperatureSensor(sensor, "outdoor_temperature"),
+            PumpSteerThermalStatusSensor(sensor),
+        ],
+        update_before_add=False,
+    )
