@@ -87,9 +87,19 @@ Each signal influences the system once only:
 
 ### 5. Simplicity Over Complexity
 
-- No ML, no black-box decisions
+- Base control remains deterministic and independent of learned state.
+- The opt-in Thermal Intelligence prototype passively records observations and
+  evaluates an empirical model; it does not change control or output decisions.
+- A fitted model is not trusted until it demonstrates independent predictive value.
 - All behavior is explainable from inputs alone
 - If a behavior cannot be described simply, it does not belong in the system
+
+The passive Thermal Intelligence prototype is deliberately isolated from the
+PI, price, comfort, SAFE, Ohmigo, Relay Guard and Generic Output paths. Its
+normalized virtual-outdoor command coordinate describes a requested control
+input, not delivered heat or heating power. Successful Home Assistant service
+completion is not receiver readback. Predictions are scored only against future
+observations in the same operating context and are never used for active control.
 
 ---
 

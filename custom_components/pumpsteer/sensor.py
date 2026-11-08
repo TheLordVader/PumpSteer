@@ -22,6 +22,7 @@ from .thermal_model import (
     VALIDATION_BASIS,
     ThermalModel,
 )
+from .thermal_intelligence.runtime import ThermalIntelligence
 from .const import (
     DEFAULT_OUTDOOR_REPORT_MAX_AGE_MINUTES,
     DEFAULT_TEMPERATURE_REPORT_MAX_AGE_MINUTES,
@@ -154,6 +155,7 @@ class PumpSteerSensor(RestoreEntity):
             "heat_pump_alarm",
             "thermal_fixed_horizon_audit",
             "thermal_intelligence_grid_marginal",
+            "thermal_intelligence",
         }
     )
 
@@ -182,6 +184,8 @@ class PumpSteerSensor(RestoreEntity):
         self._pi = PIController()
         self._pi_precool_paused: bool = False
         self._thermal_model = ThermalModel()
+        self._thermal_intelligence = ThermalIntelligence()
+        self._thermal_store_restored = False
         self._adaptive_context = None
         self._adaptive_configuration = None
         self._adaptive_report = None
@@ -1225,6 +1229,11 @@ class PumpSteerSensor(RestoreEntity):
                 if self._thermal_model.last_session_predicted_drop is not None
                 else None
             ),
+            "thermal_intelligence": (
+                self._thermal_intelligence.summary()
+                if self._cfg().get("thermal_intelligence_enabled") is True
+                else None
+            ),
         }
 
     def _update_thermal_learning(
@@ -1686,6 +1695,11 @@ class PumpSteerSensor(RestoreEntity):
                     self._ohmigo_last_push,
                     temperature_check=check,
                     temperature_sources=sources,
+                    output_observer=(
+                        self._record_thermal_output
+                        if self._cfg().get("thermal_intelligence_enabled") is True
+                        else None
+                    ),
                 )
             finally:
                 unsubscribe()
@@ -1697,6 +1711,98 @@ class PumpSteerSensor(RestoreEntity):
             # it. Keep normal PI/ramp state; the next regular cycle recalculates.
             self._attributes["control_signal_status"] = "interrupted"
             self._attributes["receiver_state"] = "unverified"
+
+    def _record_thermal_output(self, event) -> None:
+        try:
+            self._thermal_intelligence.record_output(event)
+        except Exception:
+            _LOGGER.debug("Thermal Intelligence output capture failed", exc_info=True)
+
+    def _thermal_cycle(self, at, indoor, outdoor, fake_temp, mode, extra, cfg):
+        """Capture a bounded source snapshot without affecting the control result."""
+        indoor_state = self._temperature_state(cfg, "indoor_temp_entity")
+        indoor_attrs = getattr(indoor_state, "attributes", {}) or {}
+        used = indoor_attrs.get("source_temperatures_used")
+        weights = indoor_attrs.get("source_weights")
+        if isinstance(used, dict):
+            source_ids = list(used)
+        else:
+            source_ids = [
+                cfg.get(key)
+                for key in (
+                    "indoor_temp_entity",
+                    "indoor_temp_entity_2",
+                    "indoor_temp_entity_3",
+                )
+                if cfg.get(key)
+            ]
+        configured_indices = {
+            cfg.get(key): index
+            for index, key in enumerate(
+                (
+                    "indoor_temp_entity",
+                    "indoor_temp_entity_2",
+                    "indoor_temp_entity_3",
+                ),
+                start=1,
+            )
+            if cfg.get(key)
+        }
+        sources = []
+        for entity in source_ids:
+            if not isinstance(entity, str):
+                continue
+            state = self.hass.states.get(entity)
+            if isinstance(weights, dict):
+                weight = safe_float(weights.get(entity))
+            else:
+                configured_weight = safe_float(
+                    cfg.get(f"indoor_temp_weight_{configured_indices.get(entity, 1)}", 1.0)
+                )
+                weight = configured_weight
+            sources.append(
+                {
+                    "entity": entity,
+                    "weight": weight,
+                    "value": safe_float(getattr(state, "state", None)),
+                    "reported_at": getattr(state, "last_reported", None),
+                }
+            )
+        indoor_reported_at = max(
+            (
+                source["reported_at"]
+                for source in sources
+                if isinstance(source.get("reported_at"), datetime)
+                and source["reported_at"].tzinfo is not None
+                and source["reported_at"].utcoffset() is not None
+            ),
+            key=lambda reported: reported.timestamp(),
+            default=None,
+        )
+        outdoor_state = self._temperature_state(cfg, "real_outdoor_entity")
+        identity = self._temperature_identity(cfg)
+        return {
+            "at": at,
+            "indoor": indoor,
+            "indoor_reported_at": indoor_reported_at,
+            "sources": sources,
+            "outdoor": outdoor,
+            "outdoor_reported_at": getattr(outdoor_state, "last_reported", None),
+            "outdoor_source": identity[1],
+            "requested_virtual_outdoor": fake_temp,
+            "mode": mode,
+            "brake_factor": extra.get("brake_factor", 0.0),
+            "pi_demand_c": extra.get("heating_demand_c"),
+            "command_span": safe_float(
+                cfg.get("pid_output_clamp", PID_OUTPUT_CLAMP)
+            ),
+            "command_source": (
+                "ohmigo_single"
+                if cfg.get("ohmigo_entity")
+                and not str(cfg.get("modbus_service", "")).strip()
+                else "unverified_or_multiple_transports"
+            ),
+        }
 
     def _update_brake_ramp(
         self,
@@ -3819,6 +3925,23 @@ class PumpSteerSensor(RestoreEntity):
                 ("real_outdoor_entity", "outdoor_temperature"),
             )
         }
+        if cfg.get("thermal_intelligence_enabled") is True:
+            try:
+                self._thermal_intelligence.begin_cycle(
+                    self._thermal_cycle(
+                        now,
+                        extra.get("indoor_temperature"),
+                        extra.get("outdoor_temperature"),
+                        fake_temp,
+                        mode,
+                        extra,
+                        cfg,
+                    ),
+                    use_ohmigo_input=bool(cfg.get("ohmigo_entity"))
+                    and not bool(str(cfg.get("modbus_service", "")).strip()),
+                )
+            except Exception:
+                _LOGGER.debug("Thermal Intelligence observation failed", exc_info=True)
         await self._push_validated_temperature(
             fake_temp,
             cfg,
@@ -4241,6 +4364,16 @@ class PumpSteerSensor(RestoreEntity):
                 and self._pilot_persisted.get("version") == 1
             ):
                 self._pilot_restore = self._pilot_persisted
+                if not self._thermal_store_restored:
+                    saved_thermal = self._pilot_persisted.get(
+                        "thermal_intelligence"
+                    )
+                    if saved_thermal is not None:
+                        if not self._thermal_intelligence.restore_state(saved_thermal):
+                            _LOGGER.warning(
+                                "Discarding incompatible Thermal Intelligence state"
+                            )
+                    self._thermal_store_restored = True
                 if not self._plan_audit_loaded:
                     audit = self._plan_audit
                     if not (
@@ -4291,9 +4424,11 @@ class PumpSteerSensor(RestoreEntity):
             operation_samples and any(operation_samples.values())
         )
         plan_data = self._plan_audit.export_plan()
+        thermal_available = self._thermal_intelligence.has_evidence
         if (
             not model_available
             and not operation_available
+            and not thermal_available
             and not (
                 plan_data["records"]
                 or plan_data["pending_count"]
@@ -4333,11 +4468,16 @@ class PumpSteerSensor(RestoreEntity):
             plan_data["fixed_v1"][-1]["observed"] if plan_data["fixed_v1"] else None,
             self._heat_operation_signature if operation_available else None,
             operation.sample_count // 18 if operation_available else None,
+            self._thermal_intelligence.store_signature,
         )
         if key == self._pilot_saved:
             return
         payload = dict(self._pilot_persisted or {})
         payload.update(version=1, plan_audit=plan_data)
+        if thermal_available:
+            payload["thermal_intelligence"] = (
+                self._thermal_intelligence.export_state()
+            )
         if operation_available:
             payload["heat_operation"] = {
                 "sources": list(self._heat_operation_signature),

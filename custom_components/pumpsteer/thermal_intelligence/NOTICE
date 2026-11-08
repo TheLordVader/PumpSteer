@@ -1,0 +1,11 @@
+Adaptive Preheat RTM core
+
+The files in rtm_core/ are derived from d0ugal/ha-adaptive-preheat at
+0dbf3a4aba0c8712c0dac8adfb68ea9570b4c357.
+
+Copyright (c) 2026 giogandola98
+Licensed under the MIT License; see rtm_core/LICENSE.
+
+PumpSteer's adapter treats the upstream Sample.effort numeric field as a
+normalized virtual-outdoor command coordinate. It is not heat output, heating
+power, or a claim that the requested command was physically applied.
