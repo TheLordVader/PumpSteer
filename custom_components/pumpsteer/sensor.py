@@ -1941,9 +1941,11 @@ class PumpSteerSensor(RestoreEntity):
             if not self._adaptive_learning_available
             else "temperature_observation_too_old"
         )
+        # Reuse constituents only within the existing action freshness horizon.
+        # A new aggregate still requires genuine advancement, never HA polling.
         self._adaptive_new_report = bool(
-            self._adaptive_learning_available
-            and all(
+            self._adaptive_inputs_fresh
+            and any(
                 entity not in accepted
                 or observations[entity].timestamp() > accepted[entity].timestamp()
                 for entity in contributors

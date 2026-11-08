@@ -259,8 +259,8 @@ summary (policy version 4): coefficient association, genuine-fitting provenance,
 source context and three duration/gap/resolution-bearing validation rows. Older
 coefficients remain diagnostic and require twenty genuine samples, refitting and
 new independent validation before adaptive use. For weighted room temperature, a learning
-snapshot is accepted only after every contributing indoor source has genuinely advanced
-again. Its timestamp is the newest included observation; component times remain
+snapshot is accepted when at least one contributor has genuinely advanced and all
+contributors satisfy the existing current-action freshness horizon. Its timestamp is the newest included observation; component times remain
 separate and it is explicitly a causal asynchronous snapshot, not a simultaneous
 physical measurement. An individual report cannot fabricate new observations for
 other contributors. Current action freshness uses the oldest contributor and the

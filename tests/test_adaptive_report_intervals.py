@@ -142,8 +142,8 @@ def test_jitter_and_three_asynchronous_weighted_sensors(monkeypatch, interval):
         sensor._thermal_model.adaptive_reason(START + timedelta(minutes=4 * 720), 16)
         == "qualified"
     )
-    # Each accepted aggregate requires fresh evidence from all contributors.
-    assert len(accepted) <= min(count.values())
+    # Each aggregate needs advancement from at least one fresh contributor.
+    assert len(accepted) <= sum(count.values())
     state, inputs, actual = cold_step(sensor, states, monkeypatch, 4 * 720 + 1)
     _, adaptive = replay_control_step(state, inputs)
     _, base = replay_control_step(
@@ -195,7 +195,7 @@ def test_genuinely_mixed_five_ten_fifteen_minute_sources_learn_and_adapt(monkeyp
     )
     now = START + timedelta(minutes=2881)
     assert count["sensor.indoor"] > count["sensor.indoor2"] > count["sensor.indoor3"]
-    assert len(accepted) <= min(count.values())
+    assert len(accepted) <= sum(count.values())
     assert sensor._thermal_model.adaptive_reason(now, 16) == "qualified"
     assert sensor._thermal_model.sample_count >= 20
     state, inputs, actual = cold_step(sensor, states, monkeypatch, 4 * 720 + 1)
