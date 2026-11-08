@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import logging
+from contextlib import nullcontext
 from datetime import datetime
-from typing import Optional
+from typing import Callable, Optional
 
 import homeassistant.util.dt as dt_util
 from homeassistant.config_entries import ConfigEntry
@@ -23,6 +24,16 @@ _MODBUS_DEFAULT_INTERVAL_MINUTES: float = 5.0
 # the output module for the hotfix so GOS remains independent from Ohmigo
 # timing without replacing or downgrading the current sensor implementation.
 _modbus_last_push_by_entry: dict[str, datetime] = {}
+
+
+def _report_output(observer, **event) -> None:
+    """Report transport provenance without allowing diagnostics to affect output."""
+    if observer is None:
+        return
+    try:
+        observer({"at": dt_util.now().isoformat(), **event})
+    except Exception:
+        _LOGGER.debug("Thermal Intelligence output observer failed", exc_info=True)
 
 
 def _switch_entity_id(hass: HomeAssistant, entry_id: str) -> Optional[str]:
@@ -45,6 +56,9 @@ async def async_push_modbus(
     entry: ConfigEntry,
     fake_temp: float,
     last_push_time: Optional[datetime],
+    *,
+    temperature_check: Optional[Callable[[], bool]] = None,
+    output_observer: Optional[Callable[[dict], None]] = None,
 ) -> Optional[datetime]:
     """Push fake_temp through a configurable Home Assistant service call."""
     cfg = {**entry.data, **entry.options}
@@ -57,13 +71,25 @@ async def async_push_modbus(
     )
     now = dt_util.now()
     if last_push_time is not None:
-        elapsed = (now - last_push_time).total_seconds() / 60.0
+        elapsed = (now.timestamp() - last_push_time.timestamp()) / 60.0
         if elapsed < interval_minutes:
+            _report_output(
+                output_observer,
+                transport="generic",
+                status="not_due",
+                requested=None,
+            )
             return last_push_time
 
     if "." not in service_str:
         _LOGGER.warning(
             "modbus_service '%s' is not valid (expected 'domain.service')", service_str
+        )
+        _report_output(
+            output_observer,
+            transport="generic",
+            status="invalid_configuration",
+            requested=None,
         )
         return last_push_time
 
@@ -72,6 +98,12 @@ async def async_push_modbus(
     payload_template: str = str(cfg.get("modbus_payload_template", "")).strip()
     if not payload_template:
         _LOGGER.warning("modbus_service is set but modbus_payload_template is empty")
+        _report_output(
+            output_observer,
+            transport="generic",
+            status="invalid_configuration",
+            requested=None,
+        )
         return last_push_time
 
     try:
@@ -81,6 +113,12 @@ async def async_push_modbus(
         rendered = tmpl.async_render({"fake_temp": fake_temp})
     except Exception as err:
         _LOGGER.warning("modbus_payload_template render failed: %s", err)
+        _report_output(
+            output_observer,
+            transport="generic",
+            status="render_failed",
+            requested=None,
+        )
         return last_push_time
 
     if isinstance(rendered, dict):
@@ -94,9 +132,29 @@ async def async_push_modbus(
                 raise ValueError(f"Expected dict, got {type(service_data)}")
         except Exception as err:
             _LOGGER.warning("modbus_payload_template did not produce a dict: %s", err)
+            _report_output(
+                output_observer,
+                transport="generic",
+                status="render_failed",
+                requested=None,
+            )
             return last_push_time
 
     try:
+        if temperature_check is not None and not temperature_check():
+            _report_output(
+                output_observer,
+                transport="generic",
+                status="skipped",
+                requested=None,
+            )
+            return last_push_time
+        _report_output(
+            output_observer,
+            transport="generic",
+            status="dispatch_attempted",
+            requested=None,
+        )
         await hass.services.async_call(
             domain,
             service,
@@ -106,9 +164,21 @@ async def async_push_modbus(
         _LOGGER.debug(
             "Generic output push: %s → fake_temp=%.1f °C", service_str, fake_temp
         )
+        _report_output(
+            output_observer,
+            transport="generic",
+            status="dispatched_unverified",
+            requested=None,
+        )
         return now
     except Exception as err:
         _LOGGER.warning("Generic output push failed (%s): %s", service_str, err)
+        _report_output(
+            output_observer,
+            transport="generic",
+            status="dispatch_failed",
+            requested=None,
+        )
         return last_push_time
 
 
@@ -116,6 +186,8 @@ async def _async_push_generic_output(
     hass: HomeAssistant,
     entry: ConfigEntry,
     fake_temp: float,
+    temperature_check: Optional[Callable[[], bool]] = None,
+    output_observer: Optional[Callable[[dict], None]] = None,
 ) -> None:
     """Run GOS independently from Ohmigo while keeping its own interval state."""
     cfg = {**entry.data, **entry.options}
@@ -131,6 +203,8 @@ async def _async_push_generic_output(
         entry,
         fake_temp,
         last_push_time,
+        temperature_check=temperature_check,
+        output_observer=output_observer,
     )
     if updated_last_push is not None:
         _modbus_last_push_by_entry[entry.entry_id] = updated_last_push
@@ -141,17 +215,35 @@ async def async_push_ohmigo(
     entry: ConfigEntry,
     fake_temp: float,
     last_push_time: Optional[datetime],
+    *,
+    temperature_check: Optional[Callable[[], bool]] = None,
+    temperature_sources=None,
+    output_observer: Optional[Callable[[dict], None]] = None,
 ) -> Optional[datetime]:
     """Push fake_temp to GOS and, when configured, to an Ohmigo number entity."""
     # GOS is independent from Ohmigo and must run even if no Ohmigo entity is configured.
-    await _async_push_generic_output(hass, entry, fake_temp)
+    await _async_push_generic_output(
+        hass, entry, fake_temp, temperature_check, output_observer
+    )
 
     cfg = {**entry.data, **entry.options}
     ohmigo_entity: str = cfg.get("ohmigo_entity", "")
     if not ohmigo_entity:
+        _report_output(
+            output_observer,
+            transport="ohmigo",
+            status="not_configured",
+            requested=None,
+        )
         return last_push_time
 
     if not _ohmigo_push_enabled(hass, entry.entry_id):
+        _report_output(
+            output_observer,
+            transport="ohmigo",
+            status="disabled",
+            requested=None,
+        )
         return last_push_time
 
     interval_minutes: float = float(
@@ -159,8 +251,14 @@ async def async_push_ohmigo(
     )
     now = dt_util.now()
     if last_push_time is not None:
-        elapsed = (now - last_push_time).total_seconds() / 60.0
+        elapsed = (now.timestamp() - last_push_time.timestamp()) / 60.0
         if elapsed < interval_minutes:
+            _report_output(
+                output_observer,
+                transport="ohmigo",
+                status="not_due",
+                requested=None,
+            )
             return last_push_time
 
     new_val = round(fake_temp * 2) / 2
@@ -175,13 +273,55 @@ async def async_push_ohmigo(
         except (ValueError, TypeError):
             pass
 
-    try:
-        await hass.services.async_call(
-            "number",
-            "set_value",
-            {"entity_id": ohmigo_entity, "value": new_val},
-            blocking=False,
+    runtime = getattr(hass, "data", {}).get(DOMAIN, {}).get(entry.entry_id, {})
+    guard = runtime.get("relay_guard")
+
+    def output_check():
+        # The grant belongs to this write, never to a newly configured target.
+        current = {**entry.data, **entry.options}.get("ohmigo_entity", "")
+        return (
+            current == ohmigo_entity
+            and temperature_check is not None
+            and temperature_check()
         )
+
+    context = (
+        guard.temperature_write(output_check, source_entities=temperature_sources)
+        if guard is not None and temperature_check is not None
+        else nullcontext(output_check if temperature_check is not None else None)
+    )
+    service_completed = False
+    try:
+        with context as check:
+            if check is not None and not check():
+                _report_output(
+                    output_observer,
+                    transport="ohmigo",
+                    status="skipped",
+                    requested=new_val,
+                )
+                return last_push_time
+            _report_output(
+                output_observer,
+                transport="ohmigo",
+                status="dispatch_attempted",
+                requested=new_val,
+            )
+            await hass.services.async_call(
+                "number",
+                "set_value",
+                {"entity_id": ohmigo_entity, "value": new_val},
+                blocking=True,
+            )
+            service_completed = True
+            _report_output(
+                output_observer,
+                transport="ohmigo",
+                status="service_completed_unverified",
+                requested=new_val,
+            )
+            if guard is not None and check is not None and check():
+                await guard.async_temperature_written(check)
         if within_hysteresis:
             _LOGGER.debug(
                 "Ohmigo keepalive resend: %s → %.1f °C", ohmigo_entity, new_val
@@ -205,4 +345,10 @@ async def async_push_ohmigo(
         return now
     except Exception as err:
         _LOGGER.warning("Ohmigo push failed for %s: %s", ohmigo_entity, err)
+        _report_output(
+            output_observer,
+            transport="ohmigo",
+            status=("post_dispatch_error" if service_completed else "dispatch_failed"),
+            requested=new_val,
+        )
         return last_push_time

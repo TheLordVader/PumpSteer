@@ -3,103 +3,132 @@
 """
 Empirical thermal model for PumpSteer.
 
-This module estimates the house cooling rate constant k
-(°C/h per °C temperature delta) from samples collected during
-braking periods, when reduced heating demand makes thermal loss
-easier to observe.
+The model estimates the house's observed cooling response during PumpSteer braking.
+It deliberately learns only from relevant heating/braking periods; it is not intended
+to accumulate general year-round household telemetry.
 
-In PumpSteer 2.1.0, this model is used for:
-- observability
-- telemetry
-- future validation work
-
-It does NOT directly control brake/pre-brake/preheat decisions in 2.1.0.
-
-The model can estimate expected indoor temperature drop during
-reduced-heating periods, but these prediction helpers are currently
-diagnostic/future-facing and not part of the active control path.
+The fitted model can predict observed temperature drop and validate those
+predictions. An explicitly enabled adaptive brake may use separately qualified,
+prospective validation to conservatively reduce existing price braking.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Deque, Optional
+from typing import Deque, Optional, Sequence
 
 _LOGGER = logging.getLogger(__name__)
 
 # Minimum braking samples before the model is considered valid.
 _MIN_SAMPLES = 20
 
+# Keep learning memory bounded even if several short sessions occur before a fit.
+# At approximately one sample/minute this is at most about four hours of relevant data.
+_MAX_LEARNING_SAMPLES = 240
+
 # Fallback k if insufficient braking history exists.
-# 0.05 °C/h per °C delta means a house at 21°C inside and -4°C outside
-# (delta = 25°C) cools at about 1.25°C/h. This is conservative but plausible
-# for a Swedish wood-frame house.
 _FALLBACK_K = 0.05
 
-# Physically plausible range for k.
-# < 0.005: unrealistically low heat loss
-# > 0.5: unrealistically high heat loss
-_K_MIN = 0.005
+# Plausible range for k. During PumpSteer braking the heat pump is throttled,
+# not stopped (fake outdoor = real outdoor + BRAKE_DELTA_C), so the observed
+# effective k can be far below a true passive cooling constant.
+_K_MIN = 0.001
 _K_MAX = 0.5
 
-# Ring buffer size for indoor temperature samples used to compute dT/dt.
-# 10 samples × ~60 s polling gives roughly a 10 minute window.
+# Small rolling buffer used only to estimate dT/dt. This is not retained training data.
 _TEMP_BUFFER_SIZE = 10
 
 # Minimum history span before rate is considered reliable.
-# A few minutes gives a more stable estimate than a near-instant sample.
 _MIN_RATE_WINDOW_MINUTES = 3.0
 
+# Break temperature history and sessions across stale observations.
+_MAX_TEMP_GAP_MINUTES = 5.0
+ADAPTIVE_MAX_REPORT_GAP_MINUTES = 30.0
+ADAPTIVE_LEARNING_MAX_GAP_MINUTES = 180.0
+
 # Plausible bounds for measured indoor temperature rate (°C/h).
-# These are intentionally conservative and only reject obvious spikes/noise.
 _MIN_RATE_C_PER_HOUR = -5.0
 _MAX_RATE_C_PER_HOUR = 1.0
+
+# Validation sessions shorter than this are too sensitive to sensor noise.
+_MIN_VALIDATION_SESSION_MINUTES = 10.0
+VALIDATION_BASIS = "start_outdoor_v1"
+
+# A flat session still validates the model when the model clearly predicted a drop.
+_MIN_PREDICTED_DROP_FOR_FLAT_VALIDATION_C = 0.3
+
+# Refit an already fitted model only after enough validation shows it is wrong.
+# Refitting after every session would discard each validation before it can count.
+_REFIT_MIN_VALIDATED_SESSIONS = 3
+_REFIT_MAE_THRESHOLD_C = 0.3
+
+# Without real prediction validation the confidence score is capped.
+_UNVALIDATED_CONFIDENCE_CAP = 0.5
 
 
 @dataclass
 class ThermalSample:
-    """One data point collected during a braking period."""
+    """One relevant data point collected during a stable braking period."""
 
     indoor_temp: float
     outdoor_temp: float
     rate: float  # °C/h, negative when indoor temperature is falling
 
 
+@dataclass
+class _ValidationSession:
+    """Small in-memory summary used to validate one relevant brake session."""
+
+    start_time: datetime
+    start_indoor: float
+    prediction_k: float
+    prediction_valid: bool
+    start_outdoor: float
+    last_time: datetime
+    last_indoor: float
+    forecast_30m: Optional[float] = None
+    forecast_checked: bool = False
+    adaptive_reports: bool = False
+    reports: int = 1
+    screen_external_heat: bool = False
+    declared_horizon_minutes: float = 30.0
+    max_gap_minutes: float = 0.0
+
+
 class ThermalModel:
-    """
-    Estimate house cooling rate from braking-period samples.
-
-    Simplified cooling model:
-        dT_indoor/dt = -k * (indoor - outdoor)
-
-    k is estimated by linear regression over samples collected
-    during braking periods.
-
-    In PumpSteer 2.1.0, this model is observational only:
-    - it may expose fitted values and sample counts
-    - it may support diagnostics and future validation
-    - it does NOT directly drive the state machine
-
-    Persistence:
-    k can be restored from saved sensor state so the model survives
-    Home Assistant restarts without depending on Recorder-based history.
-    """
+    """Estimate and validate observed house cooling response during braking."""
 
     def __init__(self) -> None:
+        self._external_disturbance = None
+        self._adaptive_fit = False
+        self._adaptive_reports = False
+        self._adaptive_validations = deque(maxlen=3)
         self._k: float = _FALLBACK_K
         self._valid: bool = False
         self._sample_count: int = 0
+        self._fit_rmse: Optional[float] = None
 
-        # Braking samples accumulated since the last fit cycle.
-        self._samples: list[ThermalSample] = []
+        # Only relevant braking samples are retained, and the buffer is bounded.
+        self._samples: Deque[ThermalSample] = deque(maxlen=_MAX_LEARNING_SAMPLES)
 
-        # Ring buffer of (timestamp, indoor_temp) used to estimate cooling rate.
+        # Tiny rolling buffer used to estimate indoor temperature rate.
         self._temp_history: Deque[tuple[datetime, float]] = deque(
             maxlen=_TEMP_BUFFER_SIZE
         )
+
+        # Session-level validation statistics. Raw sessions are never persisted.
+        self._session: Optional[_ValidationSession] = None
+        self._learning_sessions: int = 0
+        self._validated_sessions: int = 0
+        self._prediction_mae: Optional[float] = None
+        self._last_prediction_error: Optional[float] = None
+        self._last_session_duration_minutes: Optional[float] = None
+        self._last_session_actual_drop: Optional[float] = None
+        self._last_session_predicted_drop: Optional[float] = None
 
     # ── Public properties ──────────────────────────────────────────────────────
 
@@ -110,7 +139,7 @@ class ThermalModel:
 
     @property
     def is_valid(self) -> bool:
-        """True if k was fitted from collected data instead of fallback."""
+        """True if k was fitted from relevant braking data."""
         return self._valid
 
     @property
@@ -120,20 +149,131 @@ class ThermalModel:
 
     @property
     def pending_samples(self) -> int:
-        """Number of collected samples waiting for the next fit."""
+        """Number of relevant samples waiting for the next fit."""
         return len(self._samples)
+
+    @property
+    def fit_rmse(self) -> Optional[float]:
+        """RMSE of the most recent successful dT/dt fit in °C/h."""
+        return self._fit_rmse
+
+    @property
+    def learning_sessions(self) -> int:
+        """Number of completed relevant thermal-learning sessions."""
+        return self._learning_sessions
+
+    @property
+    def validated_sessions(self) -> int:
+        """Number of sessions validated using an already fitted model."""
+        return self._validated_sessions
+
+    @property
+    def prediction_mae(self) -> Optional[float]:
+        """Running mean absolute prediction error across validated sessions."""
+        return self._prediction_mae
+
+    @property
+    def last_prediction_error(self) -> Optional[float]:
+        """Signed error from the latest validated session: actual - predicted drop."""
+        return self._last_prediction_error
+
+    @property
+    def last_session_duration_minutes(self) -> Optional[float]:
+        return self._last_session_duration_minutes
+
+    @property
+    def last_session_actual_drop(self) -> Optional[float]:
+        return self._last_session_actual_drop
+
+    @property
+    def last_session_predicted_drop(self) -> Optional[float]:
+        return self._last_session_predicted_drop
+
+    @property
+    def validation_session_active(self) -> bool:
+        return self._session is not None
+
+    @property
+    def confidence(self) -> float:
+        """Return a conservative 0..1 diagnostic confidence score.
+
+        This is intentionally a heuristic quality indicator, not a statistical
+        probability. It combines fit sample count, fit residual quality, completed
+        learning sessions and real prediction validation.
+        """
+        if not self._valid:
+            return 0.0
+
+        sample_score = min(1.0, self._sample_count / 60.0)
+        fit_score = (
+            0.0
+            if self._fit_rmse is None
+            else max(0.0, min(1.0, 1.0 - (self._fit_rmse / 1.0)))
+        )
+        session_score = min(1.0, self._learning_sessions / 5.0)
+        validation_score = (
+            0.0
+            if self._prediction_mae is None
+            else max(0.0, min(1.0, 1.0 - (self._prediction_mae / 1.0)))
+        )
+
+        score = max(
+            0.0,
+            min(
+                1.0,
+                0.35 * sample_score
+                + 0.35 * fit_score
+                + 0.15 * session_score
+                + 0.15 * validation_score,
+            ),
+        )
+        # A good in-sample fit does not prove predictive accuracy.
+        if self._validated_sessions == 0:
+            score = min(score, _UNVALIDATED_CONFIDENCE_CAP)
+        return score
+
+    def should_refit(self) -> bool:
+        """Return True when pending samples should replace the current k.
+
+        An unfitted model is fitted as soon as enough samples exist. A fitted
+        model is kept until validation sessions show a consistent error, so
+        each new k actually gets validated before it is replaced.
+        """
+        if len(self._samples) < _MIN_SAMPLES:
+            return False
+        if not self._valid or (self._adaptive_reports and not self._adaptive_fit):
+            return True
+        if len(self._adaptive_validations) == 3 and all(
+            abs(row[1]) > 0.2 for row in self._adaptive_validations
+        ):
+            # Repeated failures of the stricter active-use gate require relearning,
+            # even when the older diagnostic MAE threshold has not been reached.
+            return True
+        if (
+            self._adaptive_reports
+            and len(self._adaptive_validations) == 3
+            and self._sample_count >= 20
+            and self._fit_rmse is not None
+            and self._fit_rmse <= 0.3
+            and all(abs(row[1]) <= 0.2 for row in self._adaptive_validations)
+        ):
+            # Prospectively tested operating horizons govern this model's active
+            # use; a different six-hour retrospective extrapolation cannot unlearn
+            # three good short/declared-horizon forecasts.
+            return False
+        return (
+            self._validated_sessions >= _REFIT_MIN_VALIDATED_SESSIONS
+            and self._prediction_mae is not None
+            and self._prediction_mae > _REFIT_MAE_THRESHOLD_C
+        )
 
     # ── Persistence ────────────────────────────────────────────────────────────
 
     def restore_k(self, k: float) -> None:
-        """
-        Restore k from previously saved state.
-
-        Intended to be called once during startup before the first
-        update cycle.
-        """
-        if _K_MIN < k < _K_MAX:
+        """Restore k from previously saved Home Assistant state."""
+        if math.isfinite(k) and _K_MIN < k < _K_MAX:
             self._k = k
+            self._adaptive_fit = False
             self._valid = True
             _LOGGER.debug("ThermalModel: restored k=%.4f from state", k)
         else:
@@ -141,52 +281,261 @@ class ThermalModel:
                 "ThermalModel: restored k=%.4f is out of range, using fallback", k
             )
 
-    # ── Sample collection ──────────────────────────────────────────────────────
+    def restore_diagnostics(
+        self,
+        *,
+        sample_count: int = 0,
+        fit_rmse: Optional[float] = None,
+        learning_sessions: int = 0,
+        validated_sessions: int = 0,
+        prediction_mae: Optional[float] = None,
+        validation_basis: Optional[str] = VALIDATION_BASIS,
+        last_prediction_error: Optional[float] = None,
+        last_session_duration_minutes: Optional[float] = None,
+        last_session_actual_drop: Optional[float] = None,
+        last_session_predicted_drop: Optional[float] = None,
+    ) -> None:
+        """Restore compact model-quality summaries without restoring raw samples."""
+        self._sample_count = max(0, int(sample_count))
+        self._fit_rmse = self._finite_or_none(fit_rmse)
+        self._learning_sessions = max(0, int(learning_sessions))
+        # Older summaries used future outdoor observations and are not forecasts.
+        if validation_basis == VALIDATION_BASIS:
+            self._validated_sessions = max(0, int(validated_sessions))
+            self._prediction_mae = self._finite_or_none(prediction_mae)
+        else:
+            self._validated_sessions = 0
+            self._prediction_mae = None
+        if validation_basis != VALIDATION_BASIS:
+            last_prediction_error = None
+            last_session_duration_minutes = None
+            last_session_actual_drop = None
+            last_session_predicted_drop = None
+        self._last_prediction_error = self._signed_finite_or_none(last_prediction_error)
+        self._last_session_duration_minutes = self._finite_or_none(
+            last_session_duration_minutes
+        )
+        self._last_session_actual_drop = self._finite_or_none(last_session_actual_drop)
+        self._last_session_predicted_drop = self._finite_or_none(
+            last_session_predicted_drop
+        )
 
-    def record_temp(self, now: datetime, indoor_temp: float) -> None:
+    @staticmethod
+    def _signed_finite_or_none(value: Optional[float]) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return None
+        return numeric if math.isfinite(numeric) else None
+
+    @staticmethod
+    def _finite_or_none(value: Optional[float]) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return None
+        return numeric if math.isfinite(numeric) and numeric >= 0.0 else None
+
+    def adaptive_snapshot(self):
+        """Tiny versioned evidence for the current fitted coefficient; no raw history."""
+        return {
+            "version": 4,
+            "genuine_fit": self._adaptive_fit,
+            "k": self._k,
+            "validations": list(self._adaptive_validations),
+        }
+
+    def restore_adaptive(self, saved):
+        """Reject incompatible/corrupt evidence instead of qualifying an old model."""
+        self._adaptive_validations.clear()
+        self._adaptive_fit = False
+        try:
+            if (
+                not isinstance(saved, dict)
+                or saved.get("version") != 4
+                or saved.get("k") != self._k
+            ):
+                return
+            if saved.get("genuine_fit") is not True:
+                return
+            rows = saved["validations"]
+            if not isinstance(rows, list) or len(rows) > 3:
+                return
+            parsed = []
+            for row in rows:
+                if len(row) != 6 or not all(
+                    type(v) in (float, int) and math.isfinite(v) for v in row
+                ):
+                    return
+                at, error, delta, duration, gap, drop = row
+                if (
+                    at <= 0
+                    or not 2 <= delta <= 70
+                    or not 27 <= duration <= 360
+                    or not 0 < gap <= min(duration, ADAPTIVE_LEARNING_MAX_GAP_MINUTES)
+                    or (parsed and at - parsed[-1][0] < 27 * 60)
+                ):
+                    return
+                parsed.append((at, error, delta, duration, gap, drop))
+            self._adaptive_validations.extend(parsed)
+            self._adaptive_fit = True
+        except (KeyError, TypeError, ValueError):
+            return
+
+    def adaptive_reason(self, now, delta):
+        """Quality gates independent of heuristic confidence and in-sample fit."""
+        if self._external_disturbance:
+            return self._external_disturbance
+        if (
+            not self._valid
+            or self._sample_count < 20
+            or self._fit_rmse is None
+            or self._fit_rmse > 0.3
+        ):
+            return "model_unqualified"
+        rows = self._adaptive_validations
+        if not self._adaptive_fit:
+            return "training_evidence_unverified"
+        if len(rows) < 3:
+            return "insufficient_validation"
+        ages = [now.timestamp() - row[0] for row in rows]
+        if min(ages) < 0 or max(ages) > 7 * 86400:
+            return "validation_expired"
+        if any(abs(row[1]) > 0.2 for row in rows):
+            return "validation_error"
+        if any(row[3] > 45 or row[4] > 35 for row in rows):
+            return "validated_horizon_too_long"
+        if any(row[5] < 0.199999 for row in rows):
+            return "temperature_change_below_resolution"
+        if (
+            not min(row[2] for row in rows) - 5
+            <= delta
+            <= max(row[2] for row in rows) + 5
+        ):
+            return "outside_validation_range"
+        return "qualified"
+
+    @property
+    def adaptive_horizon_minutes(self):
+        # Conservative common near-horizon planning choice, never selected by error.
+        return max((row[3] for row in self._adaptive_validations), default=30.0)
+
+    def reset_observation_policy(self, adaptive):
+        """Do not mix legacy poll samples with genuine temperature observations."""
+        self._samples.clear()
+        self._temp_history = deque(maxlen=32 if adaptive else _TEMP_BUFFER_SIZE)
+        self._adaptive_reports = adaptive
+        self.cancel_validation_session()
+
+    def mark_external_disturbance(self, reason="temperature_response_disturbed"):
+        """Reject uncertain observation periods, never identify their heat source.
+
+        Clear pending raw samples conservatively, including earlier samples from
+        this period. Keep the fitted coefficient; active use needs new holdouts.
+        """
+        self._external_disturbance = reason
+        self._samples.clear()
+        self._adaptive_validations.clear()
+        self._temp_history.clear()
+        self.cancel_validation_session()
+
+    def clear_external_disturbance(self):
+        """A later unmodified price period may collect independent evidence again."""
+        self._external_disturbance = None
+
+    def screen_possible_external_heat(self, now):
+        """Only report a disturbed response, not proof of a stove or heat delivery."""
+        session = self._session
+        if session is None or not session.screen_external_heat:
+            return self._external_disturbance is not None
+        rows = [
+            (at, value)
+            for at, value in self._temp_history
+            if session.start_time.timestamp() <= at.timestamp() <= now.timestamp()
+        ]
+        if len(rows) >= 3 and rows[-1][1] - min(value for at, value in rows) > 0.300001:
+            self.mark_external_disturbance()
+        return self._external_disturbance is not None
+
+    # ── Temperature history and learning samples ───────────────────────────────
+
+    def record_temp(
+        self,
+        now: datetime,
+        indoor_temp: Optional[float],
+        *,
+        adaptive_reports: bool = False,
+    ) -> None:
         """
         Record indoor temperature for later cooling-rate estimation.
 
-        This should be called every polling cycle when indoor temperature
-        is available.
+        Call every polling cycle, including missing readings, so an invalid
+        observation breaks the rate history instead of inventing a temperature.
         """
+        if adaptive_reports and not self._adaptive_reports:
+            self._adaptive_reports = True
+            self._temp_history = deque(self._temp_history, maxlen=32)
+        if indoor_temp is None or not math.isfinite(indoor_temp):
+            self._temp_history.clear()
+            return
+        if self._temp_history:
+            elapsed_seconds = now.timestamp() - self._temp_history[-1][0].timestamp()
+            if (
+                elapsed_seconds <= 0.0
+                or elapsed_seconds
+                > (
+                    ADAPTIVE_LEARNING_MAX_GAP_MINUTES
+                    if self._adaptive_reports
+                    else _MAX_TEMP_GAP_MINUTES
+                )
+                * 60
+            ):
+                self._temp_history.clear()
+        self._temp_history.append((now, indoor_temp))
+        if self._adaptive_reports:
+            while (
+                len(self._temp_history) > 1
+                and now.timestamp() - self._temp_history[0][0].timestamp() > 360 * 60
+            ):
+                self._temp_history.popleft()
+
+    def reset_temp_history(self, now: datetime, indoor_temp: float) -> None:
+        """Start a fresh rate window when stable thermal learning becomes eligible."""
+        self._temp_history.clear()
         self._temp_history.append((now, indoor_temp))
 
     def collect_braking_sample(
         self,
         indoor_temp: float,
         outdoor_temp: float,
-    ) -> None:
-        """
-        Collect one sample during braking periods.
+    ) -> bool:
+        """Collect one relevant stable-braking sample.
 
-        Uses the recent indoor temperature history to estimate current
-        cooling rate and stores the result for later fitting.
+        The caller is responsible for deciding whether current operating conditions
+        are relevant for learning. This method still rejects noisy/non-cooling data.
 
-        Samples are skipped when:
-        - the history window is too short
-        - the indoor/outdoor temperature delta is too small to be meaningful
-        - the measured rate does not indicate actual cooling
-        - the measured rate is clearly implausible
+        Returns True when a sample was accepted.
         """
+        if self._external_disturbance:
+            return False
         rate = self._compute_rate()
         if rate is None:
-            return
+            return False
 
-        # Only use real cooling samples.
-        # If indoor temperature is still flat/rising, the sample is not useful
-        # for estimating passive heat loss during braking.
-        if rate >= 0.0:
-            return
-
-        # Reject obvious spikes/noise before they contaminate the fit.
+        # Flat and slightly rising rates are kept on purpose. With a 0.1 °C sensor
+        # most short-window rates are 0 or one quantization step; dropping the
+        # non-negative ones keeps only the noise that points downward and biases
+        # k upwards. The bounds below still reject implausible values.
         if rate < _MIN_RATE_C_PER_HOUR or rate > _MAX_RATE_C_PER_HOUR:
-            return
+            return False
 
         delta_t = indoor_temp - outdoor_temp
         if abs(delta_t) < 2.0:
-            # Too small a delta — measurement noise dominates.
-            return
+            return False
 
         self._samples.append(
             ThermalSample(
@@ -195,6 +544,7 @@ class ThermalModel:
                 rate=rate,
             )
         )
+        return True
 
     def _compute_rate(self) -> Optional[float]:
         """
@@ -204,14 +554,16 @@ class ThermalModel:
         - there are fewer than two samples
         - the history span is too short to be reliable
         """
-        if len(self._temp_history) < 2:
+        if len(self._temp_history) < (3 if self._adaptive_reports else 2):
             return None
 
         t_old, temp_old = self._temp_history[0]
         t_now, temp_now = self._temp_history[-1]
 
-        dt_hours = (t_now - t_old).total_seconds() / 3600.0
-        if dt_hours < (_MIN_RATE_WINDOW_MINUTES / 60.0):
+        dt_hours = (t_now.timestamp() - t_old.timestamp()) / 3600.0
+        if dt_hours < (
+            (15 if self._adaptive_reports else _MIN_RATE_WINDOW_MINUTES) / 60.0
+        ):
             # Too little history — the estimate becomes noisy and unstable.
             return None
 
@@ -219,60 +571,248 @@ class ThermalModel:
 
     # ── Model fitting ──────────────────────────────────────────────────────────
 
-    def fit(self) -> None:
-        """
-        Fit k from accumulated braking samples.
+    def fit(self) -> bool:
+        """Fit k from accumulated relevant braking samples.
 
-        Uses ordinary least squares on the simplified model:
-            rate = -k * delta_T
-            k = -sum(rate * delta_T) / sum(delta_T²)
-
-        In PumpSteer 2.1.0, fitting improves diagnostics and observability.
-        It does not by itself activate any control behavior.
+        Returns True when a new valid fit was accepted.
         """
         if len(self._samples) < _MIN_SAMPLES:
             _LOGGER.debug(
-                "ThermalModel: only %d braking samples, keeping k=%.4f",
+                "ThermalModel: only %d relevant braking samples, keeping k=%.4f",
                 len(self._samples),
                 self._k,
             )
-            return
+            return False
 
+        samples = list(self._samples)
         sum_xy = 0.0
         sum_xx = 0.0
-        for sample in self._samples:
+        for sample in samples:
             delta_t = sample.indoor_temp - sample.outdoor_temp
             sum_xy += sample.rate * delta_t
             sum_xx += delta_t**2
 
         if sum_xx < 1e-6:
             _LOGGER.debug("ThermalModel: degenerate data, skipping fit")
-            return
+            return False
 
         k = -sum_xy / sum_xx
 
-        if _K_MIN < k < _K_MAX:
+        if math.isfinite(k) and _K_MIN < k < _K_MAX:
+            residual_sq = 0.0
+            for sample in samples:
+                delta_t = sample.indoor_temp - sample.outdoor_temp
+                predicted_rate = -k * delta_t
+                residual_sq += (sample.rate - predicted_rate) ** 2
+
             self._k = k
+            self._adaptive_fit = self._adaptive_reports
             self._valid = True
-            self._sample_count = len(self._samples)
-            _LOGGER.debug(
-                "ThermalModel: fitted k=%.4f from %d samples",
+            self._sample_count = len(samples)
+            self._fit_rmse = math.sqrt(residual_sq / len(samples))
+
+            # Prediction metrics describe the previous k and must be revalidated.
+            # Keep the historical learning-session count, not the old accuracy.
+            self.cancel_validation_session()
+            self._adaptive_validations.clear()
+            self._validated_sessions = 0
+            self._prediction_mae = None
+            self._last_prediction_error = None
+            self._last_session_duration_minutes = None
+            self._last_session_actual_drop = None
+            self._last_session_predicted_drop = None
+
+            _LOGGER.info(
+                "ThermalModel: fitted k=%.4f from %d relevant samples (RMSE=%.3f°C/h)",
                 k,
                 self._sample_count,
+                self._fit_rmse,
             )
-        else:
-            _LOGGER.warning(
-                "ThermalModel: fitted k=%.4f outside [%.3f, %.3f], keeping k=%.4f",
-                k,
-                _K_MIN,
-                _K_MAX,
-                self._k,
-            )
+            self._samples.clear()
+            return True
 
-        # Clear samples after fit so a new learning window can begin.
+        _LOGGER.warning(
+            "ThermalModel: fitted k=%.4f outside [%.3f, %.3f], keeping k=%.4f",
+            k,
+            _K_MIN,
+            _K_MAX,
+            self._k,
+        )
         self._samples.clear()
+        return False
 
-    # ── Prediction helpers (diagnostic / future-facing) ───────────────────────
+    # ── Session validation ─────────────────────────────────────────────────────
+
+    def start_validation_session(
+        self,
+        now: datetime,
+        indoor_temp: float,
+        outdoor_temp: float,
+        *,
+        adaptive_observations: bool = False,
+        screen_external_heat: bool = False,
+    ) -> None:
+        """Start one relevant stable-braking validation session."""
+        if self._session is not None or self._external_disturbance:
+            return
+
+        self._session = _ValidationSession(
+            start_time=now,
+            start_indoor=indoor_temp,
+            prediction_k=self._k,
+            prediction_valid=self._valid,
+            start_outdoor=outdoor_temp,
+            last_time=now,
+            last_indoor=indoor_temp,
+            adaptive_reports=adaptive_observations,
+            screen_external_heat=screen_external_heat,
+            declared_horizon_minutes=30.0,
+            forecast_30m=(
+                self.predict_drop(indoor_temp, outdoor_temp, 30)
+                if self._valid and adaptive_observations
+                else None
+            ),
+        )
+
+    def update_validation_session(
+        self, now: datetime, indoor_temp: float, outdoor_temp: float
+    ) -> bool:
+        """Update only contiguous observations during stable price braking."""
+        session = self._session
+        if session is None:
+            return False
+        elapsed = (now.timestamp() - session.last_time.timestamp()) / 60.0
+        if (
+            elapsed <= 0.0
+            or elapsed
+            > (
+                ADAPTIVE_LEARNING_MAX_GAP_MINUTES
+                if session.adaptive_reports
+                else _MAX_TEMP_GAP_MINUTES
+            )
+            or not all(math.isfinite(x) for x in (indoor_temp, outdoor_temp))
+        ):
+            self.cancel_validation_session()
+            return False
+        session.reports += 1
+        session.max_gap_minutes = max(session.max_gap_minutes, elapsed)
+        duration = (now.timestamp() - session.start_time.timestamp()) / 60.0
+        if (
+            not session.forecast_checked
+            and duration >= session.declared_horizon_minutes - 3
+        ):
+            session.forecast_checked = True
+            if (
+                duration
+                <= session.declared_horizon_minutes + ADAPTIVE_LEARNING_MAX_GAP_MINUTES
+                and session.reports >= 2
+                and session.forecast_30m is not None
+            ):
+                # Predeclared thirty-minute target with three-minute timing grace.
+                # Long endpoints are diagnostic only. Choose by observation time,
+                # never by its temperature/error. No temperature is interpolated.
+                predicted = self._predict_drop_with_k(
+                    session.prediction_k,
+                    session.start_indoor,
+                    session.start_outdoor,
+                    duration,
+                )
+                error = session.start_indoor - indoor_temp - predicted
+                if session.screen_external_heat and error < -0.2:
+                    # Unexpectedly added warmth is confounded. Extra cooling
+                    # remains a failed validation so genuine drift can refit.
+                    self.mark_external_disturbance()
+                    return True
+                self._adaptive_validations.append(
+                    (
+                        now.timestamp(),
+                        error,
+                        session.start_indoor - session.start_outdoor,
+                        duration,
+                        session.max_gap_minutes,
+                        session.start_indoor - indoor_temp,
+                    )
+                )
+        session.last_time = now
+        session.last_indoor = indoor_temp
+        return True
+
+    def end_validation_session(self, now: datetime, indoor_temp: float) -> bool:
+        """Finish a session and compare predicted with actual temperature drop.
+
+        Returns True when the session was long enough to count as a learning session.
+        Validation error statistics are updated only if the model was already fitted
+        when the session started.
+        """
+        session = self._session
+        self._session = None
+        if session is None:
+            return False
+
+        # Do not attribute time after the last stable-brake observation.
+        duration_minutes = (
+            session.last_time.timestamp() - session.start_time.timestamp()
+        ) / 60.0
+        if duration_minutes < _MIN_VALIDATION_SESSION_MINUTES:
+            return False
+
+        actual_drop = max(0.0, session.start_indoor - session.last_indoor)
+        # Use only the outdoor temperature known at session start. The horizon is
+        # selected afterwards, so this is conditional retrospective validation,
+        # not an issued operational forecast or a verified weather forecast.
+        predicted_drop = self._predict_drop_with_k(
+            session.prediction_k,
+            session.start_indoor,
+            session.start_outdoor,
+            duration_minutes,
+        )
+
+        self._learning_sessions += 1
+        self._last_session_duration_minutes = duration_minutes
+        self._last_session_actual_drop = actual_drop
+        self._last_session_predicted_drop = predicted_drop
+
+        # Flat readings alone do not prove the model accurate, but a flat session
+        # where the model predicted a clear drop is real evidence against it.
+        if session.prediction_valid and (
+            actual_drop >= 0.05
+            or predicted_drop >= _MIN_PREDICTED_DROP_FOR_FLAT_VALIDATION_C
+        ):
+            error = actual_drop - predicted_drop
+            abs_error = abs(error)
+            previous_count = self._validated_sessions
+            previous_total = (self._prediction_mae or 0.0) * previous_count
+            self._validated_sessions += 1
+            self._prediction_mae = (
+                previous_total + abs_error
+            ) / self._validated_sessions
+            self._last_prediction_error = error
+            _LOGGER.info(
+                "ThermalModel validation: duration=%.0fmin actual_drop=%.2f°C "
+                "predicted_drop=%.2f°C error=%+.2f°C",
+                duration_minutes,
+                actual_drop,
+                predicted_drop,
+                error,
+            )
+
+        return True
+
+    def cancel_validation_session(self) -> None:
+        """Discard an active validation session without changing statistics."""
+        self._session = None
+
+    # ── Prediction helpers ─────────────────────────────────────────────────────
+
+    @staticmethod
+    def _predict_drop_with_k(
+        k: float,
+        indoor: float,
+        outdoor: float,
+        duration_minutes: float,
+    ) -> float:
+        delta_t = max(0.0, indoor - outdoor)
+        return max(0.0, k * delta_t * (duration_minutes / 60.0))
 
     def predict_drop(
         self,
@@ -280,16 +820,64 @@ class ThermalModel:
         outdoor: float,
         duration_minutes: float,
     ) -> float:
-        """
-        Estimate indoor temperature drop over a reduced-heating period.
+        """Estimate indoor temperature drop for a constant outdoor temperature."""
+        return self._predict_drop_with_k(
+            self._k,
+            indoor,
+            outdoor,
+            duration_minutes,
+        )
 
-        Returns the predicted drop in degrees Celsius as a positive number.
+    def predict_bounded_drop(
+        self, indoor: float, outdoor: float, duration_minutes: float
+    ) -> Optional[float]:
+        """Conditional net response with constant outdoor and unchanged operation.
 
-        In PumpSteer 2.1.0, this is a diagnostic/future-facing helper and is
-        not part of the active state-machine decision path.
+        Integrate the existing empirical rate rather than extrapolating its initial
+        slope indefinitely. This does not identify heat loss or delivered heat.
         """
-        delta_t = max(0.0, indoor - outdoor)
-        return self._k * delta_t * (duration_minutes / 60.0)
+        if not all(math.isfinite(x) for x in (indoor, outdoor, duration_minutes)):
+            return None
+        if duration_minutes < 0 or duration_minutes > 120:
+            return None
+        return max(0.0, indoor - outdoor) * -math.expm1(
+            -self._k * duration_minutes / 60.0
+        )
+
+    def predict_drop_profile(
+        self,
+        indoor: float,
+        current_outdoor: float,
+        future_outdoor_temps: Optional[Sequence[float]],
+        duration_minutes: float,
+        step_minutes: float = 60.0,
+    ) -> float:
+        """Estimate temperature drop using the available future outdoor profile.
+
+        The model advances in bounded steps. When the requested duration extends past
+        the available forecast, the last available outdoor temperature is held.
+        """
+        if duration_minutes <= 0.0:
+            return 0.0
+
+        profile = [current_outdoor]
+        if future_outdoor_temps:
+            profile.extend(float(value) for value in future_outdoor_temps)
+
+        temp = indoor
+        remaining = duration_minutes
+        index = 0
+        step_minutes = max(1.0, step_minutes)
+
+        while remaining > 0.0:
+            dt_minutes = min(step_minutes, remaining)
+            outdoor = profile[min(index, len(profile) - 1)]
+            delta_t = max(0.0, temp - outdoor)
+            temp -= self._k * delta_t * (dt_minutes / 60.0)
+            remaining -= dt_minutes
+            index += 1
+
+        return max(0.0, indoor - temp)
 
     def brake_is_safe(
         self,
@@ -298,24 +886,7 @@ class ThermalModel:
         brake_duration_minutes: float,
         comfort_floor: float,
     ) -> bool:
-        """
-        Estimate whether indoor temperature would remain above comfort_floor.
-
-        This helper uses predict_drop() and returns True when the predicted
-        end temperature remains at or above the comfort floor.
-
-        In PumpSteer 2.1.0, this is diagnostic/future-facing only and does
-        not directly gate brake/pre-brake decisions.
-        """
+        """Estimate whether indoor temperature remains above the comfort floor."""
         drop = self.predict_drop(indoor, outdoor, brake_duration_minutes)
         predicted = indoor - drop
-        safe = predicted >= comfort_floor
-        _LOGGER.debug(
-            "ThermalModel: safe=%s drop=%.2f°C end=%.2f°C floor=%.2f°C k=%.4f",
-            safe,
-            drop,
-            predicted,
-            comfort_floor,
-            self._k,
-        )
-        return safe
+        return predicted >= comfort_floor

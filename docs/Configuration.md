@@ -18,7 +18,7 @@ nav_order: 3
 
 PumpSteer has two layers of configuration:
 
-- **HA interface** — sliders, switches, and options you set in Home Assistant (take effect after reload)
+- **HA interface** — sliders, switches, and options you set in Home Assistant. Number/switch changes are immediate; saved integration options are picked up by the integration, and changing the configured Relay Guard relay may trigger an integration reload.
 - **`settings.py`** — advanced constants that require editing the source file and a full HA restart
 
 ---
@@ -32,9 +32,27 @@ These are set when you first add the integration. You can change them later via
 |---|---|---|
 | **Indoor temperature sensor** | ✅ | The sensor PumpSteer uses for current indoor temperature. Must be a `sensor` with `device_class: temperature`. |
 | **Outdoor temperature sensor** | ✅ | The real outdoor temperature. PumpSteer manipulates this signal before sending it to the heat pump. |
-| **Electricity price sensor** | ✅ | Today's hourly or 15-minute price (e.g. Nordpool). Must have a `today` or `raw_today` attribute containing a list of prices. |
-| **Tomorrow price sensor** | ✅ | Tomorrow's prices. Used for lookahead braking and preheat. Can be the same entity if it includes `raw_tomorrow`. |
+| **Electricity price sensor** | ✅ | Today's hourly or 15-minute prices (e.g. Nordpool). PumpSteer accepts a `today` or `raw_today` list with plain numeric entries or objects containing `value` / `price`. |
+| **Tomorrow price sensor** | ✅ | Tomorrow's prices for lookahead braking and preheat. Can be the same entity when it exposes `tomorrow` or `raw_tomorrow`. |
 | **Weather entity** | Optional | A `weather` entity used for forecast-based preheat and precool. Leave empty to disable forecast features. |
+
+Each price list must cover its complete local calendar day at a consistent interval,
+including shorter or longer days at daylight saving time changes. Invalid entries
+are not removed or filled in: an invalid today's list triggers safe mode, while an
+invalid optional tomorrow's list is ignored and today's valid prices remain usable.
+When entries include `start` / `end` timestamps, every entry must include
+both fields. They must match their slot positions, be consecutive, and identify
+the correct day and time zone. When both `today` and `raw_today` (or their
+tomorrow equivalents) are present, PumpSteer prefers the timestamped `raw_*`
+list to prevent a shortened numeric list from silently changing the inferred
+price interval. A malformed timestamped today list triggers safe mode rather
+than falling back to a potentially misaligned numeric list.
+
+For numeric-only lists, PumpSteer infers the interval from the number of
+entries. This cannot prove whether a list of 48 values is genuinely made of
+30-minute prices or is a truncated 15-minute day; use a provider that exposes
+`raw_today` timestamps to verify slot identity. Boolean values (`true` /
+`false`) are not valid prices.
 
 ---
 
@@ -48,8 +66,14 @@ Go to **Settings → Devices & Services → PumpSteer → Configure** to access 
 | Field | Description | Default |
 |---|---|---|
 | **Notification service** | Push service for price alerts, e.g. `notify.mobile_app_my_phone`. Leave empty to use HA persistent notifications. | — |
+| **Price notification level** | All price alerts, braking only, or none. The Notifications switch remains the master on/off control. | All |
+| **Repeat notification cooldown** | Minimum time between repeated alerts of the *same mode*: none (0), 30, 60 or 120 min. Preheating never suppresses the first braking alert, or vice versa. | 0 min (legacy behavior); 60 min recommended |
 | **Ohmigo entity** | Number entity to push the fake outdoor temperature to. Leave empty to disable. | — |
+| **Ohmigo Active/Bypass relay** | Optional `switch` entity for the physical Ohmigo Active/Bypass relay. Configuring it exposes the separate **Ohmigo Relay Guard** switch. | — |
 | **Ohmigo push interval** | Minimum minutes between Ohmigo pushes. | 5 min |
+| **Generic output service** | Optional Home Assistant service used by GOS, for example `modbus.write_register`, `mqtt.publish` or `number.set_value`. | — |
+| **Generic output payload template** | YAML payload template for GOS. May use the `fake_temp` variable. | — |
+| **Generic output interval** | Minimum minutes between Generic Output System calls. | 5 min |
 
 {: .note }
 The notification service is configured directly here in the integration options — no
@@ -160,22 +184,33 @@ the moment the slot begins. A thermally heavy house needs more lead time.
 **Entity:** `switch.pumpsteer_preheat_boost`
 **Default:** On
 
-When enabled, PumpSteer heats extra (by `PREHEAT_BOOST_C = 4 °C` equivalent) before
-an upcoming expensive period when a simple cold-forecast heuristic (`_forecast_is_cold()`)
-returns true. This pre-charges the house with thermal mass so the heat pump can brake
-longer without discomfort.
+When enabled, PumpSteer can build thermal reserve before an upcoming expensive period.
+The ordinary PI controller remains the baseline; preheat adds a bounded forecast-driven
+boost on top.
 
-Only activates when:
-1. An expensive price slot is coming within the lookahead window
-2. The cold-forecast heuristic returns True
-3. Indoor temperature is below target (preheat is suppressed if already at target)
+Preheat requires:
 
-{: .note }
-`sensor.pumpsteer_thermal_outlook` is diagnostic only and does not yet control this
-switch. Preheat decisions are made by the simple `_forecast_is_cold()` heuristic.
+1. An expensive price period inside the lookahead window
+2. Forecast context that supports preheating
+3. Remaining thermal headroom above the current indoor temperature
+4. The Preheat Boost switch to be on
 
-Disable this switch if you prefer to avoid pre-heating behavior, or if your forecast
-sensor is unreliable.
+When ThermalOutlook is available, `preheat_worthwhile` gates the decision and
+`preheat_strength` scales the boost. The simpler `_forecast_is_cold()` heuristic is
+used only when ThermalOutlook cannot be built.
+
+Preheat is **not** hard-stopped at the normal target temperature. Saving levels 1–5
+allow headroom of 0.3 / 0.5 / 0.7 / 1.0 / 1.5 °C above target. Full boost is available
+up to target, then tapers linearly and reaches zero at `target + headroom`.
+
+Useful diagnostics on `sensor.pumpsteer`:
+
+- `preheat_headroom_c`
+- `preheat_ceiling_c`
+- `preheat_headroom_factor`
+
+Disable this switch if you prefer to avoid forecast-based preheating, or if your
+weather source is unreliable.
 
 ---
 
@@ -184,9 +219,24 @@ sensor is unreliable.
 **Entity:** `switch.pumpsteer_notifications`
 **Default:** On
 
-Enables or disables push notifications when braking or preheating starts.
-Notifications are sent to the service configured in the options flow, or via HA
-persistent notifications if no service is configured.
+Enables or disables *price* notifications when braking or preheating starts.
+The optional **Price notification level** in the integration options selects
+all alerts, braking only, or none. Both this switch and the level must permit
+an alert for one to be sent.
+
+Braking and preheating notifications include the current electricity price from
+the same PumpSteer state that drove the control decision (when valid). Preheating
+does not assume that the current price is always cheap.
+
+The optional **Repeat notification cooldown** limits alerts only when re-entering
+the *same* mode. Braking and preheating use separate timers; a recent preheating
+alert never blocks the first braking alert. These timers reset on an integration
+reload or HA restart. With no cooldown configured, existing behavior is preserved.
+The cooldown applies only to price notifications, not independent holiday notices
+or Relay Guard recovery behavior.
+
+Notifications are sent to the configured service or, if no service is set, via
+HA persistent notifications.
 
 ---
 
@@ -206,7 +256,7 @@ is sent.
 
 ### 📡 Ohmigo Push
 
-**Entity:** `switch.pumpsteer_ohmigo_enabled`
+**Entity:** `switch.pumpsteer_ohmigo_push`
 **Default:** On
 
 Enables or disables automatic pushing of the fake outdoor temperature to the configured
@@ -215,6 +265,45 @@ Ohmigo number entity. Toggle this without having to reconfigure the options flow
 Pushes are skipped when:
 - The new value is within 0.2 °C of the current Ohmigo value (hysteresis)
 - Less than `ohmigo_interval_minutes` have passed since the last push
+
+---
+
+### 🛡️ Ohmigo Relay Guard
+
+**Entity:** `switch.pumpsteer_ohmigo_relay_guard`  
+**Created only when:** an **Ohmigo Active/Bypass relay** entity is configured  
+**Default on first creation:** Off
+
+The Relay Guard is an optional safety layer for Ohmigo installations where a physical
+Active/Bypass relay determines whether PumpSteer's simulated outdoor-temperature signal
+is connected to the heat pump.
+
+It is deliberately separate from the PI, price, thermal and setpoint-push logic.
+
+Recovery is allowed only when all three conditions are true:
+
+1. Relay Guard is armed
+2. **Ohmigo Push** is explicitly On
+3. The configured relay explicitly reports `off`
+
+If the relay is `unknown`, `unavailable`, or missing, PumpSteer sends **no relay
+command**. Ohmigo Push Off inhibits recovery but does not change the relay itself.
+
+When eligible, Relay Guard waits briefly for the device/MQTT state to stabilize, then
+tries `switch.turn_on` up to three times. Each attempt is followed by state
+verification; a successful service call alone is not considered recovery. The relay
+must actually report `on`.
+
+The guard checks after relay/Push state changes, at Home Assistant startup, and with a
+low-frequency five-minute safety check. Recovery attempts do not overlap.
+
+`safe_mode` does not disable Relay Guard by itself. If Ohmigo Push remains On,
+PumpSteer may still be forwarding the real outdoor temperature through Ohmigo, so the
+Active signal path is still required.
+
+The guard switch restores its explicit On/Off state across Home Assistant restarts.
+Its state attributes expose the configured relay, current guard status, relay/Push
+states, recovery attempts, and timestamps for the last recovery/failure.
 
 ---
 
@@ -306,9 +395,10 @@ output. At 15 °C, the effect is very strong.
 BRAKE_HOLD_MINUTES: Final[float] = 30.0
 ```
 
-After an expensive period ends, the brake is held for this many minutes before ramping
-out. This prevents oscillation when 15-minute price slots alternate between cheap and
-expensive within a longer expensive block.
+This is the maximum non-expensive gap PumpSteer may bridge between expensive periods.
+A gap is held only when the next expensive period starts within this window; otherwise
+the brake begins ramping out immediately. During a bridge the existing brake factor is
+held flat rather than ramped higher.
 
 ---
 
@@ -318,8 +408,10 @@ expensive within a longer expensive block.
 PREHEAT_BOOST_C: Final[float] = 4.0
 ```
 
-How much extra heating demand (in °C equivalent) is added during preheat mode.
-This is added on top of the PI output, so the total demand is `PI_demand + PREHEAT_BOOST_C`.
+Maximum extra heating demand (in °C equivalent) available to preheat mode.
+The effective boost is scaled by the preheat ramp, ThermalOutlook
+`preheat_strength` when available, and the remaining thermal-headroom factor.
+It is then added on top of the ordinary PI demand.
 
 ---
 
@@ -388,3 +480,99 @@ Controls what happens when forecast data is unavailable:
 
 The default `False` is safer: it avoids unnecessary preheating if the weather entity
 is misconfigured or temporarily unavailable.
+
+### Thermal Zone Intelligence (extra temperature zones)
+
+The **Extra temperature zones** options menu supports up to four optional zones.
+Each zone monitors a Celsius room sensor. With enough suitable observations it can
+show a trend or warn about suspected heat shortage. Choose a name and manually
+select **Maintenance heat** or **Comfort**. Their separate temperature thresholds
+default to 5 °C and 18 °C respectively; only the selected profile's threshold is
+used. The thermostat setpoint is not the zone alarm threshold.
+
+Zone alarms are off by default. With alarms off, temperature and qualified trends
+remain available. If enabled, low-temperature alerts use a configurable 1–240
+minute delay (15 minutes by default), with at least two distinct low reports
+spanning that period. Forecast, suspected heat-shortage and sensor-fault alerts
+have separate evidence requirements. Recovery uses a 0.5 °C margin. Leave unused
+zones empty.
+
+**Zone monitoring is read-only.** It never changes a thermostat setpoint or valve
+opening and does not change central heat production. A cold zone does not change
+the main building's weighted temperature or PI controller. Zones also do not
+alter prices, Ohmigo, relay protection or verified learning. A zone-only options
+change preserves the controller's learning state.
+
+Each zone reports separate low-temperature, forecast, suspected heat-shortage
+and sensor-fault states. A recovery notification follows a return to normal.
+Specify the shared zone recipient `notify.your_service` or override it per zone.
+An empty individual recipient uses the shared recipient. If both are empty no
+push is sent; diagnostics remain available. These settings are independent of
+ordinary price notifications. Failed service calls are retried on the next cycle.
+Delivery runs in cancellable background tasks with a 30-second timeout, so a slow
+notification service cannot block regulation. HA's existing restore data preserves
+notification state over restarts; pending
+measurement intervals and trends start afresh. Delivery confirmation is the
+notification service completing, not confirmation from the recipient's phone.
+Recovery messages require evidence that an alarm was delivered. After upgrading,
+an older pending recovery with no saved delivery evidence is suppressed rather
+than reported as a potentially false recovery; new episodes preserve this
+evidence in HA's existing restore state.
+
+Zone reports older than 60 minutes, future reports, restored values and
+non-Celsius readings cannot establish temperature evidence. Startup allows 60
+minutes for sensors to appear. A low-temperature alarm requires at least two
+distinct low reports spanning the configured delay, with no gap over 35 minutes.
+Trend analysis uses up to two hours of HA reports (at most one actual report
+per minute and 128 samples), with
+at least seven reports spanning 30 minutes and no gap exceeding 35 minutes. Forecast warnings require
+a clear falling linear trend (fit at least 0.8, cooling faster than 0.1 °C/hour)
+a latest reading within 0.3 °C of the fitted trend, and an estimated threshold
+crossing within two hours. They clear above a
+three-hour horizon or when cooling stops. Estimates are observational linear
+extrapolations, not verified thermal predictions. HA report time does not prove
+physical measurement time.
+
+An optional climate entity is **only read**; it may supply its setpoint,
+`hvac_action` and, when exposed, numeric `pi_heating_demand`, `valve_position`
+or `heating_demand` (percent). A setpoint or heat request alone does not prove
+that a valve is open or heat is being delivered. Without a climate entity, room
+temperature monitoring still works, but thermostat diagnostics and suspected
+heat-shortage analysis have less information. An existing HA climate group can
+represent multiple radiators. The climate temperature never replaces the chosen
+room sensor; a sensor near a radiator can read differently from the room. Continuous
+reported heating operation or demand with a flat or falling room temperature below the
+selected threshold for at least 30 minutes raises **suspected** heat shortage.
+Missing telemetry does not establish heating, heat output or recovery. The
+outdoor-relative trend is shown only with matching qualified outdoor coverage.
+The `hvac_action` attribute reports the thermostat's current operating action;
+notifications describe it as operation rather than as a separately verified
+heat request. Conflicting explicit demand and action are treated as unknown.
+
+Compact diagnostics, event reasons and forecast uncertainty are available in
+`extra_temperature_zones` on the controller and the existing Thermal Intelligence
+status sensor. The latter remains accessible when the main controller temperature
+is unavailable. No extra database or monitoring service is required.
+
+When evidence is available, zone notifications include the room temperature,
+selected limit, qualified trend, and the thermostat's reported setpoint and heat
+request. A simultaneous low-temperature and suspected-heat-shortage event is
+combined into one message. A heat request is not proof of a valve opening or heat
+delivery; unavailable thermostat data is described as unknown. The message says
+that PumpSteer only monitored the zone and suggests a practical check.
+
+### Optional heat-pump fault signal
+
+Under **Advanced sensors → Passive heat pump diagnostics**, a fault signal can be
+a binary sensor or a numeric sensor. A numeric sensor remains unknown until you
+enter its documented normal value and explicitly verify that every other finite
+number means an active fault. Do not assume that `0` is normal unless the actual
+sensor's meaning is verified. Selecting a different sensor or changing the normal
+value requires confirmation again. Invalid, restored, future or over-60-minute-old
+reports cannot establish a normal state or recovery. Fault notifications use the
+existing recipient and persistent HA fallback independently of price alerts.
+
+Any future temporary thermostat assistance would need a separately authorized,
+bounded setpoint change, a genuinely measured response, safe restoration after
+restart and a rule that preserves manual edits. A mobile confirmation button
+would need those same safeguards. PumpSteer does not implement either here.

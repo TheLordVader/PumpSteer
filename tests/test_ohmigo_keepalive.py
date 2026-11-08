@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -65,7 +66,7 @@ def _expected_call():
         "number",
         "set_value",
         {"entity_id": "number.ohmigo_test", "value": 21.5},
-        False,
+        True,
     )
 
 
@@ -92,6 +93,61 @@ def test_changed_setpoint_and_due_keepalive_without_logbook_spam(setup_push, cap
     assert "Ohmigo keepalive resend" in caplog.text
 
 
+def test_output_observer_reports_quantized_request_as_unverified(setup_push):
+    clock, _, entry = setup_push
+    hass = _FakeHass("20.0")
+    events = []
+    result = asyncio.run(
+        ohmigo.async_push_ohmigo(
+            hass,
+            entry,
+            21.49,
+            None,
+            output_observer=events.append,
+        )
+    )
+    assert result == clock[0]
+    assert hass.services.calls == [_expected_call()]
+    assert events[-1] == {
+        "at": clock[0].isoformat(),
+        "transport": "ohmigo",
+        "status": "service_completed_unverified",
+        "requested": 21.5,
+    }
+
+
+def test_post_dispatch_guard_error_does_not_misreport_service_failure(setup_push):
+    clock, _, entry = setup_push
+    hass = _FakeHass("20.0")
+    events = []
+
+    class _FailingGuard:
+        def temperature_write(self, check, source_entities=None):
+            return nullcontext(check)
+
+        async def async_temperature_written(self, check):
+            raise RuntimeError("guard status unavailable")
+
+    hass.data = {"pumpsteer": {entry.entry_id: {"relay_guard": _FailingGuard()}}}
+    result = asyncio.run(
+        ohmigo.async_push_ohmigo(
+            hass,
+            entry,
+            21.49,
+            None,
+            temperature_check=lambda: True,
+            output_observer=events.append,
+        )
+    )
+    assert result is None
+    assert hass.services.calls == [_expected_call()]
+    assert [event["status"] for event in events] == [
+        "dispatch_attempted",
+        "service_completed_unverified",
+        "post_dispatch_error",
+    ]
+
+
 def test_push_off_sends_nothing(setup_push, monkeypatch):
     _, logbook_calls, entry = setup_push
     monkeypatch.setattr(ohmigo, "_ohmigo_push_enabled", lambda hass, entry_id: False)
@@ -110,3 +166,22 @@ def test_missing_or_invalid_state_still_pushes(setup_push, current_state):
     assert _push(hass, entry, None) == clock[0]
     assert hass.services.calls == [_expected_call()]
     assert len(logbook_calls) == 1
+
+
+@pytest.mark.parametrize(
+    "before,after",
+    [
+        ((2026, 3, 29, 1, 58, 0), (2026, 3, 29, 3, 3, 0)),
+        ((2026, 10, 25, 2, 58, 0), (2026, 10, 25, 2, 3, 1)),
+    ],
+)
+def test_keepalive_interval_across_dst(setup_push, before, after):
+    from zoneinfo import ZoneInfo
+
+    clock, _, entry = setup_push
+    tz = ZoneInfo("Europe/Stockholm")
+    old = datetime(*before[:5], tzinfo=tz, fold=before[5])
+    clock[0] = datetime(*after[:5], tzinfo=tz, fold=after[5])
+    hass = _FakeHass("21.5")
+    _push(hass, entry, old)
+    assert hass.services.calls == [_expected_call()]

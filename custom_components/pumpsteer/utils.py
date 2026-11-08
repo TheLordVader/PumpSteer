@@ -8,6 +8,7 @@ from typing import Any, List, Optional
 from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.typing import StateType
+from homeassistant.util import dt as dt_util
 
 from .settings import MAX_REASONABLE_TEMP, MIN_REASONABLE_TEMP
 
@@ -83,6 +84,39 @@ def get_state(
     }:
         return default
     return entity.state
+
+
+def get_temperature(
+    hass: HomeAssistant, entity_id: str, reported_after: Optional[datetime] = None
+) -> Optional[float]:
+    """Read a numeric, non-restored temperature; HA report time is not measurement time."""
+    if not entity_id:
+        return None
+    entity = hass.states.get(entity_id)
+    if entity is None or entity.attributes.get("restored"):
+        return None
+    if reported_after is not None:
+        reported = getattr(entity, "last_reported", None)
+        try:
+            if (
+                not isinstance(reported, datetime)
+                or reported.utcoffset() is None
+                or reported_after.utcoffset() is None
+                or reported.timestamp() <= reported_after.timestamp()
+                or reported.timestamp() > dt_util.now().timestamp()
+            ):
+                return None
+        except TypeError:
+            return None
+    return temperature_from_state(entity)
+
+
+def temperature_from_state(entity):
+    """Validate Celsius temperature without assuming a foreign unit is Celsius."""
+    attrs = getattr(entity, "attributes", {}) or {}
+    if attrs.get("restored") or attrs.get("unit_of_measurement") not in (None, "°C"):
+        return None
+    return safe_float(getattr(entity, "state", None), -50, 60)
 
 
 def get_attr(
@@ -187,7 +221,16 @@ def compute_price_slot_index(
     if total_slots <= 0:
         return 0
     interval = max(1, price_interval_minutes)
-    minutes = current_time.hour * 60 + current_time.minute
+
+    if current_time.tzinfo is not None and current_time.utcoffset() is not None:
+        midnight = current_time.replace(hour=0, minute=0, second=0, microsecond=0)
+        minutes = max(
+            0,
+            int((current_time.timestamp() - midnight.timestamp()) // 60),
+        )
+    else:
+        minutes = current_time.hour * 60 + current_time.minute
+
     slot = minutes // interval
     return max(0, min(total_slots - 1, slot))
 

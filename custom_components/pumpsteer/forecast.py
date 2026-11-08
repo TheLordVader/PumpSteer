@@ -6,12 +6,11 @@ This module provides two separate responsibilities:
 1. Forecast normalization for PumpSteer utility/control support
 2. Thermal outlook analysis for diagnostics and observability
 
-IMPORTANT:
-In PumpSteer 2.1.0, ThermalOutlook is diagnostic only.
-It does not directly influence active control decisions.
-
-The main control loop continues to use simpler forecast gating
-such as _forecast_is_cold() and _should_precool().
+CURRENT 2.2.x BEHAVIOR:
+ThermalOutlook.preheat_worthwhile and preheat_strength are used by the
+main control loop to gate and scale preheat boost. Other outlook fields
+remain primarily diagnostic. The simpler _forecast_is_cold() path is
+used only when ThermalOutlook cannot be built.
 """
 
 from __future__ import annotations
@@ -51,12 +50,12 @@ class ThermalOutlook:
     This structure provides diagnostic insight into upcoming thermal conditions,
     such as cold periods, warming trends, and precool risk.
 
-    In PumpSteer 2.1.x, preheat_worthwhile and preheat_strength are used
+    In PumpSteer 2.2.x, preheat_worthwhile and preheat_strength are used
     in block 5b of sensor.py to gate and scale the preheat boost.
-    All other fields remain diagnostic only and do not influence control.
+    Other fields remain primarily diagnostic.
 
-    The active control loop continues to use simpler forecast gating
-    such as _forecast_is_cold().
+    The simpler _forecast_is_cold() path is retained only as a fallback
+    when ThermalOutlook is unavailable.
     """
 
     # Raw values
@@ -133,6 +132,7 @@ async def _async_extract_weather_points(
     hass: HomeAssistant,
     weather_entity_id: str,
     horizon_hours: int,
+    raw_callback=None,
 ) -> dict[datetime, ForecastPoint]:
     """Read hourly weather forecast via weather.get_forecasts service call."""
 
@@ -166,6 +166,12 @@ async def _async_extract_weather_points(
             weather_entity_id,
         )
         return {}
+
+    if raw_callback is not None:
+        try:
+            raw_callback(forecast[:100])
+        except Exception:
+            _LOGGER.exception("Passive weather forecast capture failed")
 
     now_utc = dt_util.utcnow()
     current_hour = now_utc.replace(minute=0, second=0, microsecond=0)
@@ -277,6 +283,7 @@ async def async_build_forecast(
     price_entity_id: str,
     weather_entity_id: str,
     horizon_hours: int = 24,
+    raw_weather_callback=None,
 ) -> list[ForecastPoint]:
     """
     Build a normalized hourly forecast for PumpSteer utility and diagnostics.
@@ -285,12 +292,12 @@ async def async_build_forecast(
     - future weather forecast from a weather entity
     - future electricity prices from a price entity
 
-    In 2.1.0, this supports both:
-    - simple control-facing forecast helpers
-    - richer diagnostic analysis such as ThermalOutlook
+    This supports both:
+    - control-facing ThermalOutlook analysis for bounded preheat
+    - diagnostic forecast observability
     """
     weather_points = await _async_extract_weather_points(
-        hass, weather_entity_id, horizon_hours
+        hass, weather_entity_id, horizon_hours, raw_weather_callback
     )
     price_points = _extract_price_points(hass, price_entity_id, horizon_hours)
 

@@ -45,8 +45,8 @@ The PI controller is the only feedback loop in the system.
 
 ```
 fake_temp = outdoor − PI_demand
-          + brake_overlay    (raises fake temp during expensive slots)
-          + preheat_boost    (lowers fake temp before expensive slots)
+          + brake_overlay     (raises fake temp during expensive slots)
+          − preheat_overlay   (lowers fake temp before expensive slots)
 ```
 
 The PI integral is **frozen** (not decayed, not reset) while braking is active. When
@@ -59,9 +59,9 @@ Feedforward signals come exclusively from electricity price and weather forecast
 
 | Signal source | Effect |
 |---|---|
-| Cheap electricity | Preheat boost — lower fake temp = more heating |
+| Non-expensive period before a costly block | Opportunity for bounded preheat |
 | Expensive electricity | Brake overlay — raise fake temp = less heating |
-| Cold forecast + upcoming expensive | Preheat boost to build thermal mass |
+| Forecast supports preheat + upcoming expensive | Preheat overlay to build thermal reserve |
 
 Feedforward is applied as a **bounded overlay** on top of PI output.
 
@@ -87,25 +87,76 @@ Each signal influences the system once only:
 
 ### 5. Simplicity Over Complexity
 
-- No ML, no black-box decisions
+- Base control remains deterministic and independent of learned state.
+- The opt-in Thermal Intelligence prototype passively records observations and
+  evaluates an empirical model; it does not change control or output decisions.
+- A fitted model is not trusted until it demonstrates independent predictive value.
 - All behavior is explainable from inputs alone
 - If a behavior cannot be described simply, it does not belong in the system
 
+The passive Thermal Intelligence prototype is deliberately isolated from the
+PI, price, comfort, SAFE, Ohmigo, Relay Guard and Generic Output paths. Its
+normalized virtual-outdoor command coordinate describes a requested control
+input, not delivered heat or heating power. Successful Home Assistant service
+completion is not receiver readback. Predictions are scored only against future
+observations in the same operating context and are never used for active control.
+
 ---
 
-## State Machine — Priority Order
+## Ohmigo Relay Guard — Output-path Safety
 
-The control loop evaluates blocks in strict priority order and returns on the first match:
+The optional **Ohmigo Relay Guard** is intentionally outside the PumpSteer control
+loop. It does not calculate temperature, classify price, alter PI state, or change
+thermal behavior.
+
+The responsibilities are separate:
+
+```text
+PumpSteer control → calculates virtual outdoor temperature
+Ohmigo Push       → decides whether setpoints are sent to Ohmigo
+Relay Guard       → keeps the configured Active signal path available
+```
+
+Relay recovery is eligible only when the guard is armed, Ohmigo Push explicitly
+reports On, and the configured relay explicitly reports Off. Unknown, unavailable or
+missing relay state fails closed and never causes a relay command.
+
+This separation is important in `safe_mode`: PumpSteer may still send the real outdoor
+temperature through Ohmigo, so safe mode alone must not disable the physical Active
+signal path.
+
+Relay recovery uses a short reconnect stabilization delay, at most three
+`switch.turn_on` attempts, and state verification after every attempt. Successful
+service dispatch is not treated as success until the relay itself reports On.
+
+---
+
+## State Machine — Evaluation Order
+
+Required inputs are validated before the control branches. Missing indoor/outdoor
+temperature or unusable price data currently enters `safe_mode` before optimization
+continues.
+
+With required inputs available, the control branches are evaluated in order:
 
 ```
-1. Summer mode    → outdoor ≥ summer_threshold → passthrough real temp
-2. Safe mode      → required sensor missing    → passthrough real temp
+1. Summer mode      → outdoor ≥ summer_threshold → passthrough real temp
+2. Precool          → warm-period risk detected
 3. Aggressiveness 0 → pure PI, all price logic disabled
-4. Braking        → current price is expensive AND comfort allows
-5a. Pre-brake     → expensive imminent, within ramp_in window AND comfort allows
-5b. Preheat-boost → expensive imminent, forecast supports preheat, thermal headroom remains
-6. Normal PI      → default, with optional ramp-out from previous brake
+4. Braking          → current price is expensive AND comfort allows
+5a. Pre-brake       → expensive imminent, within ramp_in window AND comfort allows
+5b. Preheat-boost   → expensive imminent, forecast supports preheat, thermal headroom remains
+6. Normal / holiday PI → default, including brake ramp-out or short-dip hold
 ```
+
+A valid short-dip bridge is reported as `brake_hold`. It is not a separate price
+decision; it is the normal-control path preserving the existing brake factor while a
+nearby expensive period approaches.
+
+When preheat takes over, the previous brake phase ends: its ramp, timestamps and
+actual-braking provenance are cleared. The diagnostic thermal model uses the same
+20-sample fit threshold as an ordinary completed brake phase. A later expensive
+period starts a fresh ramp instead of reviving an old hold.
 
 ---
 
@@ -114,16 +165,23 @@ The control loop evaluates blocks in strict priority order and returns on the fi
 | Mode | Trigger | PI active | Brake active | Integral |
 |---|---|---|---|---|
 | `summer_mode` | outdoor ≥ summer threshold | No | No | — |
-| `safe_mode` | sensor data missing | No | No | — |
-| `normal` | default | Yes | No (or ramp-out) | Accumulates |
-| `holiday` | holiday switch on | Yes (lower target) | No (or ramp-out) | Accumulates |
+| `safe_mode` | required temperature or price input missing/invalid | No | No | — |
+| `precool` | warm-period risk detected | No | Yes (precool brake ramp) | — |
+| `normal` | default | Yes | No (or ramp-out) | Frozen during ramp-out; otherwise accumulates |
+| `holiday` | holiday target active while otherwise in normal PI | Yes (lower target) | No (or ramp-out) | Frozen during ramp-out; otherwise accumulates |
 | `braking` | price expensive, comfort OK | Frozen¹ | Yes | Frozen |
+| `brake_hold` | short non-expensive gap before nearby expensive period | Frozen¹ | Held flat | Frozen |
 | `pre_braking` | expensive imminent, within ramp_in, comfort OK | Frozen¹ | Yes (ramping in) | Frozen |
 | `preheating` | expensive imminent + forecast worthwhile + headroom remaining | Yes + tapered boost | No | Accumulates |
 
 ¹ PI is computed with a frozen integral. At `factor = 1.0` the PI output has no effect
 on `fake_temp`. It influences output only during ramp-in/ramp-out (`0 < factor < 1`)
 as part of the blend.
+
+During precool, PI is computed only to advance its clock with a frozen integral;
+its output is discarded. The first PI computation after precool also freezes the
+integral, so it does not integrate the paused interval. Later unrestricted cycles
+resume ordinary integration. Existing PI resets clear this pause state.
 
 ---
 
@@ -176,8 +234,8 @@ brake ramps out normally.
 Ramp timing from house inertia slider:
 
 ```
-ramp_in  = clamp(house_inertia × 10, 20 min, 60 min)
-ramp_out = clamp(ramp_in × 0.8, 20 min, 60 min)   # ramp-out is 20% faster than ramp-in
+ramp_in  = clamp(house_inertia × 6, 15 min, 60 min)
+ramp_out = clamp(ramp_in × 0.5, 15 min, 60 min)
 ```
 
 ---
@@ -202,6 +260,12 @@ These two blocks are distinct and are often confused:
 - Allows limited thermal charging above target, but tapers the extra boost linearly to zero at the configured headroom ceiling
 - Requires `switch.pumpsteer_preheat_boost` to be on
 - Mode: `preheating`
+
+The preheat ramp uses elapsed time between control updates, capped at five minutes
+per update so a long outage cannot charge the whole ramp in one step. The first
+update after startup or a ramp reset retains the nominal one-minute step. Duplicate
+or backwards timestamps do not advance the ramp. The clock advances in other modes
+too, so time spent braking or precooling is not later counted as preheating.
 
 Preheat headroom follows saving level:
 
@@ -258,18 +322,24 @@ When outdoor temperature reaches or exceeds `summer_threshold` (default 17 °C):
 - PI is reset, brake ramp is cleared
 - Heat pump operates on its own summer logic
 
-Summer mode is the **highest-priority check** — it short-circuits everything else.
+Summer mode is the highest-priority **control branch after required input validation**.
+The current implementation validates required temperature and price inputs first; the
+roadmap tracks a future change where missing price data may fall back to comfort-only PI
+instead of safe passthrough.
 
 ---
 
 ## Safe Mode
 
-When any required sensor is missing or invalid:
+When required control input is missing or invalid:
 
-- Real outdoor temperature is passed through unchanged
-- PI is reset, brake ramp is cleared
-- `status` attribute contains the specific failure reason
-- Resolves automatically when valid data returns
+- Missing indoor/outdoor temperature enters safe mode
+- Missing or unusable price-list data also currently enters safe mode
+- If real outdoor temperature is available, it is passed through unchanged
+- If the outdoor sensor itself is unavailable, the PumpSteer sensor becomes unavailable
+- PI and both brake/preheat ramps are reset
+- `status` contains the specific failure reason
+- Safe mode resolves automatically when valid data returns
 
 ---
 
@@ -293,8 +363,20 @@ ThermalOutlook determines:
 | `night_min_temp` | Lowest forecast temp in 22:00–06:00 window |
 | `day_max_temp` | Highest forecast temp in 06:00–22:00 window |
 
-The thermal model remains separate: ThermalOutlook influences preheat, while `ThermalModel`
-is still observational/future-facing and does not yet decide brake depth or preheat headroom.
+ThermalOutlook and ThermalModel remain separate. ThermalOutlook actively influences
+preheat. `ThermalModel` collects valid cooling samples during braking and, after a
+completed brake phase, fits its cooling constant `k` when at least 20 samples are
+available. The fitted `thermal_k` is restored across Home Assistant restarts.
+
+Rate history includes only valid indoor readings. Missing/non-finite readings,
+duplicate/backwards timestamps, or a gap longer than five minutes break that
+history; three minutes of fresh contiguous readings are needed before collecting
+another cooling sample. Cooling rates use elapsed time across DST transitions.
+Restoring `thermal_k` does not restore old temperature history.
+
+ThermalModel is still **diagnostic with respect to control decisions**: it does not yet
+decide brake depth, override the comfort floor, or determine preheat headroom. Prediction
+helpers such as expected temperature drop and brake safety remain the next validation step.
 
 ---
 
