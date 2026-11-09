@@ -7,7 +7,7 @@ from collections import deque
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from .rtm_core import ModelConfig, RCThermalModel, Sample
+from .rtm_core import ModelConfig, RCThermalModel, Sample, ThermalParameters
 from .rtm_core.quality import step_temperature
 
 _STATE_VERSION = 1
@@ -174,6 +174,12 @@ class ThermalIntelligence:
             return False
         self._fit_summary = result
         status = result.get("status")
+        if result.get("fit_ts") is not None:
+            self.model._last_fit_ts = result["fit_ts"]
+        if result.get("data_end_ts") is not None:
+            self.model._data_end_at_fit = result["data_end_ts"]
+        self.model._summary = result
+
         if status == "candidate_insufficient_excitation":
             self._status = "candidate_insufficient_excitation"
             self.model._params = None
@@ -182,9 +188,6 @@ class ThermalIntelligence:
         if status == "ok" and result.get("params"):
             self.model._params = result["params"]
             self.model._quality = result.get("quality")
-            self.model._last_fit_ts = result.get("fit_ts")
-            self.model._data_end_at_fit = result.get("data_end_ts")
-            self.model._summary = result
             self.model._outdoor_ref = result.get("outdoor_ref")
             self._status = "candidate_learning"
             return True
@@ -334,7 +337,8 @@ class ThermalIntelligence:
 
         command = self._last_command if use_ohmigo_input else None
         command_value = _number(command.get("requested")) if command else None
-        command_at = _timestamp(command.get("at")) if command else None
+        command_at = _timestamp(command.get("established_at") or command.get("at")) if command else None
+        command_dispatched_at = _timestamp(command.get("last_dispatched_at") or command.get("at")) if command else None
         command_status = command.get("status") if command else None
         coordinate = None
         if (
@@ -406,6 +410,9 @@ class ThermalIntelligence:
             "command_coordinate": coordinate,
             "command_status": command_status,
             "command_at": command_at.isoformat() if command_at else None,
+            "command_dispatched_at": (
+                command_dispatched_at.isoformat() if command_dispatched_at else None
+            ),
             "interruption": self._last_interruption,
         }
         self._last_interruption = None
@@ -429,16 +436,38 @@ class ThermalIntelligence:
             and at is not None
         ):
             previous = self._last_command
+            requested = row["requested"]
             if (
                 previous is not None
-                and _number(previous.get("requested")) != row["requested"]
+                and _number(previous.get("requested")) == requested
+                and previous.get("status") == "service_completed_unverified"
             ):
-                self._interrupt("ohmigo_command_changed", at)
-            self._last_command = {
-                "requested": row["requested"],
-                "at": at.isoformat(),
-                "status": row["status"],
-            }
+                # Ohmigo keepalive: preserve the timestamp when command was established
+                established_at = (
+                    previous.get("established_at")
+                    or previous.get("at")
+                    or at.isoformat()
+                )
+                self._last_command = {
+                    "requested": requested,
+                    "at": established_at,
+                    "established_at": established_at,
+                    "last_dispatched_at": at.isoformat(),
+                    "status": row["status"],
+                }
+            else:
+                if (
+                    previous is not None
+                    and _number(previous.get("requested")) != requested
+                ):
+                    self._interrupt("ohmigo_command_changed", at)
+                self._last_command = {
+                    "requested": requested,
+                    "at": at.isoformat(),
+                    "established_at": at.isoformat(),
+                    "last_dispatched_at": at.isoformat(),
+                    "status": row["status"],
+                }
         elif row.get("transport") == "ohmigo" and row.get("status") in {
             "dispatch_failed",
             "skipped",
@@ -506,6 +535,12 @@ class ThermalIntelligence:
         )
         if prediction is None:
             return
+        frozen_params = {
+            "heating_rate_k_per_h": float(params.heating_rate_k_per_h),
+            "loss_rate_per_h": float(params.loss_rate_per_h),
+            "gains_k_per_h": float(params.gains_k_per_h),
+            "dead_time_minutes": float(getattr(params, "dead_time_minutes", 0.0)),
+        }
         self._pending_forecast = {
             "issued": at.isoformat(),
             "due": (at + _AUDIT_HORIZON).isoformat(),
@@ -516,6 +551,7 @@ class ThermalIntelligence:
             "outdoor": outdoor,
             "coordinate": coordinate,
             "model": self.model.to_dict(),
+            "params": frozen_params,
             "predicted": prediction,
             "invalidated": False,
         }
@@ -621,7 +657,28 @@ class ThermalIntelligence:
             return
 
         elapsed_hours = elapsed_seconds / 3600.0
-        params = self.model.parameters()
+        # Predictions evaluated at actual elapsed time must use exact model parameters frozen at issuance
+        frozen_params = pending.get("params")
+        if isinstance(frozen_params, dict):
+            params = ThermalParameters(
+                heating_rate_k_per_h=float(frozen_params["heating_rate_k_per_h"]),
+                loss_rate_per_h=float(frozen_params["loss_rate_per_h"]),
+                gains_k_per_h=float(frozen_params["gains_k_per_h"]),
+                dead_time_minutes=float(frozen_params.get("dead_time_minutes", 0.0)),
+            )
+        elif isinstance(frozen_params, ThermalParameters):
+            params = frozen_params
+        elif pending.get("model") and isinstance(pending["model"].get("params"), dict):
+            p = pending["model"]["params"]
+            params = ThermalParameters(
+                heating_rate_k_per_h=float(p["a"]),
+                loss_rate_per_h=float(p["b"]),
+                gains_k_per_h=float(p["c"]),
+                dead_time_minutes=float(p.get("d_minutes", 0.0)),
+            )
+        else:
+            params = None
+
         if params is None:
             self._pending_forecast = None
             self._interrupt("forecast_model_unavailable", at)

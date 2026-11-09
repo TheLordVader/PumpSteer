@@ -38,6 +38,7 @@ from .trust import FitFacts, FitTrust, assess_fit
 STATE_VERSION = 1
 MIN_FIT_HOURS = 3.0  # usable data needed before the first fit
 MIN_QUALITY_HOURS = 12.0  # usable data needed for a holdout evaluation
+MIN_NEW_DATA_HOURS = 1.0  # new eligible data needed since last fit before refitting
 REFIT_SECONDS = 3600.0
 WEAK_EXCITATION_HOURS = 3.0
 OUTDOOR_REF_HOURS = 24.0
@@ -165,9 +166,16 @@ class RCThermalModel(ThermalModel):
             return False
         if self._last_fit_ts is None:
             return self._usable_hours() >= MIN_FIT_HOURS
-        if ts_of(now) - self._last_fit_ts < REFIT_SECONDS:
-            return False
-        return self._data_end_at_fit is None or self._grid.end_ts > self._data_end_at_fit
+        # Meaningful new eligible data is required since the last fit attempt
+        if self._data_end_at_fit is not None:
+            new_data_s = self._grid.end_ts - self._data_end_at_fit
+            if new_data_s < MIN_NEW_DATA_HOURS * 3600.0:
+                return False
+        if self._summary.get("status") == "candidate_insufficient_excitation":
+            efforts = [e for e in self._grid.effort if e is not None]
+            if not efforts or (max(efforts) - min(efforts)) < 0.15:
+                return False
+        return (ts_of(now) - self._last_fit_ts) >= REFIT_SECONDS
 
     def _usable_hours(self) -> float:
         return self._grid.valid_indoor_count() * self.config.step_minutes / 60.0
@@ -188,7 +196,13 @@ class RCThermalModel(ThermalModel):
         prior_info = gp.as_dict() if gp is not None else dict(DEFAULT_PRIOR_INFO)
         ds = build_dataset(grid, cfg, now_ts)
         if len(ds) * ds.dt_h < MIN_FIT_HOURS:
-            return {"status": "insufficient_data", "rows": len(ds), "excitation_sufficient": False}
+            return {
+                "status": "insufficient_data",
+                "rows": len(ds),
+                "excitation_sufficient": False,
+                "fit_ts": now_ts,
+                "data_end_ts": grid.end_ts,
+            }
 
         # Check command excitation before running regressions. A nearly constant command
         # cannot independently identify heating response gain a and background gain c.
@@ -204,11 +218,19 @@ class RCThermalModel(ThermalModel):
                 "command_variance": round(var_u, 6),
                 "excitation_sufficient": False,
                 "params": None,
+                "fit_ts": now_ts,
+                "data_end_ts": grid.end_ts,
             }
 
         res = fit_rc(ds, grid.effort, cfg, prior=prior)
         if res is None:
-            return {"status": "fit_failed", "rows": len(ds), "excitation_sufficient": True}
+            return {
+                "status": "fit_failed",
+                "rows": len(ds),
+                "excitation_sufficient": True,
+                "fit_ts": now_ts,
+                "data_end_ts": grid.end_ts,
+            }
 
         bad = bad_rows(grid, cfg.max_step_delta_k)
         heat_h, cool_h = experience_hours(grid, bad)
