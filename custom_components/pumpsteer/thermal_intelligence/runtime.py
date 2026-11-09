@@ -169,9 +169,9 @@ class ThermalIntelligence:
 
     def apply_fit_result(self, token: int, result: dict[str, Any]) -> bool:
         """Apply fitted results if still current. Discards results from obsolete generations."""
-        self._fit_in_progress = False
         if token != self._fit_generation:
             return False
+        self._fit_in_progress = False
         self._fit_summary = result
         status = result.get("status")
         if result.get("fit_ts") is not None:
@@ -289,6 +289,7 @@ class ThermalIntelligence:
 
         changed = False
         source_rows = []
+        source_values = {}
         if isinstance(sources, list):
             for row in sources:
                 if not isinstance(row, dict) or not isinstance(row.get("entity"), str):
@@ -304,7 +305,7 @@ class ThermalIntelligence:
                     and (previous is None or value != previous[0])
                 )
                 if value is not None and reported is not None:
-                    self._source_values[entity] = (value, reported)
+                    source_values[entity] = (value, reported)
                 changed = changed or advanced
                 source_rows.append(
                     {
@@ -321,6 +322,19 @@ class ThermalIntelligence:
             self._status = "waiting_for_temperatures"
             return
 
+        # Every contributor must satisfy the existing capture age limit; the
+        # newest aggregate report cannot certify older or future components.
+        if not source_rows or any(
+            row["value"] is None
+            or _timestamp(row["reported_at"]) is None
+            or not timedelta(0) <= at - _timestamp(row["reported_at"])
+            <= timedelta(minutes=_MAX_GAP_MINUTES)
+            for row in source_rows
+        ):
+            self._interrupt("indoor_component_unavailable_or_stale", at)
+            self._status = "waiting_for_temperatures"
+            return
+
         indoor_at = _timestamp(cycle.get("indoor_reported_at"))
         if (
             not changed
@@ -334,6 +348,10 @@ class ThermalIntelligence:
             self._interrupt("outdoor_observation_stale", at)
             self._status = "waiting_for_fresh_outdoor"
             return
+
+        # Only accepted observations consume source changes. A weather failure
+        # must not permanently discard a genuine indoor change.
+        self._source_values.update(source_values)
 
         command = self._last_command if use_ohmigo_input else None
         command_value = _number(command.get("requested")) if command else None
@@ -714,6 +732,15 @@ class ThermalIntelligence:
         )
         self._pending_forecast = None
 
+    def suspend(self, reason: str, at: datetime) -> None:
+        """Break an unobserved interval while retaining completed evidence."""
+        self._interrupt(reason, at)
+        self.model._pending.clear()
+        self._last_command = None
+        self._active_cycle = None
+        self._braking_episode_active = False
+        self._braking_episode_forecasted = False
+
     def _interrupt(self, reason: str, at: datetime | None = None) -> None:
         if reason != self._last_interruption:
             self._interruptions.append(
@@ -773,6 +800,22 @@ class ThermalIntelligence:
             scores = data.get("scores", [])
             if not all(isinstance(value, list) for value in (rows, outputs, scores)):
                 return False
+            if not all(isinstance(row, dict) for group in (rows, outputs, scores) for row in group):
+                return False
+            # Summary runs in the control lifecycle: corrupted stored errors
+            # must be rejected before they can raise during arithmetic there.
+            if any(
+                isinstance(row.get(key), bool)
+                or not isinstance(row.get(key), (int, float))
+                or not math.isfinite(row[key])
+                or row[key] < 0
+                for row in scores
+                for key in ("model_error_c", "persistence_error_c")
+            ):
+                return False
+            # Keep finalized grid rows, but never carry a held command or an
+            # unfinished resampling interval across an unobserved restart.
+            model._pending.clear()
             self.model = model
             self._observations = deque(rows[-_MAX_RECORDS:], maxlen=_MAX_RECORDS)
             self._outputs = deque(outputs[-_MAX_RECORDS:], maxlen=_MAX_RECORDS)

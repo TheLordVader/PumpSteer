@@ -1315,6 +1315,10 @@ class PumpSteerSensor(RestoreEntity):
         outdoor: Optional[float],
         now: datetime,
     ) -> None:
+        try:
+            self._thermal_intelligence.suspend("safe_mode", now)
+        except Exception:
+            _LOGGER.debug("Thermal Intelligence suspension failed", exc_info=True)
         self._control_modifier_state = None
         self._adaptive_braking = {
             "state": "base",
