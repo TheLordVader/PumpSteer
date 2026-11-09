@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import bisect
+import math
 import time
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import asdict
@@ -20,7 +21,7 @@ from .base import (
 )
 from .cooling import cooling_tau
 from .deadtime import tangent_dead_time
-from .fit import FitResult, _wvar, build_dataset, fit_rc
+from .fit import FitResult, build_dataset, excitation, fit_rc
 from .forecast import mean_over, outdoor_curve, solve_duration
 from .grid import Grid, ceil_ts, dt_of, floor_ts, resample, ts_of
 from .physics import coast_temperature, equilibrium, preheat_minutes
@@ -83,6 +84,7 @@ class RCThermalModel(ThermalModel):
         self._outdoor_ref: float | None = None
         self._quality: dict[str, Any] | None = None
         self._last_fit_ts: float | None = None
+        self._fit_evidence_rows: set[float] | None = None
         self._data_end_at_fit: float | None = None
         self._summary: dict[str, Any] = {}
 
@@ -95,7 +97,9 @@ class RCThermalModel(ThermalModel):
         if not rows:
             return
         cfg = self.config
-        new = resample(rows, cfg.step_minutes, cfg.max_gap_minutes, cfg.outdoor_max_gap_minutes)
+        new = resample(
+            rows, cfg.step_minutes, cfg.max_gap_minutes, cfg.outdoor_max_gap_minutes
+        )
         if len(new):
             self._grid = new if not len(self._grid) else self._grid.merged(new)
         latest = ts_of(rows[-1].ts)
@@ -103,7 +107,9 @@ class RCThermalModel(ThermalModel):
             self._last_sample_ts = latest
         end = self._grid.end_ts
         horizon = (end if end is not None else latest) - self._lookback_s
-        merged = self._pending + [(ts_of(s.ts), s) for s in rows if ts_of(s.ts) >= horizon]
+        merged = self._pending + [
+            (ts_of(s.ts), s) for s in rows if ts_of(s.ts) >= horizon
+        ]
         merged.sort(key=lambda p: p[0])
         self._pending = [p for p in merged if p[0] >= horizon]
         self._advance()
@@ -112,8 +118,11 @@ class RCThermalModel(ThermalModel):
     def add_sample(self, sample: Sample) -> None:
         t = ts_of(sample.ts)
         end = self._grid.end_ts
-        if end is not None and t < end - self._lookback_s:
-            return  # too old to matter: rows up to ``end`` are final
+        if end is not None and t < end:
+            # Completed rows are immutable. Retaining a late value only in the
+            # pending tail would silently move its effect to a later grid row.
+            # The runtime evidence ledger still retains its actual source time.
+            return
         if not self._pending or t >= self._pending[-1][0]:
             self._pending.append((t, sample))
         else:
@@ -122,13 +131,21 @@ class RCThermalModel(ThermalModel):
             self._last_sample_ts = t
         self._advance()
 
+    def break_segment(self, at: datetime) -> None:
+        """Record a mode/eligibility boundary without discarding captured history."""
+        # A backward clock must still sever the next open model interval.
+        boundary = max(ts_of(at), self._grid.end_ts or ts_of(at))
+        self.add_sample(Sample(dt_of(boundary), None, None, None, True))
+
     def _advance(self) -> None:
         """Build grid rows fully covered by the pending samples."""
         if not self._pending:
             return
         step = self._step_s
         latest = self._pending[-1][0]
-        if self._grid.start_ts is None or ((self._grid.end_ts or 0.0) < latest - self._history_s):
+        if self._grid.start_ts is None or (
+            (self._grid.end_ts or 0.0) < latest - self._history_s
+        ):
             first = max(self._pending[0][0], latest - self._history_s)
             self._grid = Grid(self.config.step_minutes, ceil_ts(first, step))
         end = self._grid.end_ts
@@ -161,24 +178,43 @@ class RCThermalModel(ThermalModel):
     def set_prior(self, prior: GroupPrior | None) -> None:
         self._group_prior = prior
 
+    def _evidence_rows(self, grid: Grid, now_ts: float) -> set[float]:
+        ds = build_dataset(grid, self.config, now_ts)
+        return {grid.ts(k + 1) for k in ds.k}
+
+    def record_fit_attempt(self, grid: Grid, now_ts: float) -> None:
+        """Remember the actual snapshot attempted, including rejected candidates."""
+        self._last_fit_ts = now_ts
+        self._data_end_at_fit = grid.end_ts
+        self._fit_evidence_rows = self._evidence_rows(grid, now_ts)
+
     def fit_due(self, now: datetime) -> bool:
         if self._last_sample_ts is None or self._grid.end_ts is None:
             return False
+        now_ts = ts_of(now)
+        if self._last_fit_ts is not None and now_ts - self._last_fit_ts < REFIT_SECONDS:
+            return False
+        evidence = self._evidence_rows(self._grid, now_ts)
+        dt_h = self.config.step_minutes / 60.0
+        if len(evidence) * dt_h < MIN_FIT_HOURS:
+            return False
         if self._last_fit_ts is None:
-            return self._usable_hours() >= MIN_FIT_HOURS
-        # Meaningful new eligible data is required since the last fit attempt
-        if self._data_end_at_fit is not None:
-            new_data_s = self._grid.end_ts - self._data_end_at_fit
-            if new_data_s < MIN_NEW_DATA_HOURS * 3600.0:
-                return False
-        if self._summary.get("status") == "candidate_insufficient_excitation":
-            efforts = [e for e in self._grid.effort if e is not None]
-            if not efforts or (max(efforts) - min(efforts)) < 0.15:
-                return False
-        return (ts_of(now) - self._last_fit_ts) >= REFIT_SECONDS
+            return True
+        if self._fit_evidence_rows is not None:
+            new_rows = evidence - self._fit_evidence_rows
+        else:
+            # Compatibility with attempts saved before evidence rows were tracked.
+            new_rows = {t for t in evidence if t > (self._data_end_at_fit or now_ts)}
+        return len(new_rows) * dt_h >= MIN_NEW_DATA_HOURS
 
     def _usable_hours(self) -> float:
-        return self._grid.valid_indoor_count() * self.config.step_minutes / 60.0
+        if self._last_sample_ts is None:
+            return 0.0
+        return (
+            len(self._evidence_rows(self._grid, self._last_sample_ts))
+            * self.config.step_minutes
+            / 60.0
+        )
 
     @classmethod
     def fit_snapshot(
@@ -191,6 +227,14 @@ class RCThermalModel(ThermalModel):
         """Fit model parameters from a grid snapshot. Pure, thread-safe function."""
         t_start = time.perf_counter()
         cfg = config
+        # Auxiliary checks and holdouts must see the same causal snapshot as fitting.
+        grid = grid.copy()
+        if grid.start_ts is not None:
+            n = max(0, min(len(grid), int((now_ts - grid.start_ts) // grid.step_s) + 1))
+            grid.indoor, grid.outdoor = grid.indoor[:n], grid.outdoor[:n]
+            grid.effort, grid.excluded = grid.effort[:n], grid.excluded[:n]
+            if n and grid.ts(n) > now_ts:
+                grid.effort[-1] = None
         gp = group_prior
         prior = gp.as_prior() if gp is not None else None
         prior_info = gp.as_dict() if gp is not None else dict(DEFAULT_PRIOR_INFO)
@@ -206,10 +250,9 @@ class RCThermalModel(ThermalModel):
 
         # Check command excitation before running regressions. A nearly constant command
         # cannot independently identify heating response gain a and background gain c.
-        u0 = [e if (e := grid.effort[k]) is not None else 0.0 for k in ds.k]
-        range_u = (max(u0) - min(u0)) if u0 else 0.0
-        var_u = _wvar(u0, ds.w)
-        if range_u < 0.15 or var_u < 0.005:
+        u0 = [float(e) for k in ds.k if (e := grid.effort[k]) is not None]
+        sufficient, range_u, var_u = excitation(u0, ds.w)
+        if not sufficient:
             return {
                 "status": "candidate_insufficient_excitation",
                 "reason": "insufficient_command_excitation_for_dual_gain_identification",
@@ -222,12 +265,20 @@ class RCThermalModel(ThermalModel):
                 "data_end_ts": grid.end_ts,
             }
 
-        res = fit_rc(ds, grid.effort, cfg, prior=prior)
+        res = fit_rc(
+            ds,
+            grid.effort,
+            cfg,
+            prior=prior,
+            min_rows=math.ceil(MIN_FIT_HOURS / ds.dt_h),
+        )
         if res is None:
             return {
-                "status": "fit_failed",
+                "status": "candidate_insufficient_excitation",
+                "reason": "no_identifiable_delayed_command_candidate",
+                "params": None,
                 "rows": len(ds),
-                "excitation_sufficient": True,
+                "excitation_sufficient": False,
                 "fit_ts": now_ts,
                 "data_end_ts": grid.end_ts,
             }
@@ -261,6 +312,7 @@ class RCThermalModel(ThermalModel):
                 d_candidates=[d_steps],
                 fixed=fixed,
                 scale=res.scale,
+                min_rows=math.ceil(MIN_FIT_HOURS / ds.dt_h),
             )
             if res2 is not None:
                 res2.criterion, res2.flatness = res.criterion, res.flatness
@@ -280,6 +332,7 @@ class RCThermalModel(ThermalModel):
                 d_candidates=[res.d_steps],
                 fixed=fixed,
                 scale=res.scale,
+                min_rows=math.ceil(MIN_FIT_HOURS / ds.dt_h),
             )
             if r_tr is not None:
                 p_tr = Params(r_tr.a, r_tr.b, r_tr.c, r_tr.d_steps, ds.use_outdoor)
@@ -323,13 +376,19 @@ class RCThermalModel(ThermalModel):
             "fallbacks": fallbacks,
             "prior": prior_info,
             "cross_check": cross,
-            "quality": {k: _r(v) if isinstance(v, float) else v for k, v in quality.items()},
+            "quality": {
+                k: _r(v) if isinstance(v, float) else v for k, v in quality.items()
+            },
+            # Delay, robust scale and fallback selection used the full dataset.
+            # This check is diagnostic; independent proof comes from live episodes.
+            "evaluation_independent": False,
+            "evaluation_basis": "internal_holdout_with_full_data_model_selection",
             "evaluation_windows": evaluation.windows if evaluation else 0,
             "episode_errors_min": evaluation.episode_errors if evaluation else [],
             "fit_seconds": round(time.perf_counter() - t_start, 3),
             "excitation_sufficient": True,
-            "command_range": round(range_u, 4),
-            "command_variance": round(var_u, 6),
+            "command_range": round(res.command_range, 4),
+            "command_variance": round(res.command_variance, 6),
             "params": params,
             "outdoor_ref": outdoor_ref,
             "fit_ts": now_ts,
@@ -339,9 +398,8 @@ class RCThermalModel(ThermalModel):
     def fit(self, now: datetime) -> dict[str, Any]:
         """Synchronous fitting on the local instance."""
         now_ts = ts_of(now)
-        self._last_fit_ts = now_ts
         grid = self._grid.snapshot()
-        self._data_end_at_fit = grid.end_ts
+        self.record_fit_attempt(grid, now_ts)
         res = self.fit_snapshot(grid, self.config, now_ts, self._group_prior)
         self._summary = res
         if res.get("status") == "ok" and res.get("params"):
@@ -424,7 +482,9 @@ class RCThermalModel(ThermalModel):
 
         def mean_outdoor(m: float) -> float:
             value = mean_over(curve, t0, t0 + m * 60.0)
-            assert value is not None  # curve is non-empty on every path that reaches here
+            assert (
+                value is not None
+            )  # curve is non-empty on every path that reaches here
             return value
 
         return mean_outdoor, source
@@ -521,7 +581,8 @@ class RCThermalModel(ThermalModel):
             "config": asdict(self.config),
             "grid": self._grid.to_dict(),
             "pending": [
-                [t, s.indoor_c, s.outdoor_c, s.effort, int(s.excluded)] for t, s in self._pending
+                [t, s.indoor_c, s.outdoor_c, s.effort, int(s.excluded)]
+                for t, s in self._pending
             ],
             "last_sample_ts": self._last_sample_ts,
             "params": dict(self._params) if self._params else None,
@@ -529,6 +590,9 @@ class RCThermalModel(ThermalModel):
             "quality": dict(self._quality) if self._quality else None,
             "last_fit_ts": self._last_fit_ts,
             "data_end_at_fit": self._data_end_at_fit,
+            "fit_evidence_rows": sorted(self._fit_evidence_rows)
+            if self._fit_evidence_rows is not None
+            else None,
             "summary": self._summary,
         }
 
@@ -551,6 +615,8 @@ class RCThermalModel(ThermalModel):
         model._quality = data.get("quality")
         model._last_fit_ts = data.get("last_fit_ts")
         model._data_end_at_fit = data.get("data_end_at_fit")
+        evidence = data.get("fit_evidence_rows")
+        model._fit_evidence_rows = set(evidence) if isinstance(evidence, list) else None
         model._summary = data.get("summary") or {}
         model._last_sample_ts = data.get("last_sample_ts")
         grid_data = data.get("grid")

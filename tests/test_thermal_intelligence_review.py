@@ -47,13 +47,14 @@ def test_restart_does_not_restore_open_resampling_window():
     assert not restored.model._pending
 
 
-def test_safe_entry_discards_passive_forecast(request):
+def test_safe_entry_discards_held_command(request):
     import asyncio
     controller, states, clock = request.getfixturevalue("control")
     runtime = controller._thermal_intelligence
-    runtime._pending_forecast = {'issued': clock[0].isoformat()}
+    runtime._last_command = {'requested': -8.0, 'established_at': clock[0].isoformat()}
     asyncio.run(controller._enter_safe_mode('test', 2, clock[0]))
-    assert runtime._pending_forecast is None
+    assert runtime.current_command is None
+    assert runtime._interruptions[-1]["reason"] == "safe_mode"
 
 
 from test_safe_mode_output import setup_sensor  # noqa: E402,F401
@@ -88,4 +89,4 @@ def test_corrupt_stored_scores_are_rejected_before_control_summary():
                         'model_error_c': 'broken', 'persistence_error_c': 0.1}]
     restored = ThermalIntelligence()
     assert not restored.restore_state(state)
-    assert restored.summary()['forecast_count'] == 0
+    assert not restored.has_evidence

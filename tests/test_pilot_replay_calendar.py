@@ -353,7 +353,7 @@ def test_preheat_brake_and_release_across_local_midnight():
     assert any(mode == "normal" for _, mode in changes[modes.index("braking") + 1 :])
 
 
-def test_actual_ha_cycle_executes_dst_reference_without_changing_control(monkeypatch):
+def test_actual_ha_cycle_collects_across_dst_without_legacy_planning_or_control_change(monkeypatch):
     from custom_components.pumpsteer import forecast
     from custom_components.pumpsteer import sensor as sensor_module
 
@@ -404,9 +404,12 @@ def test_actual_ha_cycle_executes_dst_reference_without_changing_control(monkeyp
     asyncio.run(candidate._do_update())
     assert base.state == candidate.state
     assert base_pushes == candidate_pushes
-    assert (
-        candidate.extra_state_attributes["thermal_intelligence_plan_detail"][
-            "comparison"
-        ]["baseline"]
-        == "shared_control_passive"
-    )
+    assert candidate._pilot_plan == {
+        "planning_status": "unavailable", "reason": "shared_evidence_chain"
+    }
+    assert candidate._pilot is None
+    assert not candidate._plan_audit.plan_pending
+    assert candidate._thermal_intelligence.latest_observation["indoor_c"] == float(states["sensor.indoor"].state)
+    assert candidate._plan_audit.fixed_pending["curves"] == [
+        {"name": "persistence", "rate": 0.0}
+    ]

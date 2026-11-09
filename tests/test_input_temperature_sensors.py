@@ -348,17 +348,21 @@ def test_fixed_audit_completes_in_control_cycle_and_uses_existing_store(temperat
     controller._pilot_store = SimpleNamespace(
         async_delay_save=lambda callback, delay: saved.append(callback())
     )
-    controller._thermal_model.restore_k(0.03)
-    controller._update_thermal_learning(
-        active=True, reason="stable_braking", now=clock[0], indoor=21, outdoor=-3.3
-    )
+    _report(states, clock, unit_of_measurement="°C")
+    asyncio.run(controller._do_update())
     assert controller._plan_audit.fixed_pending is not None
+    assert controller._plan_audit.fixed_pending["kind"] == "shared_command_response"
+    assert controller._plan_audit.fixed_pending["curves"] == [{"name": "persistence", "rate": 0.0}]
     clock[0] += timedelta(minutes=60)
+    states["sensor.indoor"].state = "20.8"
     _report(states, clock, unit_of_measurement="°C")
     asyncio.run(controller._do_update())
     assert len(controller._plan_audit.fixed_records) == 1
     assert controller._plan_audit.fixed_records[0]["horizon"] == 60
-    assert saved[-1]["plan_audit"]["fixed_v1"][0]["horizon"] == 60
+    assert controller._plan_audit.fixed_records[0]["actual"] == 20.8
+    asyncio.run(controller._save_pilot_store())
+    assert saved[-1]["plan_audit"]["fixed_v2"][0]["horizon"] == 60
+    assert saved[-1]["plan_audit"]["fixed_v1"] == []
 
 
 @pytest.mark.parametrize("valid", [False, True, None])

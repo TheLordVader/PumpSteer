@@ -112,9 +112,17 @@ def test_disabled_does_not_expose_restored_diagnostic():
     assert "thermal_intelligence_reason" not in sensor.extra_state_attributes
 
 
-def test_enabled_reads_real_heat_and_feeds_pilot_without_changing_pi(monkeypatch):
+def test_enabled_reads_real_heat_and_retains_diagnostics_without_changing_pi(
+    monkeypatch,
+):
     from datetime import datetime, timedelta, timezone
 
+    from custom_components.pumpsteer.pilot_passive import PilotPassive
+
+    def retired_collect(*args, **kwargs):
+        pytest.fail("live control must use the shared RTM chain, not Pilot.observe")
+
+    monkeypatch.setattr(PilotPassive, "observe", retired_collect)
     base, _ = _sensor()
     sensor, states = _sensor()
     sensor._config_entry.options.update(
@@ -137,8 +145,13 @@ def test_enabled_reads_real_heat_and_feeds_pilot_without_changing_pi(monkeypatch
         _cycle(base, monkeypatch, minute)
         attrs = _cycle(sensor, monkeypatch, minute)
         assert sensor.state == base.state
-    assert attrs["thermal_intelligence_learning_intervals"] == 1
+    assert attrs["thermal_intelligence_learning_intervals"] == 0
     assert attrs["thermal_intelligence_plan"] == "not_available"
+
+    assert (
+        attrs["thermal_intelligence_plan_detail"]["reason"] == "shared_evidence_chain"
+    )
+    assert attrs["thermal_intelligence_operating_mode"] == "radiator_heating"
 
 
 def test_external_heat_setting_prevents_unqualified_learning(monkeypatch):
@@ -169,7 +182,7 @@ def test_update_error_breaks_pending_pilot_interval(monkeypatch):
 
     monkeypatch.setattr(sensor, "_do_update", broken)
     asyncio.run(sensor.async_update())
-    assert sensor._pilot.manager.house.start is None
+    assert sensor._pilot is None or sensor._pilot.manager.house.start is None
 
 
 @pytest.mark.parametrize(
@@ -181,7 +194,7 @@ def test_update_error_breaks_pending_pilot_interval(monkeypatch):
         "thermal_power_entity",
     ],
 )
-def test_signal_transition_during_learning_discards_fit(monkeypatch, role):
+def test_live_diagnostics_never_run_retired_fit_for_optional_signals(monkeypatch, role):
     from datetime import datetime, timezone
     from custom_components.pumpsteer import sensor as sensor_module
 
@@ -208,13 +221,14 @@ def test_signal_transition_during_learning_discards_fit(monkeypatch, role):
 
     pilot = Pilot()
     sensor._pilot = pilot
-    monkeypatch.setattr(sensor, "_observe_pilot", lambda *args: object())
+    monkeypatch.setattr(sensor, "_observe_pilot", lambda *args, **kwargs: object())
     monkeypatch.setattr(sensor_module.dt_util, "now", lambda: at)
     for key in ("sensor.indoor", "sensor.outdoor"):
         states[key].last_reported = at
     asyncio.run(sensor._do_update())
-    assert pilot.reset
-    assert sensor._pilot_plan["reason"] == "inputs_changed_during_learning"
+    assert not pilot.reset
+    assert sensor._pilot_plan["reason"] == "shared_evidence_chain"
+    assert states["sensor.observed"].state == "off"
 
 
 def test_safe_does_not_expose_previous_forecast_or_price_as_current(monkeypatch):
@@ -320,7 +334,9 @@ def test_diagnostic_failure_never_changes_primary_control(monkeypatch):
     assert attrs["thermal_intelligence_grid_marginal"]["status"] == "unavailable"
 
 
-def test_extra_heat_setting_allows_background_aware_unvalidated_learning(monkeypatch):
+def test_extra_heat_setting_retains_background_diagnostic_without_parallel_learning(
+    monkeypatch,
+):
     from datetime import datetime, timedelta, timezone
 
     sensor, states = _sensor()
@@ -343,8 +359,9 @@ def test_extra_heat_setting_allows_background_aware_unvalidated_learning(monkeyp
             attributes={},
         )
         attrs = _cycle(sensor, monkeypatch, minute)
-    assert attrs["thermal_intelligence_learning_intervals"] == 1
+    assert attrs["thermal_intelligence_learning_intervals"] == 0
     assert attrs["thermal_intelligence_model"] == "unvalidated"
+    assert sensor._thermal_intelligence.model.parameters() is None
     assert attrs["thermal_intelligence_external_heat"] == "background_unverified"
     assert attrs["thermal_intelligence_plan"] == "not_available"
 
@@ -373,7 +390,7 @@ def test_plan_refusal_identifies_absent_heat_and_safe_mode(monkeypatch):
     assert safe["thermal_intelligence_reason"] == "safe_mode"
 
 
-def test_response_observer_uses_reported_ohmigo_entity(monkeypatch):
+def test_live_cycle_never_fits_retired_pump_response_model(monkeypatch):
     from datetime import datetime, timedelta, timezone
 
     sensor, states = _sensor()
@@ -395,7 +412,6 @@ def test_response_observer_uses_reported_ohmigo_entity(monkeypatch):
         return original(self, interval)
 
     monkeypatch.setattr(PumpResponseModel, "add_interval", record_thread)
-    main_thread = threading.get_ident()
 
     monkeypatch.setattr(
         ohmigo, "_switch_entity_id", lambda hass, entry_id: "switch.push"
@@ -427,36 +443,13 @@ def test_response_observer_uses_reported_ohmigo_entity(monkeypatch):
             state="on", last_reported=at, last_changed=start, attributes={}
         )
         _cycle(sensor, monkeypatch, minute)
-    assert len(sensor._pilot.manager.pump.history) == 1
-    assert thread_ids and thread_ids[0] != main_thread
+    assert sensor._pilot.manager.pump.history == []
+    assert thread_ids == []
     states["switch.active"].state = "off"
-    _cycle(sensor, monkeypatch, 16)
-    assert sensor._pilot.manager.pump.reason == "response_input_unavailable"
-
-    states["switch.active"].state = "on"
-    for minute in range(17, 33):
-        at = start + timedelta(minutes=minute)
-        for key in (
-            "binary_sensor.house_heat",
-            "number.reported_command",
-            "switch.push",
-            "switch.active",
-        ):
-            states[key].last_reported = at
-        if minute == 32:
-            import pytest
-
-            async def cancelled(*args, **kwargs):
-                raise asyncio.CancelledError
-
-            monkeypatch.setattr(asyncio, "to_thread", cancelled)
-            sensor._pilot.manager.pump.ready = True
-            with pytest.raises(asyncio.CancelledError):
-                _cycle(sensor, monkeypatch, minute)
-            assert not sensor._pilot.manager.pump.ready
-            assert sensor._pilot.manager.pump.reason == "interval_interrupted"
-        else:
-            _cycle(sensor, monkeypatch, minute)
+    attrs = _cycle(sensor, monkeypatch, 16)
+    assert sensor._pilot.manager.pump.history == []
+    assert attrs["thermal_intelligence_plan"] == "not_available"
+    assert sensor._thermal_intelligence.model.parameters() is None
 
 
 def test_supply_and_verified_heating_mode_feed_observer(monkeypatch):
@@ -485,7 +478,7 @@ def test_supply_and_verified_heating_mode_feed_observer(monkeypatch):
             state="on", last_reported=at, last_changed=start, attributes={}
         )
         attrs = _cycle(sensor, monkeypatch, minute)
-    assert attrs["thermal_intelligence_learning_intervals"] == 1
+    assert attrs["thermal_intelligence_learning_intervals"] == 0
     assert attrs["thermal_intelligence_heat_source"] == "supply_temperature_indicator"
     states["binary_sensor.radiator_mode"].state = "off"
     attrs = _cycle(sensor, monkeypatch, 66)
@@ -519,7 +512,7 @@ def test_supply_accepts_explicit_inverted_radiator_mode(monkeypatch):
             state="off", last_reported=at, last_changed=start, attributes={}
         )
         attrs = _cycle(sensor, monkeypatch, minute)
-    assert attrs["thermal_intelligence_learning_intervals"] == 1
+    assert attrs["thermal_intelligence_learning_intervals"] == 0
     assert attrs["thermal_intelligence_operating_mode"] == "radiator_heating"
     assert (
         attrs["thermal_intelligence_operating_quality"]
@@ -625,7 +618,7 @@ def test_automatic_mode_uses_verified_heat_and_rejects_contradictory_compressor(
     states["binary_sensor.compressor"].last_changed = at
     attrs = _cycle(sensor, monkeypatch, 1)
     assert attrs["thermal_intelligence_operating_mode"] == "unknown"
-    assert sensor._pilot.manager.house.start is None
+    assert sensor._pilot is None or sensor._pilot.manager.house.start is None
 
 
 def test_operation_store_batches_and_flushes_latest_samples():
@@ -683,7 +676,7 @@ def test_automatic_mode_rejects_heat_signal_aliasing_compressor(monkeypatch):
     attrs = _cycle(sensor, monkeypatch, 0)
     assert attrs["thermal_intelligence_operating_mode"] == "unknown"
     assert not attrs["thermal_intelligence_operation_detail"]["learning_qualified"]
-    assert sensor._pilot.manager.model.history == []
+    assert sensor._pilot is None or sensor._pilot.manager.model.history == []
 
 
 def test_automatic_mode_requires_a_configured_missing_radiator_sensor(monkeypatch):
@@ -705,7 +698,7 @@ def test_automatic_mode_requires_a_configured_missing_radiator_sensor(monkeypatc
     )
     attrs = _cycle(sensor, monkeypatch, 0)
     assert attrs["thermal_intelligence_operating_mode"] == "unknown"
-    assert sensor._pilot.manager.house.start is None
+    assert sensor._pilot is None or sensor._pilot.manager.house.start is None
 
 
 @pytest.mark.parametrize(
@@ -733,7 +726,7 @@ def test_automatic_mode_discards_unobserved_operating_transition(monkeypatch, ro
     )
     _cycle(sensor, monkeypatch, 0)
     pilot = sensor._pilot
-    assert pilot.manager.house.start is not None
+    assert pilot.manager.house.start is None
     pilot.manager.pump.ready = True
     changed = start + timedelta(seconds=40)
     at = start + timedelta(minutes=1)
@@ -742,7 +735,7 @@ def test_automatic_mode_discards_unobserved_operating_transition(monkeypatch, ro
     states["binary_sensor.heat"].last_reported = at
     _cycle(sensor, monkeypatch, 1)
     assert not pilot.manager.pump.ready
-    assert pilot.manager.house.start == at.timestamp()
+    assert pilot.manager.house.start is None
 
 
 def test_automatic_learning_waits_through_compressor_source_outage(monkeypatch):
@@ -781,7 +774,7 @@ def test_automatic_learning_waits_through_compressor_source_outage(monkeypatch):
     states["binary_sensor.compressor"].last_changed = at - timedelta(seconds=10)
     states["binary_sensor.compressor"].last_reported = at
     _cycle(sensor, monkeypatch, 5)
-    assert pilot.manager.house.start == at.timestamp()
+    assert pilot.manager.house.start is None
 
 
 def test_calibrated_multi_signal_indication_does_not_become_pilot_heat(monkeypatch):
@@ -840,10 +833,10 @@ def test_calibrated_multi_signal_indication_does_not_become_pilot_heat(monkeypat
     assert attrs["thermal_intelligence_operating_mode"] == "space_heating"
     assert attrs["thermal_intelligence_operating_quality"] == "probable"
     assert not attrs["thermal_intelligence_operation_detail"]["learning_qualified"]
-    assert sensor._pilot.manager.model.history == []
+    assert sensor._pilot is None or sensor._pilot.manager.model.history == []
 
 
-def test_automatic_collects_indication_but_never_qualifies_pilot_without_heat_label(
+def test_offline_automatic_collects_indication_but_never_qualifies_pilot_without_heat_label(
     monkeypatch,
 ):
     from datetime import datetime, timedelta, timezone
@@ -897,6 +890,9 @@ def test_automatic_collects_indication_but_never_qualifies_pilot_without_heat_la
         )
 
     attrs = _cycle(sensor, monkeypatch, 0)
+    # Explicit offline algorithm invocation; the live cycle does not collect.
+    sensor._observe_pilot(sensor._cfg(), start, attrs["mode"])
+    attrs = sensor.extra_state_attributes
     detail = attrs["thermal_intelligence_operation_detail"]
     assert detail["mode"] == "indicated_radiator_heating"
     assert detail["evidence_level"] == "operating_indication"
@@ -904,7 +900,7 @@ def test_automatic_collects_indication_but_never_qualifies_pilot_without_heat_la
     assert not detail["learning_qualified"]
     assert calls == ["indicated_radiator_heating"]
     assert sensor._pilot is not None
-    assert sensor._pilot.manager.model.history == []
+    assert sensor._pilot is None or sensor._pilot.manager.model.history == []
 
     assert sensor._pilot.validated_house(start.timestamp()) is None
 
@@ -912,16 +908,20 @@ def test_automatic_collects_indication_but_never_qualifies_pilot_without_heat_la
     states["binary_sensor.water"].last_reported = start + timedelta(minutes=1)
     states["binary_sensor.water"].last_changed = start + timedelta(minutes=1)
     attrs = _cycle(sensor, monkeypatch, 1)
+    sensor._observe_pilot(sensor._cfg(), start + timedelta(minutes=1), attrs["mode"])
+    attrs = sensor.extra_state_attributes
     detail = attrs["thermal_intelligence_operation_detail"]
     assert detail["mode"] == "unknown"
     assert "hot_water" not in detail["signals"]
     assert not detail["learning_qualified"]
     assert calls[-1] == "unknown"
     assert sensor._pilot._observation_evidence == "unknown_heating_mode"
-    assert sensor._pilot.manager.model.history == []
+    assert sensor._pilot is None or sensor._pilot.manager.model.history == []
 
 
-def test_automatic_collects_temperature_interval_with_stale_operation(monkeypatch):
+def test_offline_automatic_collects_temperature_interval_with_stale_operation(
+    monkeypatch,
+):
     from datetime import datetime, timedelta, timezone
 
     sensor, states = _sensor()
@@ -945,12 +945,16 @@ def test_automatic_collects_temperature_interval_with_stale_operation(monkeypatc
     for minute in range(61):
         states["sensor.indoor"].state = str(20.5 + minute / 600)
         attrs = _cycle(sensor, monkeypatch, minute)
+        sensor._observe_pilot(
+            sensor._cfg(), start + timedelta(minutes=minute), attrs["mode"]
+        )
+        attrs = sensor.extra_state_attributes
     detail = attrs["thermal_intelligence_operation_detail"]
     assert detail["indicated_observation_intervals"] >= 1
     assert (
         detail["latest_indicated_interval"]["evidence_level"] == "unknown_heating_mode"
     )
-    assert sensor._pilot.manager.model.history == []
+    assert sensor._pilot is None or sensor._pilot.manager.model.history == []
     assert sensor._pilot.validated_house(start.timestamp() + 3600) is None
 
 
@@ -997,7 +1001,7 @@ def test_options_offer_supply_mode_and_threshold(monkeypatch):
     )
 
 
-def test_new_paired_bad_forecast_invalidates_cached_plan(monkeypatch):
+def test_live_cycle_discards_legacy_plan_without_consuming_legacy_audit(monkeypatch):
     from datetime import datetime, timedelta, timezone
 
     sensor, states = _sensor()
@@ -1034,10 +1038,14 @@ def test_new_paired_bad_forecast_invalidates_cached_plan(monkeypatch):
         states["binary_sensor.house_heat"].last_reported = at
         attrs = _cycle(sensor, monkeypatch, minute)
     assert attrs["thermal_intelligence_planning_status"] != "validated_passive"
-    assert attrs["thermal_intelligence_forecast_quality"]["status"] == "degraded"
+    assert audit.summary("r")["status"] == "insufficient_outcomes"
+    assert len(audit.records) == 4
+    assert (
+        attrs["thermal_intelligence_plan_detail"]["reason"] == "shared_evidence_chain"
+    )
 
 
-def test_degraded_model_keeps_monitoring_actual_outcomes_without_exposing_plan(
+def test_offline_quality_recovery_cannot_reactivate_retired_live_planner(
     monkeypatch,
 ):
     from datetime import datetime, timedelta, timezone
@@ -1142,14 +1150,16 @@ def test_degraded_model_keeps_monitoring_actual_outcomes_without_exposing_plan(
         "binary_sensor.heat",
         False,
     )
-    monkeypatch.setattr(sensor, "_observe_pilot", lambda *args: None)
+    monkeypatch.setattr(sensor, "_observe_pilot", lambda *args, **kwargs: None)
     attrs = _cycle(sensor, monkeypatch, 0)
     assert attrs["thermal_intelligence_planning_status"] == "unavailable"
     assert (
-        attrs["thermal_intelligence_plan_detail"]["reason"]
-        == "forecast_quality_degraded"
+        attrs["thermal_intelligence_plan_detail"]["reason"] == "shared_evidence_chain"
     )
-    assert audit.pending is not None
+    assert audit.pending is None
+    assert audit.issue(
+        start, 20.5, 5, 1, 0.02, 0.4, 0.1, revision, source_identity=(None, None)
+    )
     assert audit.pending["revision"] == revision
     for minute in (5, 10, 15):
         at = start + timedelta(minutes=minute)
@@ -1186,7 +1196,18 @@ def test_degraded_model_keeps_monitoring_actual_outcomes_without_exposing_plan(
         attrs = _cycle(sensor, monkeypatch, 30 * index)
         if before == "degraded":
             assert attrs["thermal_intelligence_planning_status"] == "unavailable"
-        assert audit.pending is not None
+        assert audit.pending is None
+        assert audit.issue(
+            issued,
+            indoor_value,
+            5,
+            1,
+            0.02,
+            0.4,
+            0.1,
+            revision,
+            source_identity=(None, None),
+        )
         predicted = audit.pending["forecast"]
         for minute in (5, 10, 15):
             observed = issued + timedelta(minutes=minute)
@@ -1214,7 +1235,10 @@ def test_degraded_model_keeps_monitoring_actual_outcomes_without_exposing_plan(
     sensor._pilot.manager.recent = [(issued.timestamp(), 0.5, 1.0)]
     sensor._pilot_plan_next = None
     attrs = _cycle(sensor, monkeypatch, 240)
-    assert attrs["thermal_intelligence_planning_status"] == "validated_passive"
+    assert attrs["thermal_intelligence_planning_status"] == "unavailable"
+    assert (
+        attrs["thermal_intelligence_plan_detail"]["reason"] == "shared_evidence_chain"
+    )
 
 
 def test_power_telemetry_uses_bounded_event_subscription_and_no_new_entity(monkeypatch):
@@ -1507,7 +1531,7 @@ def test_hot_water_mode_blocks_ambiguous_learning_then_recovers(monkeypatch, hea
     attrs = _cycle(sensor, monkeypatch, 0)
     assert attrs["thermal_intelligence_status"] == "hot_water_active"
     assert attrs["thermal_intelligence_reason"] == "hot_water_active"
-    assert sensor._pilot.manager.house.start is None
+    assert sensor._pilot is None or sensor._pilot.manager.house.start is None
     at = start + timedelta(minutes=1)
     states["binary_sensor.hot_water"].state = "unavailable"
     states["binary_sensor.hot_water"].last_reported = at
@@ -1515,7 +1539,7 @@ def test_hot_water_mode_blocks_ambiguous_learning_then_recovers(monkeypatch, hea
     attrs = _cycle(sensor, monkeypatch, 1)
     assert attrs["thermal_intelligence_status"] == "hot_water_mode_unavailable"
     assert attrs["thermal_intelligence_reason"] == "hot_water_mode_unavailable"
-    assert sensor._pilot.manager.house.start is None
+    assert sensor._pilot is None or sensor._pilot.manager.house.start is None
     states["binary_sensor.hot_water"].state = "off"
     states["binary_sensor.hot_water"].last_changed = start + timedelta(minutes=2)
     for minute in range(2, 8):
@@ -1533,7 +1557,7 @@ def test_hot_water_mode_blocks_ambiguous_learning_then_recovers(monkeypatch, hea
         "hot_water_mode_unavailable",
         "learning_error",
     )
-    assert sensor._pilot.manager.house.start is not None
+    assert sensor._pilot is None or sensor._pilot.manager.house.start is None
 
 
 def test_hot_water_roundtrip_between_cycles_breaks_learning_interval(monkeypatch):
@@ -1557,15 +1581,15 @@ def test_hot_water_roundtrip_between_cycles_breaks_learning_interval(monkeypatch
     )
     _cycle(sensor, monkeypatch, 0)
     pilot = sensor._pilot
-    assert pilot.manager.house.start is not None
+    assert pilot.manager.house.start is None
     pilot.validation_after = start.timestamp() - 100
     changed = start + timedelta(seconds=45)
     states["binary_sensor.hot_water"].last_changed = changed
     states["binary_sensor.hot_water"].last_reported = changed
     states["binary_sensor.heat"].last_reported = start + timedelta(minutes=1)
     _cycle(sensor, monkeypatch, 1)
-    assert pilot.validation_after == (start + timedelta(minutes=1)).timestamp()
-    assert pilot.manager.house.start == (start + timedelta(minutes=1)).timestamp()
+    assert pilot.validation_after is None
+    assert pilot.manager.house.start is None
 
 
 def test_grid_marginal_is_passive_unrecorded_and_cleared_on_disable_or_safe():
@@ -1601,7 +1625,7 @@ def test_grid_marginal_is_passive_unrecorded_and_cleared_on_disable_or_safe():
     assert "thermal_intelligence_grid_marginal" not in sensor.extra_state_attributes
 
 
-def test_price_change_during_learning_invalidates_grid_forecast(monkeypatch):
+def test_live_diagnostics_never_run_retired_fit_that_mutates_price(monkeypatch):
     from datetime import UTC, datetime
 
     from custom_components.pumpsteer import sensor as sensor_module
@@ -1625,13 +1649,14 @@ def test_price_change_during_learning_invalidates_grid_forecast(monkeypatch):
     pilot = Pilot()
     sensor._pilot = pilot
     sensor._pilot_grid_marginal = {"status": "available_conditional_grid_import"}
-    monkeypatch.setattr(sensor, "_observe_pilot", lambda *args: object())
+    monkeypatch.setattr(sensor, "_observe_pilot", lambda *args, **kwargs: object())
     monkeypatch.setattr(sensor_module.dt_util, "now", lambda: at)
     for key in ("sensor.indoor", "sensor.outdoor"):
         states[key].last_reported = at
     asyncio.run(sensor._do_update())
-    assert pilot.reset
-    assert sensor._pilot_grid_marginal["status"] == "unavailable"
+    assert not pilot.reset
+    assert "changed_during_fit" not in states["sensor.price"].attributes
+    assert sensor._pilot_plan["reason"] == "shared_evidence_chain"
 
 
 def test_energy_meter_subscription_tracks_asynchronous_reports_and_restarts_on_options_change(
@@ -2014,7 +2039,7 @@ def test_status_sensor_translations_survive_upstream_integration():
         assert "outdoor_temperature" in sensor
 
 
-def test_weighted_temperature_used_by_pilot_and_source_loss_resets_interval(
+def test_shared_chain_uses_control_weighted_temperature_and_resets_on_source_loss(
     monkeypatch,
 ):
     from datetime import datetime, timedelta, timezone
@@ -2048,14 +2073,15 @@ def test_weighted_temperature_used_by_pilot_and_source_loss_resets_interval(
     )
     attrs = _cycle(sensor, monkeypatch, 0)
     assert attrs["indoor_temperature"] == pytest.approx(22.0)
-    assert captured[-1] == (22.0, 5.0)
-    previous = sensor._pilot
-    assert previous is not None
+    assert captured == []
+    runtime = sensor._thermal_intelligence
+    assert runtime.latest_observation["indoor_c"] == 22.0
+    previous_model = runtime.model
     states["sensor.room2"].state = "unavailable"
     attrs = _cycle(sensor, monkeypatch, 1)
     assert attrs["indoor_temperature"] == 20.5
     assert attrs["temperature_sources"]["indoor_coverage"] == "reduced"
-    assert captured[-1] == (20.5, 5.0)
-    assert sensor._pilot is not previous
-    assert previous.indicated_house.last is None
-    assert sensor._pilot.manager.model.history == []
+    assert captured == []
+    assert runtime.latest_observation["indoor_c"] == 20.5
+    assert runtime.model is not previous_model
+    assert sensor._pilot is None or sensor._pilot.manager.model.history == []

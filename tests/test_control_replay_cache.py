@@ -1,4 +1,7 @@
-"""Actual HA control cycles invalidate stale passive replay contexts."""
+"""Offline legacy replay cache follows actual control state; live planner is retired."""
+
+import asyncio
+import copy
 
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -97,6 +100,29 @@ def _ready_sensor(monkeypatch):
     return sensor, states, calls
 
 
+def _offline_reference_cycle(sensor, monkeypatch, minute):
+    """Explicitly exercise retained replay code after the real control cycle.
+
+    Production must never run this optimizer. Preserve the offline cache across
+    actual controller updates, then invoke its diagnostic API deliberately.
+    """
+    previous = copy.deepcopy(sensor._pilot_plan)
+    live = _cycle(sensor, monkeypatch, minute)
+    assert live["thermal_intelligence_planning_status"] == "unavailable"
+    if live["mode"] != "safe_mode":
+        assert live["thermal_intelligence_plan_detail"]["reason"] == "shared_evidence_chain"
+    sensor._pilot_plan = previous
+    if live.get("indoor_temperature") is None:
+        sensor._pilot_plan = sensor._unavailable_pilot_plan("safe_mode")
+    else:
+        asyncio.run(sensor._plan_pilot(sensor._cfg(), START + timedelta(minutes=minute),
+                                      live, sensor.state))
+    result = dict(live)
+    result["thermal_intelligence_plan_detail"] = copy.deepcopy(sensor._pilot_plan)
+    result["thermal_intelligence_planning_status"] = sensor._pilot_plan["planning_status"]
+    return result
+
+
 @pytest.mark.parametrize(
     ("entity", "value"),
     [
@@ -126,7 +152,7 @@ def test_real_cycle_invalidates_cached_reference_on_control_context_change(
 
     def cycle(minute):
         _cycle(reference, monkeypatch, minute)
-        result = _cycle(sensor, monkeypatch, minute)
+        result = _offline_reference_cycle(sensor, monkeypatch, minute)
         assert sensor.state == reference.state
         assert pushed == reference_pushed
         return result
@@ -195,7 +221,7 @@ def test_real_cycle_invalidates_cached_reference_on_control_context_change(
 def test_saturated_pi_integral_change_invalidates_cached_reference(monkeypatch):
     sensor, _, calls = _ready_sensor(monkeypatch)
     sensor._config_entry.options.update(pid_ki=0.1, pid_output_clamp=0.2)
-    initial = _cycle(sensor, monkeypatch, 0)
+    initial = _offline_reference_cycle(sensor, monkeypatch, 0)
     assert initial["thermal_intelligence_plan_detail"]["comparison"]["baseline"] == (
         "shared_control_passive"
     )
@@ -203,7 +229,7 @@ def test_saturated_pi_integral_change_invalidates_cached_reference(monkeypatch):
     integral = sensor._pi._integral
     assert len(calls) == 1
 
-    next_cycle = _cycle(sensor, monkeypatch, 1)
+    next_cycle = _offline_reference_cycle(sensor, monkeypatch, 1)
     assert (
         sensor.state == output
     )  # The saturated PI output did not reveal its changed state.
@@ -217,7 +243,7 @@ def test_saturated_pi_integral_change_invalidates_cached_reference(monkeypatch):
 def test_changed_brake_ramp_invalidates_reference_even_when_output_matches(monkeypatch):
     sensor, _, calls = _ready_sensor(monkeypatch)
     sensor._config_entry.options.update(target_temperature=20.0, pid_kp=20, pid_ki=0)
-    initial = _cycle(sensor, monkeypatch, 0)
+    initial = _offline_reference_cycle(sensor, monkeypatch, 0)
     assert initial["thermal_intelligence_plan_detail"]["comparison"]["baseline"] == (
         "shared_control_passive"
     )
@@ -226,7 +252,7 @@ def test_changed_brake_ramp_invalidates_reference_even_when_output_matches(monke
     # therefore hidden by the output but matters to subsequent replay steps.
     sensor._brake_ramp = 0.5
     sensor._brake_last_t = START
-    next_cycle = _cycle(sensor, monkeypatch, 1)
+    next_cycle = _offline_reference_cycle(sensor, monkeypatch, 1)
     assert sensor.state == output == 15.0
     assert sensor._brake_ramp > 0
     comparison = next_cycle["thermal_intelligence_plan_detail"]["comparison"]
@@ -240,12 +266,12 @@ def test_interruption_preserves_reference_as_historical_not_current(
     monkeypatch, failure
 ):
     sensor, states, calls = _ready_sensor(monkeypatch)
-    initial = _cycle(sensor, monkeypatch, 0)["thermal_intelligence_plan_detail"]
+    initial = _offline_reference_cycle(sensor, monkeypatch, 0)["thermal_intelligence_plan_detail"]
     assert initial["comparison"]["baseline"] == "shared_control_passive"
     states[
         "weather.local" if failure == "weather" else "sensor.indoor"
     ].state = "unavailable"
-    result = _cycle(sensor, monkeypatch, 1)["thermal_intelligence_plan_detail"]
+    result = _offline_reference_cycle(sensor, monkeypatch, 1)["thermal_intelligence_plan_detail"]
     assert result["planning_status"] == "unavailable"
     comparison = result["comparison"]
     assert comparison["baseline"] == "unavailable"
@@ -263,7 +289,7 @@ def test_options_change_preserves_reference_only_as_historical(monkeypatch):
     import asyncio
 
     sensor, _, calls = _ready_sensor(monkeypatch)
-    initial = _cycle(sensor, monkeypatch, 0)["thermal_intelligence_plan_detail"]
+    initial = _offline_reference_cycle(sensor, monkeypatch, 0)["thermal_intelligence_plan_detail"]
 
     async def no_update(*args):
         pass
@@ -287,10 +313,10 @@ def test_price_threshold_change_invalidates_current_plan_even_if_prices_unchange
     monkeypatch,
 ):
     sensor, _, calls = _ready_sensor(monkeypatch)
-    initial = _cycle(sensor, monkeypatch, 0)["thermal_intelligence_plan_detail"]
+    initial = _offline_reference_cycle(sensor, monkeypatch, 0)["thermal_intelligence_plan_detail"]
     assert initial["comparison"]["baseline"] == "shared_control_passive"
     sensor._cached_p30 -= 0.5
-    result = _cycle(sensor, monkeypatch, 1)["thermal_intelligence_plan_detail"]
+    result = _offline_reference_cycle(sensor, monkeypatch, 1)["thermal_intelligence_plan_detail"]
     assert result["planning_status"] == "unavailable"
     assert result["reason"] == "context_changed_waiting_for_replan"
     assert (
@@ -302,9 +328,9 @@ def test_price_threshold_change_invalidates_current_plan_even_if_prices_unchange
 
 def test_pilot_plan_without_pi_reference_is_also_kept_as_history(monkeypatch):
     sensor, _, _ = _ready_sensor(monkeypatch)
-    initial = _cycle(sensor, monkeypatch, 0)["thermal_intelligence_plan_detail"]
+    initial = _offline_reference_cycle(sensor, monkeypatch, 0)["thermal_intelligence_plan_detail"]
     sensor._pilot_plan["comparison"]["baseline"] = "unavailable"
-    result = _cycle(sensor, monkeypatch, 1)["thermal_intelligence_plan_detail"]
+    result = _offline_reference_cycle(sensor, monkeypatch, 1)["thermal_intelligence_plan_detail"]
     assert result["planning_status"] == "unavailable"
     historical = result["comparison"]["historical_reference"]
     assert historical["status"] == "historical"

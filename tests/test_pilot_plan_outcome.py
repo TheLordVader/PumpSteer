@@ -240,7 +240,9 @@ def test_source_change_at_same_temperature_during_forecast_does_not_issue_audit(
     monkeypatch.setattr(forecast, "async_build_forecast", changed_source)
     _cycle(sensor, monkeypatch, 0)
     assert not sensor._plan_audit.plan_pending
-    assert sensor._pilot_plan["plan_outcome_reason"] == "source_changed_during_cycle"
+    assert sensor._plan_audit.fixed_pending is None
+    assert sensor._pilot_plan["planning_status"] == "unavailable"
+    assert not sensor._thermal_intelligence._observations
 
 
 def test_shared_report_scores_each_issued_plan_horizon_once_and_survives_restore():
@@ -438,7 +440,7 @@ def test_outdoor_entity_change_cancels_even_without_selected_source_attribute():
     assert sensor._plan_audit.plan_summary()["unverifiable"] == 3
 
 
-def test_basic_ha_chain_scores_issued_plan_and_keeps_it_after_history(monkeypatch):
+def test_basic_ha_chain_scores_shared_persistence_and_keeps_completed_pairs(monkeypatch):
     from custom_components.pumpsteer import forecast
     from test_brake_provenance import _cycle, _sensor
 
@@ -498,30 +500,31 @@ def test_basic_ha_chain_scores_issued_plan_and_keeps_it_after_history(monkeypatc
     sensor._pilot_store = MemoryStore()
     attrs = _cycle(sensor, monkeypatch, 0)
     assert sensor._pilot is None
-    assert attrs["thermal_intelligence_planning_status"] == "hypothetical_unvalidated"
-    assert sensor._plan_audit.plan_pending
-    issued_context = dict(attrs["thermal_intelligence_plan_detail"]["initial_context"])
-    assert sensor._pilot_store.payload["plan_audit"]["pending_count"] > 0
+    assert attrs["thermal_intelligence_planning_status"] == "unavailable"
+    assert sensor._pilot_plan["reason"] == "shared_evidence_chain"
+    assert not sensor._plan_audit.plan_pending
+    assert sensor._plan_audit.fixed_pending["curves"] == [{"name": "persistence", "rate": 0.0}]
     for minute in range(1, 31):
+        if minute == 30:
+            states["sensor.indoor"].state = "20.2"
         attrs = _cycle(sensor, monkeypatch, minute)
-    assert sensor._plan_audit.plan_records
-    assert sensor._plan_audit.plan_records[0]["horizon_minutes"] == 30
-    assert (
-        sensor._plan_audit.plan_records[0]["initial_context"]["target_temperature"]
-        == issued_context["target_temperature"]
-    )
-    assert sensor._pilot_store.payload["plan_audit"]["records"]
-    assert (
-        attrs["thermal_intelligence_plan_outcomes"]["kind"]
-        == "unexecuted_scenario_residual"
-    )
+    assert not sensor._plan_audit.plan_records
+    records = sensor._plan_audit.fixed_records
+    assert len(records) == 1
+    assert records[0]["horizon"] == 30
+    assert records[0]["model_order"] == ["persistence"]
+    assert records[0]["actual"] == 20.2
+    assert records[0]["physical_measurement_time"] == "unknown"
+    assert sensor._pilot_store.payload["plan_audit"]["fixed_v2"]
     restored = ForecastAudit()
     restored.restore_plan(
         sensor._pilot_store.payload["plan_audit"],
         START + timedelta(minutes=31),
     )
-    assert restored.plan_records
+    assert restored.fixed_records == records
+    assert restored.fixed_pending is None
     assert not restored.plan_pending
+
 
 
 @pytest.mark.parametrize("failure", ["audit", "storage"])

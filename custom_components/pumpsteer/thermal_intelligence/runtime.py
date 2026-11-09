@@ -3,21 +3,18 @@
 from __future__ import annotations
 
 import math
+from copy import deepcopy
 from collections import deque
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from .rtm_core import ModelConfig, RCThermalModel, Sample, ThermalParameters
+from .rtm_core import ModelConfig, RCThermalModel, Sample
 from .rtm_core.quality import step_temperature
 
-_STATE_VERSION = 1
+_STATE_VERSION = 2
 _MAX_RECORDS = 2048
 _MAX_GAP_MINUTES = 60.0
 _OUTDOOR_MAX_AGE = timedelta(hours=3)
-_AUDIT_HORIZON = timedelta(hours=1)
-_OUTDOOR_DRIFT_TOLERANCE_C = 3.0
-_FORECAST_MIN_MINUTES = 45.0
-_FORECAST_MAX_MINUTES = 75.0
 
 
 def _number(value: Any) -> float | None:
@@ -79,62 +76,96 @@ def classify_regime(mode: str | None, brake_factor: float | None) -> str:
 
 
 class ThermalIntelligence:
-    """Bounded, restart-safe passive data path; never controls PumpSteer outputs."""
+    """One bounded evidence chain; model inputs are empirical service requests."""
 
     def __init__(self) -> None:
-        self.model = RCThermalModel(
-            ModelConfig(
-                step_minutes=15.0,
-                half_life_days=21.0,
-                max_dead_time_minutes=180.0,
-                max_gap_minutes=_MAX_GAP_MINUTES,
-                max_step_delta_k=1.5,
-                history_days=30.0,
-                outdoor_max_gap_minutes=180.0,
-            )
-        )
+        self.model = RCThermalModel(ModelConfig(
+            step_minutes=15.0, half_life_days=21.0,
+            max_dead_time_minutes=180.0, max_gap_minutes=_MAX_GAP_MINUTES,
+            max_step_delta_k=1.5, history_days=30.0,
+            outdoor_max_gap_minutes=180.0,
+        ))
+        self._events: deque[dict[str, Any]] = deque(maxlen=_MAX_RECORDS)
+        self._sequence = 0
         self._source_signature: tuple = ()
-        self._source_values: dict[str, tuple[float, datetime]] = {}
+        self._source_values: dict[str, tuple[float, datetime | None]] = {}
+        self._captured_values: dict[str, tuple] = {}
+        self._observation_values: dict[str, float] = {}
+        self._latest_observation: dict[str, Any] | None = None
+        self._context_signature: tuple = ()
         self._last_command: dict[str, Any] | None = None
+        self._last_command_sample_at: datetime | None = None
         self._active_cycle: dict[str, Any] | None = None
-        self._pending_forecast: dict[str, Any] | None = None
-        self._last_forecast_at: datetime | None = None
-        self._observations: deque[dict[str, Any]] = deque(maxlen=_MAX_RECORDS)
-        self._outputs: deque[dict[str, Any]] = deque(maxlen=_MAX_RECORDS)
-        self._scores: deque[dict[str, Any]] = deque(maxlen=96)
-        self._interruptions: deque[dict[str, Any]] = deque(maxlen=96)
+        self._last_output_signature: dict[str, tuple] = {}
         self._last_interruption: str | None = None
+        self._last_interruption_event: dict[str, Any] | None = None
         self._status = "collecting"
         self._samples = 0
         self._last_training_at: datetime | None = None
-        self._braking_episode_active = False
-        self._braking_episode_forecasted = False
-        self._fit_generation: int = 0
-        self._fit_in_progress: bool = False
+        self._fit_generation = 0
+        self._fit_in_progress = False
         self._fit_summary: dict[str, Any] = {}
+        self._segment = 0
+        self._outdoor_sample_segment: int | None = None
+        self._last_cycle_at: datetime | None = None
+
+    @property
+    def _observations(self) -> list[dict[str, Any]]:
+        return [row for row in self._events if row["kind"] == "observation"]
+
+    @property
+    def _outputs(self) -> list[dict[str, Any]]:
+        return [row for row in self._events if row["kind"] == "output"]
+
+    @property
+    def _interruptions(self) -> list[dict[str, Any]]:
+        return [row for row in self._events if row["kind"] == "interruption"]
+
+    @property
+    def latest_observation(self) -> dict[str, Any] | None:
+        return dict(self._latest_observation) if self._latest_observation else None
+
+    @property
+    def context_id(self) -> int:
+        return self._segment
+
+    @property
+    def current_command(self) -> dict[str, Any] | None:
+        return dict(self._last_command) if self._last_command else None
 
     @property
     def status(self) -> str:
         if self._status == "candidate_insufficient_excitation":
-            return "candidate_insufficient_excitation"
-        if self.model.parameters() is None:
             return self._status
-        return "candidate_unvalidated"
+        return "candidate_unvalidated" if self.model.parameters() else self._status
 
     @property
     def store_signature(self) -> tuple:
-        return (
-            self._observations[-1].get("at") if self._observations else None,
-            self._outputs[-1].get("at") if self._outputs else None,
-            self._scores[-1].get("observed") if self._scores else None,
-            len(self._observations),
-            len(self._outputs),
-            self._samples,
-            self._status,
-            self._fit_generation,
-            self._interruptions[-1].get("at") if self._interruptions else None,
-            len(self._interruptions),
-        )
+        return (self._sequence, self._fit_generation, self._status, self._samples)
+
+    @property
+    def has_evidence(self) -> bool:
+        return bool(self._events)
+
+    def _append(self, kind: str, at: datetime, **values: Any) -> dict[str, Any]:
+        # Wall clock may move backwards; chain order follows capture order, while
+        # source timestamps retain their independent, validated provenance.
+        previous = _timestamp(self._events[-1]["at"]) if self._events else None
+        captured = max(at, previous) if previous else at
+        self._sequence += 1
+        row = dict(values, kind=kind, at=captured.isoformat(),
+                   sequence=self._sequence, segment=self._segment)
+        if captured != at:
+            row["reported_capture_at"] = at.isoformat()
+        self._events.append(row)
+        cutoff = captured - timedelta(days=self.model.config.history_days)
+        while self._events and _timestamp(self._events[0]["at"]) < cutoff:
+            self._events.popleft()
+        if kind == "observation":
+            self._latest_observation = row
+        elif kind == "interruption":
+            self._last_interruption_event = row
+        return row
 
     def fit_due(self, now: datetime) -> bool:
         """True when a refit is worthwhile and no fit is currently in progress."""
@@ -147,6 +178,8 @@ class ThermalIntelligence:
         if not self.fit_due(now):
             return None
         self._fit_generation += 1
+        if hasattr(self.model, "record_fit_attempt"):
+            self.model.record_fit_attempt(self.model._grid, now.timestamp())
         self._fit_in_progress = True
         token = self._fit_generation
         snapshot_data = {
@@ -206,375 +239,188 @@ class ThermalIntelligence:
         self.apply_fit_result(token, result)
         return result
 
-    @property
-    def has_evidence(self) -> bool:
-        return bool(
-            self._observations or self._outputs or self._scores or self._interruptions
-        )
+    def _boundary(self, at: datetime) -> None:
+        self._segment += 1
+        if hasattr(self.model, "break_segment"):
+            self.model.break_segment(at)
+        else:
+            self.model._pending.clear()
+            self.model.add_sample(Sample(at, None, None, None, excluded=True))
+        self._fit_generation += 1
+        self._fit_in_progress = False
 
     def begin_cycle(self, cycle: dict[str, Any], *, use_ohmigo_input: bool) -> None:
-        """Record one decision context and add only value-advancing observations."""
+        """Capture source changes even without a usable model or output transport."""
         self._active_cycle = None
         at = _timestamp(cycle.get("at"))
+        if at is None:
+            return
+        if self._last_cycle_at is not None and not timedelta(0) <= at - self._last_cycle_at <= timedelta(minutes=_MAX_GAP_MINUTES):
+            self.suspend("capture_gap_or_clock_rollback", at)
+        self._last_cycle_at = at
+        sources = cycle.get("sources")
+        sources = [row for row in sources if isinstance(row, dict)] if isinstance(sources, list) else []
+        signature = (tuple(sorted((row["entity"], _number(row.get("weight")))
+                     for row in sources if isinstance(row.get("entity"), str))),
+                     cycle.get("outdoor_source"), cycle.get("command_source"))
+        regime = classify_regime(cycle.get("mode"), _number(cycle.get("brake_factor")))
+        context = (signature, cycle.get("mode"), regime, cycle.get("gos_active"), use_ohmigo_input)
+        if context != self._context_signature:
+            if self._context_signature:
+                self._last_interruption = None
+                self._interrupt("context_changed", at)
+                self._last_command = None
+            self._context_signature = context
+            self._append("context", at, mode=cycle.get("mode"), regime=regime,
+                         sources=[list(row) for row in signature[0]],
+                         outdoor_source=signature[1], command_source=signature[2],
+                         gos_active=cycle.get("gos_active"),
+                         use_ohmigo_input=use_ohmigo_input)
+        if self._source_signature and signature != self._source_signature:
+            self._source_values.clear()
+            self._captured_values.clear()
+            self._observation_values.clear()
+            self.model = RCThermalModel(self.model.config)
+            self._fit_summary.clear()
+            self._last_training_at = None
+        self._source_signature = signature
+        eligible = regime in {"normal_pi", "braking_stable", "preheating"} and not cycle.get("gos_active")
         indoor = _number(cycle.get("indoor"))
         outdoor = _number(cycle.get("outdoor"))
-        outdoor_at = _timestamp(cycle.get("outdoor_reported_at"))
-        sources = cycle.get("sources")
-        mode = cycle.get("mode")
-        indoor_signature = (
-            tuple(
-                sorted(
-                    (
-                        row.get("entity"),
-                        _number(row.get("weight")),
-                    )
-                    for row in sources
-                    if isinstance(row, dict) and isinstance(row.get("entity"), str)
-                )
-            )
-            if isinstance(sources, list)
-            else ()
-        )
-        source_signature = (
-            indoor_signature,
-            cycle.get("outdoor_source"),
-            cycle.get("command_source"),
-        )
-        stable_braking = (
-            mode == "braking" and (_number(cycle.get("brake_factor")) or 0.0) >= 0.98
-        )
-        if not stable_braking or not self._braking_episode_active:
-            self._braking_episode_forecasted = False
-        self._braking_episode_active = stable_braking
-
-        if (
-            source_signature
-            and self._source_signature
-            and source_signature != self._source_signature
-        ):
-            self._interrupt("source_or_transport_changed", at)
-            self.model = RCThermalModel(self.model.config)
-            self._source_values.clear()
-            self._last_command = None
-            self._samples = 0
-            self._last_training_at = None
-            self._last_forecast_at = None
-            self._fit_generation += 1
-            self._fit_in_progress = False
-            self._fit_summary.clear()
-            self._status = "collecting"
-        if source_signature:
-            self._source_signature = source_signature
-
-        pending = self._pending_forecast
-        if pending is not None:
-            context_changed = (
-                tuple(pending["identity"]) != self._source_signature
-                or mode != pending["mode"]
-                or abs(
-                    (_number(cycle.get("brake_factor")) or 0.0)
-                    - (_number(pending.get("brake_factor")) or 0.0)
-                )
-                > 0.05
-            )
-            outdoor_drift = (
-                _number(cycle.get("outdoor")) is not None
-                and abs(_number(cycle.get("outdoor")) - pending["outdoor"])
-                > _OUTDOOR_DRIFT_TOLERANCE_C
-            )
-            if context_changed:
-                self._interrupt("forecast_context_changed", at)
-            elif outdoor_drift:
-                self._interrupt("forecast_weather_drift_exceeded", at)
-
-        changed = False
         source_rows = []
-        source_values = {}
-        if isinstance(sources, list):
-            for row in sources:
-                if not isinstance(row, dict) or not isinstance(row.get("entity"), str):
-                    continue
-                value = _number(row.get("value"))
-                reported = _timestamp(row.get("reported_at"))
-                entity = row["entity"]
-                previous = self._source_values.get(entity)
-                advanced = bool(
-                    value is not None
-                    and reported is not None
-                    and (previous is None or reported > previous[1])
-                    and (previous is None or value != previous[0])
-                )
-                if value is not None and reported is not None:
-                    source_values[entity] = (value, reported)
-                changed = changed or advanced
-                source_rows.append(
-                    {
-                        "entity": entity,
-                        "weight": _number(row.get("weight")),
-                        "value": value,
-                        "reported_at": reported.isoformat() if reported else None,
-                        "value_advanced": advanced,
-                    }
-                )
-
-        if at is None or indoor is None or outdoor is None:
-            self._interrupt("required_temperature_missing", at)
+        changed = False
+        for raw in sources + [{"entity": cycle.get("outdoor_source") or "outdoor",
+                               "value": outdoor,
+                               "reported_at": cycle.get("outdoor_reported_at"),
+                               "physical_time_known": cycle.get("outdoor_physical_time_known", False),
+                               "role": "outdoor"}]:
+            entity = raw.get("entity")
+            if not isinstance(entity, str):
+                continue
+            role = raw.get("role", "indoor")
+            key = role + ":" + entity
+            value = _number(raw.get("value"))
+            reported = _timestamp(raw.get("reported_at"))
+            previous = self._source_values.get(key)
+            age_limit = _OUTDOOR_MAX_AGE if role == "outdoor" else timedelta(minutes=_MAX_GAP_MINUTES)
+            valid_time = reported is not None and timedelta(0) <= at - reported <= age_limit
+            advanced = value is not None and (previous is None or value != previous[0])
+            ordered = previous is None or previous[1] is None or (reported is not None and (reported > previous[1] or (reported == previous[1] and not advanced)))
+            accepted = advanced and ordered
+            row = dict(entity=entity, weight=_number(raw.get("weight")), value=value,
+                       reported_at=reported.isoformat() if reported else None,
+                       physical_time_known=raw.get("physical_time_known") is True and valid_time,
+                       timestamp_valid=valid_time and ordered, value_advanced=accepted,
+                       physical_time_status="known" if raw.get("physical_time_known") is True and valid_time else "physical_time_unknown")
+            captured = (value, valid_time, ordered)
+            if advanced and self._captured_values.get(key) != captured:
+                self._captured_values[key] = captured
+                self._append("temperature", at, role=role, **row,
+                             quality="valid_report_time" if valid_time and ordered else "invalid_or_unknown_report_time")
+            # Invalid times never consume an otherwise usable future observation.
+            if accepted and valid_time:
+                self._source_values[key] = (value, reported)
+            if role == "outdoor" and eligible and value is not None and valid_time and ordered:
+                if self._outdoor_sample_segment != self._segment:
+                    # Restore held context after a boundary, without asserting a
+                    # new weather observation or extending its source age limit.
+                    self.model.add_sample(Sample(at, None, value, None))
+                    self._outdoor_sample_segment = self._segment
+                elif accepted:
+                    self.model.add_sample(Sample(reported, None, value, None))
+            if role == "indoor":
+                source_rows.append(row)
+                changed |= valid_time and ordered and value is not None and self._observation_values.get(entity) != value
+        self._active_cycle = dict(cycle, regime=regime, use_ohmigo_input=use_ohmigo_input)
+        if indoor is None or outdoor is None or not source_rows or any(
+            row["value"] is None or not row["timestamp_valid"] for row in source_rows
+        ):
+            self._interrupt("required_temperature_missing_or_stale", at)
             self._status = "waiting_for_temperatures"
             return
-
-        # Every contributor must satisfy the existing capture age limit; the
-        # newest aggregate report cannot certify older or future components.
-        if not source_rows or any(
-            row["value"] is None
-            or _timestamp(row["reported_at"]) is None
-            or not timedelta(0) <= at - _timestamp(row["reported_at"])
-            <= timedelta(minutes=_MAX_GAP_MINUTES)
-            for row in source_rows
-        ):
-            self._interrupt("indoor_component_unavailable_or_stale", at)
-            self._status = "waiting_for_temperatures"
+        changed_times = [self._source_values["indoor:" + row["entity"]][1]
+                         for row in source_rows
+                         if self._observation_values.get(row["entity"]) != row["value"]
+                         and "indoor:" + row["entity"] in self._source_values]
+        indoor_at = max(changed_times) if changed_times else _timestamp(cycle.get("indoor_reported_at"))
+        outdoor_at = _timestamp(cycle.get("outdoor_reported_at"))
+        if indoor_at is None or not timedelta(0) <= at - indoor_at <= timedelta(minutes=_MAX_GAP_MINUTES):
+            self._interrupt("indoor_report_time_unknown_or_stale", at)
             return
-
-        indoor_at = _timestamp(cycle.get("indoor_reported_at"))
-        if (
-            not changed
-            or indoor_at is None
-            or indoor_at > at
-            or at - indoor_at > timedelta(minutes=_MAX_GAP_MINUTES)
-        ):
+        if outdoor_at is None or not timedelta(0) <= at - outdoor_at <= _OUTDOOR_MAX_AGE:
+            self._interrupt("outdoor_observation_stale", at)
+            return
+        if not changed:
             self._status = "waiting_for_new_temperature_value"
             return
-        if outdoor_at is None or at - outdoor_at > _OUTDOOR_MAX_AGE or outdoor_at > at:
-            self._interrupt("outdoor_observation_stale", at)
-            self._status = "waiting_for_fresh_outdoor"
-            return
-
-        # Only accepted observations consume source changes. A weather failure
-        # must not permanently discard a genuine indoor change.
-        self._source_values.update(source_values)
-
         command = self._last_command if use_ohmigo_input else None
         command_value = _number(command.get("requested")) if command else None
-        command_at = _timestamp(command.get("established_at") or command.get("at")) if command else None
-        command_dispatched_at = _timestamp(command.get("last_dispatched_at") or command.get("at")) if command else None
-        command_status = command.get("status") if command else None
+        command_at = _timestamp(command.get("established_at")) if command else None
         coordinate = None
-        if (
-            command_value is not None
-            and command_at is not None
-            and command_status == "service_completed_unverified"
-            and command_at <= indoor_at
-            and outdoor_at <= indoor_at
-        ):
-            coordinate = command_coordinate(
-                outdoor,
-                command_value,
-                _number(cycle.get("command_span")) or 12.0,
-            )
-            if (
-                mode == "braking"
-                and (_number(cycle.get("brake_factor")) or 0.0) >= 0.98
-                and (
-                    self._last_training_at is None or indoor_at > self._last_training_at
-                )
-            ):
-                self.model.add_sample(
-                    Sample(
-                        ts=indoor_at,
-                        indoor_c=indoor,
-                        outdoor_c=outdoor,
-                        effort=coordinate,
-                    )
-                )
-                self._last_training_at = indoor_at
+        if command_value is not None and command_at is not None and command_at <= indoor_at:
+            coordinate = _number(command.get("coordinate"))
+        if eligible and (self._last_training_at is None or indoor_at > self._last_training_at):
+            # Independent command/outdoor samples establish held fields in the
+            # grid; an indoor report never backdates a newly received command.
+            self.model.add_sample(Sample(indoor_at, indoor, None, None))
+            self._last_training_at = indoor_at
+            if coordinate is not None:
                 self._samples += 1
-                if self._status != "candidate_insufficient_excitation":
-                    self._status = "candidate_learning"
-
-        regime = classify_regime(mode, _number(cycle.get("brake_factor")))
-        quality = "valid"
-        if cycle.get("command_source") == "unverified_or_multiple_transports":
-            quality = "unverified_transport"
-        if outdoor_at is None or at - outdoor_at > _OUTDOOR_MAX_AGE:
-            quality = "stale_outdoor"
-        if self._last_interruption is not None:
-            quality = "interrupted"
-
-        calculated_virtual = _number(cycle.get("requested_virtual_outdoor"))
-        dispatched_virtual = command_value
-        quantization_error = (
-            round(dispatched_virtual - calculated_virtual, 4)
-            if calculated_virtual is not None and dispatched_virtual is not None
-            else None
-        )
-
-        record = {
-            "at": at.isoformat(),
-            "indoor_reported_at": indoor_at.isoformat(),
-            "indoor_c": indoor,
-            "outdoor_reported_at": outdoor_at.isoformat(),
-            "outdoor_c": outdoor,
-            "outdoor_source": cycle.get("outdoor_source"),
-            "sources": source_rows,
-            "requested_virtual_outdoor_c": calculated_virtual,
-            "calculated_virtual_outdoor_c": calculated_virtual,
-            "dispatched_virtual_outdoor_c": dispatched_virtual,
-            "command_quantization_error_c": quantization_error,
-            "mode": mode,
-            "regime": regime,
-            "data_quality": quality,
-            "brake_factor": _number(cycle.get("brake_factor")),
-            "pi_demand_c": _number(cycle.get("pi_demand_c")),
-            "command_coordinate": coordinate,
-            "command_status": command_status,
-            "command_at": command_at.isoformat() if command_at else None,
-            "command_dispatched_at": (
-                command_dispatched_at.isoformat() if command_dispatched_at else None
-            ),
-            "interruption": self._last_interruption,
-        }
+                self._status = "candidate_learning"
+        self._observation_values.update({row["entity"]: row["value"] for row in source_rows})
+        self._append("observation", at, indoor_reported_at=indoor_at.isoformat(),
+                     indoor_c=indoor, outdoor_reported_at=outdoor_at.isoformat(),
+                     outdoor_c=outdoor, sources=source_rows, mode=cycle.get("mode"),
+                     regime=regime, command_coordinate=coordinate,
+                     calculated_virtual_outdoor_c=_number(cycle.get("requested_virtual_outdoor")),
+                     dispatched_virtual_outdoor_c=command_value,
+                     requested_virtual_outdoor_c=_number(cycle.get("requested_virtual_outdoor")),
+                     command_quantization_error_c=(round(command_value - _number(cycle.get("requested_virtual_outdoor")), 4) if command_value is not None and _number(cycle.get("requested_virtual_outdoor")) is not None else None),
+                     command_at=command_at.isoformat() if command_at else None,
+                     command_status=command.get("status") if command else None,
+                     data_quality="empirical_command_unverified" if coordinate is not None else "command_unknown")
         self._last_interruption = None
-        self._observations.append(record)
-        self._active_cycle = record
-
-        self._score_pending(at, indoor, indoor_at, outdoor, mode, coordinate)
-        self._maybe_issue(record, outdoor, command_value, coordinate)
 
     def record_output(self, event: dict[str, Any]) -> None:
-        """Capture transport-level status; never claim physical application."""
+        """Capture meaningful dispatch changes independently of indoor changes."""
         row = dict(event)
-        at = _timestamp(row.get("at"))
-        row["at"] = at.isoformat() if at else None
+        at = _timestamp(row.pop("at", None))
+        if at is None:
+            return
         row["requested"] = _number(row.get("requested"))
-        self._outputs.append(row)
-        if (
-            row.get("transport") == "ohmigo"
-            and row.get("status") == "service_completed_unverified"
-            and row["requested"] is not None
-            and at is not None
-        ):
-            previous = self._last_command
-            requested = row["requested"]
-            if (
-                previous is not None
-                and _number(previous.get("requested")) == requested
-                and previous.get("status") == "service_completed_unverified"
-            ):
-                # Ohmigo keepalive: preserve the timestamp when command was established
-                established_at = (
-                    previous.get("established_at")
-                    or previous.get("at")
-                    or at.isoformat()
-                )
-                self._last_command = {
-                    "requested": requested,
-                    "at": established_at,
-                    "established_at": established_at,
-                    "last_dispatched_at": at.isoformat(),
-                    "status": row["status"],
-                }
-            else:
-                if (
-                    previous is not None
-                    and _number(previous.get("requested")) != requested
-                ):
-                    self._interrupt("ohmigo_command_changed", at)
-                self._last_command = {
-                    "requested": requested,
-                    "at": at.isoformat(),
-                    "established_at": at.isoformat(),
-                    "last_dispatched_at": at.isoformat(),
-                    "status": row["status"],
-                }
-        elif row.get("transport") == "ohmigo" and row.get("status") in {
-            "dispatch_failed",
-            "skipped",
-            "disabled",
-            "not_configured",
-            "invalid_configuration",
-        }:
+        transport = str(row.get("transport"))
+        status = row.get("status")
+        if status in {"not_due", "dispatch_attempted"}:
+            return
+        signature = (status, row["requested"], row.get("source"), row.get("reason"), self._segment)
+        repeated = self._last_output_signature.get(transport) == signature
+        self._last_output_signature[transport] = signature
+        previous = self._last_command
+        success = transport == "ohmigo" and status == "service_completed_unverified" and row["requested"] is not None
+        if success:
+            same = previous is not None and previous["requested"] == row["requested"]
+            established = previous["established_at"] if same else at.isoformat()
+            self._last_command = dict(coordinate=previous.get("coordinate") if same else None, requested=row["requested"], established_at=established,
+                                      at=established, last_dispatched_at=at.isoformat(), status=status)
+            if self._active_cycle:
+                cycle = self._active_cycle
+                outdoor = _number(cycle.get("outdoor"))
+                outdoor_at = _timestamp(cycle.get("outdoor_reported_at"))
+                if outdoor is not None and outdoor_at is not None and timedelta(0) <= at - outdoor_at <= _OUTDOOR_MAX_AGE and cycle.get("use_ohmigo_input") and cycle["regime"] in {"normal_pi", "braking_stable", "preheating"} and not cycle.get("gos_active"):
+                    coordinate = _number(self._last_command.get("coordinate"))
+                    if coordinate is None:
+                        coordinate = command_coordinate(outdoor, row["requested"], _number(cycle.get("command_span")) or 12.0)
+                    self._last_command["coordinate"] = coordinate
+                    # Confirmations refresh coverage at most once per grid step;
+                    # repeated calls cannot create a dense pending-sample log.
+                    if not same or self._last_command_sample_at is None or at - self._last_command_sample_at >= timedelta(minutes=self.model.config.step_minutes):
+                        self.model.add_sample(Sample(at, None, None, coordinate))
+                        self._last_command_sample_at = at
+        elif transport == "ohmigo" and status in {"dispatch_failed", "skipped", "disabled", "not_configured", "invalid_configuration"}:
             self._last_command = None
-            self._interrupt(f"ohmigo_{row['status']}", at)
-        if self._active_cycle is not None:
-            self._active_cycle.setdefault("outputs", []).append(row)
-
-    def _maybe_issue(
-        self,
-        record: dict[str, Any],
-        outdoor: float,
-        command_value: float | None,
-        coordinate: float | None,
-    ) -> None:
-        params = self.model.parameters()
-        at = _timestamp(record["at"])
-        command_at = _timestamp(record.get("command_at"))
-        command_warmup = (
-            at is not None
-            and command_at is not None
-            and at - command_at >= timedelta(minutes=max(0.0, params.dead_time_minutes))
-            if params is not None
-            else False
-        )
-        if self._pending_forecast is not None:
-            context_changed = (
-                tuple(self._pending_forecast["identity"]) != self._source_signature
-                or record.get("mode") != self._pending_forecast["mode"]
-                or abs(
-                    (_number(record.get("brake_factor")) or 0.0)
-                    - (_number(self._pending_forecast.get("brake_factor")) or 0.0)
-                )
-                > 0.05
-                or coordinate is None
-                or abs(coordinate - self._pending_forecast["coordinate"]) > 0.15
-            )
-            outdoor_drift = (
-                abs(outdoor - self._pending_forecast["outdoor"])
-                > _OUTDOOR_DRIFT_TOLERANCE_C
-            )
-            if context_changed:
-                self._interrupt("forecast_context_changed", at)
-            elif outdoor_drift:
-                self._interrupt("forecast_weather_drift_exceeded", at)
-
-        if (
-            params is None
-            or at is None
-            or record.get("mode") != "braking"
-            or (_number(record.get("brake_factor")) or 0.0) < 0.98
-            or command_value is None
-            or coordinate is None
-            or not command_warmup
-            or self._pending_forecast is not None
-            or self._braking_episode_forecasted
-        ):
-            return
-        prediction = self._predict(
-            record["indoor_c"], outdoor, coordinate, params, duration_hours=1.0
-        )
-        if prediction is None:
-            return
-        frozen_params = {
-            "heating_rate_k_per_h": float(params.heating_rate_k_per_h),
-            "loss_rate_per_h": float(params.loss_rate_per_h),
-            "gains_k_per_h": float(params.gains_k_per_h),
-            "dead_time_minutes": float(getattr(params, "dead_time_minutes", 0.0)),
-        }
-        self._pending_forecast = {
-            "issued": at.isoformat(),
-            "due": (at + _AUDIT_HORIZON).isoformat(),
-            "identity": self._source_signature,
-            "mode": record["mode"],
-            "brake_factor": record["brake_factor"],
-            "indoor": record["indoor_c"],
-            "outdoor": outdoor,
-            "coordinate": coordinate,
-            "model": self.model.to_dict(),
-            "params": frozen_params,
-            "predicted": prediction,
-            "invalidated": False,
-        }
-        self._braking_episode_forecasted = True
-        self._last_forecast_at = at
+            self._interrupt("ohmigo_" + status, at)
+        if not repeated:
+            self._append("output", at, **row, physical_application_verified=False)
 
     @staticmethod
     def _predict(
@@ -619,317 +465,112 @@ class ThermalIntelligence:
             remaining -= dt
         return temp
 
-    def _score_pending(
-        self,
-        at: datetime,
-        indoor: float,
-        indoor_at: datetime,
-        outdoor: float,
-        mode: str,
-        coordinate: float | None,
-    ) -> None:
-        pending = self._pending_forecast
-        if pending is None:
-            return
-        issued = _timestamp(pending["issued"])
-        due = _timestamp(pending["due"])
-        if issued is None or due is None or pending.get("invalidated"):
-            self._pending_forecast = None
-            return
-
-        if (
-            tuple(pending["identity"]) != self._source_signature
-            or mode != pending["mode"]
-        ):
-            self._pending_forecast = None
-            self._interrupt("forecast_context_changed", at)
-            return
-
-        if coordinate is None or abs(coordinate - pending["coordinate"]) > 0.15:
-            self._pending_forecast = None
-            self._interrupt("forecast_command_unverified_or_changed", at)
-            return
-
-        if abs(outdoor - pending["outdoor"]) > _OUTDOOR_DRIFT_TOLERANCE_C:
-            self._pending_forecast = None
-            self._interrupt("forecast_weather_drift_exceeded", at)
-            return
-
-        elapsed_seconds = (indoor_at - issued).total_seconds()
-        elapsed_minutes = elapsed_seconds / 60.0
-
-        # If overall clock has passed the maximum horizon window without a valid report:
-        if (
-            at - issued
-        ).total_seconds() > _FORECAST_MAX_MINUTES * 60.0 and elapsed_minutes < _FORECAST_MIN_MINUTES:
-            self._pending_forecast = None
-            self._interrupt("forecast_outcome_unavailable", at)
-            return
-
-        if elapsed_minutes < _FORECAST_MIN_MINUTES:
-            return
-
-        if elapsed_minutes > _FORECAST_MAX_MINUTES:
-            self._pending_forecast = None
-            self._interrupt("forecast_outcome_unavailable", at)
-            return
-
-        elapsed_hours = elapsed_seconds / 3600.0
-        # Predictions evaluated at actual elapsed time must use exact model parameters frozen at issuance
-        frozen_params = pending.get("params")
-        if isinstance(frozen_params, dict):
-            params = ThermalParameters(
-                heating_rate_k_per_h=float(frozen_params["heating_rate_k_per_h"]),
-                loss_rate_per_h=float(frozen_params["loss_rate_per_h"]),
-                gains_k_per_h=float(frozen_params["gains_k_per_h"]),
-                dead_time_minutes=float(frozen_params.get("dead_time_minutes", 0.0)),
-            )
-        elif isinstance(frozen_params, ThermalParameters):
-            params = frozen_params
-        elif pending.get("model") and isinstance(pending["model"].get("params"), dict):
-            p = pending["model"]["params"]
-            params = ThermalParameters(
-                heating_rate_k_per_h=float(p["a"]),
-                loss_rate_per_h=float(p["b"]),
-                gains_k_per_h=float(p["c"]),
-                dead_time_minutes=float(p.get("d_minutes", 0.0)),
-            )
-        else:
-            params = None
-
-        if params is None:
-            self._pending_forecast = None
-            self._interrupt("forecast_model_unavailable", at)
-            return
-
-        predicted = self._predict(
-            pending["indoor"],
-            pending["outdoor"],
-            pending["coordinate"],
-            params,
-            duration_hours=elapsed_hours,
-        )
-        if predicted is None or not math.isfinite(predicted):
-            self._pending_forecast = None
-            self._interrupt("forecast_evaluation_failed", at)
-            return
-
-        error = abs(predicted - indoor)
-        persistence_error = abs(pending["indoor"] - indoor)
-
-        self._scores.append(
-            {
-                "issued": pending["issued"],
-                "observed": indoor_at.isoformat(),
-                "horizon_minutes": round(elapsed_minutes, 2),
-                "model_error_c": round(error, 4),
-                "persistence_error_c": round(persistence_error, 4),
-                "model": "rtm_command_v1",
-                "independent_unit": "non_overlapping_braking_episode",
-                "command_application": "service_completed_unverified",
-                "identity": repr(self._source_signature),
-            }
-        )
-        self._pending_forecast = None
-
     def suspend(self, reason: str, at: datetime) -> None:
-        """Break an unobserved interval while retaining completed evidence."""
         self._interrupt(reason, at)
-        self.model._pending.clear()
         self._last_command = None
         self._active_cycle = None
-        self._braking_episode_active = False
-        self._braking_episode_forecasted = False
+        self._context_signature = ()
 
     def _interrupt(self, reason: str, at: datetime | None = None) -> None:
+        at = at or datetime.now(UTC)
         if reason != self._last_interruption:
-            self._interruptions.append(
-                {
-                    "at": (at or datetime.now(UTC)).isoformat(),
-                    "reason": reason,
-                }
-            )
+            self._boundary(at)
+            self._append("interruption", at, reason=reason)
         self._last_interruption = reason
-        if self._active_cycle is not None:
-            self._active_cycle["interruption"] = reason
-        if self._pending_forecast is not None:
-            self._pending_forecast = None
 
     def export_state(self) -> dict[str, Any]:
-        """Return JSON-compatible bounded state; open predictions never resume."""
-        return {
-            "version": _STATE_VERSION,
-            "model": self.model.to_dict(),
-            "source_signature": {
-                "indoor": [list(row) for row in self._source_signature[0]]
-                if self._source_signature
-                else [],
-                "outdoor": self._source_signature[1]
-                if self._source_signature
-                else None,
-                "command_source": self._source_signature[2]
-                if self._source_signature
-                else None,
-            },
-            "observations": list(self._observations),
-            "outputs": list(self._outputs),
-            "scores": list(self._scores),
-            "interruptions": list(self._interruptions),
-            "samples": self._samples,
-            "last_training_at": (
-                self._last_training_at.isoformat() if self._last_training_at else None
-            ),
-            "braking_episode_active": self._braking_episode_active,
-            "braking_episode_forecasted": self._braking_episode_forecasted,
-            "last_forecast_at": (
-                self._last_forecast_at.isoformat() if self._last_forecast_at else None
-            ),
-            "status": self._status,
-            "fit_summary": dict(self._fit_summary),
-            "fit_generation": self._fit_generation,
-        }
+        """Persist one chain; unfinished command and interpolation never resume."""
+        model_state = self.model.to_dict()
+        model_state["pending"] = []  # Open interpolation intervals never resume.
+        return deepcopy(dict(version=_STATE_VERSION, model=model_state,
+                    events=list(self._events), sequence=self._sequence,
+                    samples=self._samples, status=self._status,
+                    fit_summary=dict(self._fit_summary), fit_generation=self._fit_generation,
+                    segment=self._segment))
 
     def restore_state(self, data: Any) -> bool:
-        """Restore completed history; require a new command after every restart."""
+        restored = ThermalIntelligence()
+        if not restored._restore_state(data):
+            return False
+        self.__dict__.update(restored.__dict__)
+        return True
+
+    def _restore_state(self, data: Any) -> bool:
         if not isinstance(data, dict) or data.get("version") != _STATE_VERSION:
             return False
         try:
+            events = deepcopy(data["events"])
+            if any(key in data for key in ("scores", "observations", "outputs", "interruptions")):
+                return False
+            if not isinstance(events, list) or any(not isinstance(row, dict) or _timestamp(row.get("at")) is None or row.get("kind") not in {"temperature", "context", "output", "observation", "interruption"} for row in events):
+                return False
+            if any(_timestamp(a["at"]) > _timestamp(b["at"]) or int(a["sequence"]) >= int(b["sequence"]) for a, b in zip(events, events[1:])):
+                return False
             model = RCThermalModel.from_dict(data["model"], self.model.config)
-            rows = data.get("observations", [])
-            outputs = data.get("outputs", [])
-            scores = data.get("scores", [])
-            if not all(isinstance(value, list) for value in (rows, outputs, scores)):
-                return False
-            if not all(isinstance(row, dict) for group in (rows, outputs, scores) for row in group):
-                return False
-            # Summary runs in the control lifecycle: corrupted stored errors
-            # must be rejected before they can raise during arithmetic there.
-            if any(
-                isinstance(row.get(key), bool)
-                or not isinstance(row.get(key), (int, float))
-                or not math.isfinite(row[key])
-                or row[key] < 0
-                for row in scores
-                for key in ("model_error_c", "persistence_error_c")
-            ):
-                return False
-            # Keep finalized grid rows, but never carry a held command or an
-            # unfinished resampling interval across an unobserved restart.
             model._pending.clear()
             self.model = model
-            self._observations = deque(rows[-_MAX_RECORDS:], maxlen=_MAX_RECORDS)
-            self._outputs = deque(outputs[-_MAX_RECORDS:], maxlen=_MAX_RECORDS)
-            self._scores = deque(scores[-96:], maxlen=96)
-            interruptions = data.get("interruptions", [])
-            if not isinstance(interruptions, list):
-                return False
-            self._interruptions = deque(interruptions[-96:], maxlen=96)
-            self._last_interruption = None
+            cutoff = _timestamp(events[-1]["at"]) - timedelta(days=model.config.history_days) if events else None
+            events = [row for row in events if cutoff is None or _timestamp(row["at"]) >= cutoff]
+            self._events = deque(events[-_MAX_RECORDS:], maxlen=_MAX_RECORDS)
+            self._sequence = max(int(data.get("sequence", 0)), int(events[-1]["sequence"]) if events else 0)
             self._samples = max(0, int(data.get("samples", 0)))
-            self._last_training_at = _timestamp(data.get("last_training_at"))
-            self._braking_episode_active = bool(
-                data.get("braking_episode_active", False)
-            )
-            self._braking_episode_forecasted = bool(
-                data.get("braking_episode_forecasted", False)
-            )
-            raw_signature = data.get("source_signature", {})
-            if not isinstance(raw_signature, dict):
-                return False
-            raw_indoor = raw_signature.get("indoor", [])
-            if not isinstance(raw_indoor, list):
-                return False
-            indoor_signature = tuple(
-                (row[0], _number(row[1]))
-                for row in raw_indoor
-                if isinstance(row, list) and len(row) == 2 and isinstance(row[0], str)
-            )
-            self._source_signature = (
-                indoor_signature,
-                raw_signature.get("outdoor"),
-                raw_signature.get("command_source"),
-            )
-            self._source_values.clear()
-            observations = list(self._observations)
-            if observations:
-                for row in observations[-1].get("sources", []):
-                    if not isinstance(row, dict):
-                        continue
-                    value = _number(row.get("value"))
-                    reported = _timestamp(row.get("reported_at"))
-                    entity = row.get("entity")
-                    if (
-                        isinstance(entity, str)
-                        and value is not None
-                        and reported is not None
-                    ):
-                        self._source_values[entity] = (value, reported)
-            self._last_command = None
-            self._pending_forecast = None
-            self._last_forecast_at = _timestamp(data.get("last_forecast_at"))
-            self._active_cycle = None
             self._fit_summary = dict(data.get("fit_summary", {}))
-            self._status = data.get("status", "collecting")
             self._fit_generation = int(data.get("fit_generation", 0))
             self._fit_in_progress = False
+            self._segment = int(data.get("segment", 0))
+            self._status = "collecting"
+            self._last_command = None
+            self._source_values.clear()
+            self._captured_values.clear()
+            self._observation_values.clear()
+            self._latest_observation = None
+            # Reconstruct source values only to suppress identical republishes.
+            for row in self._events:
+                if row["kind"] == "temperature" and row.get("timestamp_valid"):
+                    value = _number(row.get("value"))
+                    if value is not None:
+                        self._source_values[row["role"] + ":" + row["entity"]] = (value, _timestamp(row.get("reported_at")))
+                        self._captured_values[row["role"] + ":" + row["entity"]] = (value, True, True)
+            for row in self._events:
+                if row["kind"] == "interruption":
+                    self._last_interruption_event = row
+                if row["kind"] == "observation":
+                    self._latest_observation = row
+                    self._observation_values = {source["entity"]: source["value"] for source in row.get("sources", [])}
+            self._context_signature = ()
+            self._source_signature = ()
+            for row in reversed(self._events):
+                if row["kind"] == "context":
+                    self._source_signature = (tuple((source[0], _number(source[1])) for source in row.get("sources", [])), row.get("outdoor_source"), row.get("command_source"))
+                    break
+            self._active_cycle = None
+            self._last_output_signature.clear()
+            self._last_training_at = None
+            self._last_interruption = None
+            if events:
+                self._interrupt("restart", _timestamp(events[-1]["at"]))
         except (KeyError, TypeError, ValueError, OverflowError):
             return False
         return True
 
     def summary(self) -> dict[str, Any]:
-        params = self.model.parameters()
-        scores = [
-            row
-            for row in self._scores
-            if row.get("identity") == repr(self._source_signature)
-        ]
-        model_mae = (
-            sum(row["model_error_c"] for row in scores) / len(scores)
-            if scores
-            else None
-        )
-        persistence_mae = (
-            sum(row["persistence_error_c"] for row in scores) / len(scores)
-            if scores
-            else None
-        )
-        excitation_info = self._fit_summary.get("excitation_sufficient")
-        command_range = self._fit_summary.get("command_range")
-        command_variance = self._fit_summary.get("command_variance")
-        fit_reason = self._fit_summary.get("reason")
-
-        current_status = self.status
-        reason = fit_reason or (
-            "insufficient_command_excitation_for_dual_gain_identification"
-            if current_status == "candidate_insufficient_excitation"
-            else "passive_diagnostics_only"
-        )
-
         return {
-            "status": current_status,
+            "status": self.status,
+            "model_status": "candidate_unvalidated" if self.model.parameters() else "insufficient_evidence",
             "model": "adaptive_preheat_rtm_empirical_command_response",
             "samples": self._samples,
-            "fit_parameters_available": params is not None,
+            "evidence_events": len(self._events),
+            "oldest_evidence_at": self._events[0]["at"] if self._events else None,
+            "latest_evidence_at": self._events[-1]["at"] if self._events else None,
+            "forecast_endpoint_basis": "accepted_numeric_changes_only",
+            "fit_parameters_available": self.model.parameters() is not None,
             "fit_trusted": False,
-            "excitation_sufficient": excitation_info,
-            "command_range": command_range,
-            "command_variance": command_variance,
-            "forecast_count": len(scores),
-            "forecast_mae_c": round(model_mae, 4) if model_mae is not None else None,
-            "persistence_mae_c": (
-                round(persistence_mae, 4) if persistence_mae is not None else None
-            ),
-            "forecast_skill": (
-                round(1.0 - model_mae / persistence_mae, 4)
-                if model_mae is not None
-                and persistence_mae is not None
-                and persistence_mae > 0
-                else None
-            ),
+            "excitation_sufficient": self._fit_summary.get("excitation_sufficient"),
+            "command_range": self._fit_summary.get("command_range"),
+            "command_variance": self._fit_summary.get("command_variance"),
             "command_semantics": "service_request_unverified_not_thermal_power",
+            "forecast_audit": "shared_forecast_audit",
             "active_control": False,
-            "last_interruption": (
-                self._interruptions[-1]["reason"] if self._interruptions else None
-            ),
-            "reason": reason,
+            "last_interruption": self._last_interruption_event["reason"] if self._last_interruption_event else None,
+            "reason": self._fit_summary.get("reason") or "passive_diagnostics_only",
         }

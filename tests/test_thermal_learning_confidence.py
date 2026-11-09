@@ -361,6 +361,22 @@ def test_fixed_audit_is_connected_to_learning_entry_and_neutral_when_disabled():
         sensor._update_thermal_learning(
             active=True, reason="stable_braking", now=_START, indoor=21, outdoor=5
         )
+        # Adaptive k learning no longer creates a second forecast evaluator.
+        assert sensor._plan_audit.fixed_pending is None
+        if enabled:
+            from custom_components.pumpsteer.sensor import MODE_PI
+            sensor._thermal_intelligence.begin_cycle({
+                "at": _START, "indoor": 21, "outdoor": 5,
+                "indoor_reported_at": _START, "outdoor_reported_at": _START,
+                "outdoor_source": "sensor.outside", "mode": MODE_PI,
+                "command_source": "unverified_or_multiple_transports",
+                "gos_active": True,
+                "sources": [{"entity": "sensor.inside", "weight": 1,
+                             "value": 21, "reported_at": _START}],
+            }, use_ohmigo_input=False)
+            sensor._update_shared_thermal_audit(_START, sensor._cfg())
         assert (sensor._plan_audit.fixed_pending is not None) is enabled
+        if enabled:
+            assert sensor._plan_audit.fixed_pending["curves"] == [{"name": "persistence", "rate": 0.0}]
         attrs = sensor._base_attrs(21, 21, 5, "expensive", 3)
         assert (attrs["thermal_fixed_horizon_audit"] is not None) is enabled

@@ -75,7 +75,7 @@ def test_repeated_values_do_not_create_temperature_samples():
     assert len(runtime._observations) == 1
 
 
-def test_same_indoor_timestamp_is_not_added_as_a_second_training_sample():
+def test_changed_source_timestamp_supersedes_republished_aggregate_timestamp():
     runtime = ThermalIntelligence()
     runtime.begin_cycle(
         _cycle(START, [("sensor.room", 1.0, 21.0, 0)]),
@@ -103,7 +103,8 @@ def test_same_indoor_timestamp_is_not_added_as_a_second_training_sample():
     cycle["indoor_reported_at"] = (START + timedelta(minutes=15)).isoformat()
     cycle["outdoor_reported_at"] = (START + timedelta(minutes=15)).isoformat()
     runtime.begin_cycle(cycle, use_ohmigo_input=True)
-    assert runtime._samples == 1
+    assert runtime._samples == 2
+    assert runtime.latest_observation["indoor_reported_at"] == (START + timedelta(minutes=30)).isoformat()
 
 
 def test_only_service_completed_ohmigo_request_enters_training():
@@ -140,52 +141,14 @@ def test_only_service_completed_ohmigo_request_enters_training():
     assert runtime.summary()["fit_trusted"] is False
 
 
-def test_forecast_evidence_is_limited_to_one_per_continuous_braking_episode():
-    runtime = ThermalIntelligence()
-    runtime.model._params = {
-        "a": 1.2,
-        "b": 0.1,
-        "c": -0.2,
-        "d_minutes": 60.0,
-        "use_outdoor": True,
-    }
-    runtime._source_signature = (
-        (("sensor.room", 1.0),),
-        "sensor.outdoor",
-        "ohmigo_single",
-    )
-    runtime._braking_episode_active = True
-    coordinate = 0.7
-    record = {
-        "at": START.isoformat(),
-        "command_at": (START - timedelta(hours=1)).isoformat(),
-        "mode": "braking",
-        "brake_factor": 1.0,
-        "indoor_c": 20.0,
-    }
-    runtime._maybe_issue(record, 2.0, -8.0, coordinate)
-    assert runtime._pending_forecast is not None
-    runtime._score_pending(
-        START + timedelta(hours=1),
-        19.9,
-        START + timedelta(hours=1),
-        2.0,
-        "braking",
-        coordinate,
-    )
-    assert runtime.summary()["forecast_count"] == 1
-
-    next_record = {**record, "at": (START + timedelta(hours=2)).isoformat()}
-    runtime._maybe_issue(next_record, 2.0, -8.0, coordinate)
-    assert runtime._pending_forecast is None
 
 
 def test_interruption_only_evidence_is_persistable():
     runtime = ThermalIntelligence()
     runtime._interrupt("required_temperature_missing", START)
     assert runtime.has_evidence
-    assert runtime.store_signature[-1] == len(runtime._interruptions) == 1
-    assert runtime.export_state()["interruptions"][0]["at"] == START.isoformat()
+    assert len(runtime._interruptions) == 1
+    assert runtime.export_state()["events"][0]["at"] == START.isoformat()
 
 
 def test_generic_output_or_multiple_transport_mode_is_not_a_model_input():
@@ -221,8 +184,6 @@ def test_restore_keeps_history_but_requires_new_value_and_new_command():
             "requested": -8.0,
         }
     )
-    first._braking_episode_active = True
-    first._braking_episode_forecasted = True
     state = first.export_state()
 
     restored = ThermalIntelligence()
@@ -233,9 +194,8 @@ def test_restore_keeps_history_but_requires_new_value_and_new_command():
     )
     assert restored._samples == 0
     assert restored._last_command is None
-    assert restored._pending_forecast is None
-    assert restored._braking_episode_active
-    assert restored._braking_episode_forecasted
+    assert restored._interruptions[-1]["reason"] == "restart"
+    assert not any(sample.effort is not None for _, sample in restored.model._pending)
 
 
 def test_rtm_fits_sparse_quantized_synthetic_command_response():

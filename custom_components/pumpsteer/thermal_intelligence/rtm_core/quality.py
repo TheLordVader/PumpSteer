@@ -1,7 +1,8 @@
 """Model quality and maturity.
 
 Evaluation (all on a chronological holdout = the last 20 % of the usable rows, with
-parameters fitted on the first 80 % only):
+gain parameters fitted on the first 80 % only; delay, scale and fallback selection
+may use the full data, so this is an internal diagnostic rather than independent proof):
 
 - **forecast skill**: from every holdout row (every 30 min) the model is simulated
   open-loop for 60 min with the observed effort and outdoor temperature, starting from
@@ -92,7 +93,9 @@ def forecast_rmse(
     cnt = 0
     k = max(k_start, p.d_steps)
     while k < k_end and k + h < n:
-        ok = not any(bad[k : k + h + 1])
+        ok = not any(bad[k - p.d_steps : k + h + 1]) and all(
+            e is not None for e in eff[k - p.d_steps : k + h]
+        )
         t = ind[k]
         obs = ind[k + h]
         if t is None or obs is None:
@@ -141,7 +144,7 @@ def heat_up_episodes(
             k += 1
             continue
         prev = eff[k - pre : k]
-        if any(p is None or p >= EPISODE_EFFORT for p in prev):
+        if any(bad[k - pre : k]) or any(p is None or p >= EPISODE_EFFORT for p in prev):
             k += 1
             continue
         j = k
@@ -157,14 +160,18 @@ def heat_up_episodes(
         t0, t_end = ind[k], ind[j]
         if t0 is not None and t_end is not None and t_end - t0 >= EPISODE_MIN_RISE:
             reach = next(
-                i for i in range(k, j + 1) if (v := ind[i]) is not None and v >= t_end - 1e-9
+                i
+                for i in range(k, j + 1)
+                if (v := ind[i]) is not None and v >= t_end - 1e-9
             )
             eps.append((k, j, reach))
         k = j + 1
     return eps
 
 
-def episode_errors(grid: Grid, p: Params, episodes: list[tuple[int, int, int]]) -> list[float]:
+def episode_errors(
+    grid: Grid, p: Params, episodes: list[tuple[int, int, int]]
+) -> list[float]:
     """Predicted − actual minutes for each episode."""
     step = grid.step_minutes
     errs: list[float] = []
@@ -229,6 +236,9 @@ def data_factor(heating_hours: float, cooling_hours: float) -> float:
 
 
 def maturity(
-    heating_hours: float, cooling_hours: float, rmse: float | None, baseline: float | None
+    heating_hours: float,
+    cooling_hours: float,
+    rmse: float | None,
+    baseline: float | None,
 ) -> float:
     return data_factor(heating_hours, cooling_hours) * skill_factor(rmse, baseline)

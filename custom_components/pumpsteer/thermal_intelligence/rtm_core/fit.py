@@ -34,7 +34,9 @@ A_MIN = 0.05
 B_MIN, B_MAX = 0.01, 2.0
 IRLS_PASSES = 3
 PRIOR_HOURS = 6.0
-SCALE_FLOOR_K = 0.1  # per-step noise floor of the robust scale (sensor resolution, see fit_rc)
+SCALE_FLOOR_K = (
+    0.1  # per-step noise floor of the robust scale (sensor resolution, see fit_rc)
+)
 NO_OUTDOOR_REF_C = 10.0  # prior for c' = b·mean(Tout) when no outdoor data exists
 
 
@@ -56,6 +58,7 @@ class Dataset:
     w: list[float]
     use_outdoor: bool
     dt_h: float
+    eligible: frozenset[int] | None = None
 
     def __len__(self) -> int:
         return len(self.k)
@@ -65,7 +68,15 @@ class Dataset:
         n = 0
         while n < len(self.k) and self.k[n] < k_max:
             n += 1
-        return Dataset(self.k[:n], self.y[:n], self.x[:n], self.w[:n], self.use_outdoor, self.dt_h)
+        return Dataset(
+            self.k[:n],
+            self.y[:n],
+            self.x[:n],
+            self.w[:n],
+            self.use_outdoor,
+            self.dt_h,
+            self.eligible,
+        )
 
 
 @dataclass
@@ -81,6 +92,8 @@ class FitResult:
     criterion: dict[int, float] = field(default_factory=dict[int, float])
     flatness: float = 0.0  # (J_max − J_min)/J_min over the dead-time candidates
     projected: list[str] = field(default_factory=list[str])
+    command_range: float = 0.0
+    command_variance: float = 0.0
 
     def as_dict(self, step_minutes: float) -> dict[str, Any]:
         return {
@@ -123,7 +136,14 @@ def build_dataset(
     for k in range(len(ind) - 1):
         t0 = ind[k]
         t1 = ind[k + 1]
-        if t0 is None or t1 is None or exc[k] or exc[k + 1]:
+        if (
+            grid.ts(k + 1) > now_ts
+            or grid.effort[k] is None
+            or t0 is None
+            or t1 is None
+            or exc[k]
+            or exc[k + 1]
+        ):
             continue
         if abs(t1 - t0) > max_dt:
             continue
@@ -150,7 +170,7 @@ def build_dataset(
         ys.append((t1 - t0) / dt_h)
         xs.append(x)
         ws.append(0.5 ** (age / half_life_s))
-    return Dataset(ks, ys, xs, ws, bool(use_outdoor), dt_h)
+    return Dataset(ks, ys, xs, ws, bool(use_outdoor), dt_h, frozenset(ks))
 
 
 # -- linear algebra -------------------------------------------------------------------
@@ -175,7 +195,9 @@ def solve_linear(m: list[list[float]], v: list[float]) -> list[float] | None:
     return xs
 
 
-def _solve_fixed(m: list[list[float]], v: list[float], fixed: dict[int, float]) -> list[float]:
+def _solve_fixed(
+    m: list[list[float]], v: list[float], fixed: dict[int, float]
+) -> list[float]:
     free = [i for i in range(3) if i not in fixed]
     theta = [0.0, 0.0, 0.0]
     for i, val in fixed.items():
@@ -249,6 +271,36 @@ def _wvar(values: list[float], w: list[float]) -> float:
     return sum(wi * (vi - mean) ** 2 for vi, wi in zip(values, w, strict=True)) / sw
 
 
+def excitation(
+    u: list[float], w: list[float], x: list[float] | None = None
+) -> tuple[bool, float, float]:
+    """Require command variation independent of thermal loss, before ridge fitting.
+
+    The existing variance floor also applies to the independent command component:
+    weather-correlated commands cannot identify separate heating and loss gains.
+    """
+    span = max(u) - min(u) if u else 0.0
+    var = _wvar(u, w)
+    independent_var = var
+    if x is not None:
+        vx = _wvar(x, w)
+        sw = sum(w)
+        if vx <= 1e-12 or sw <= 0:
+            independent_var = 0.0
+        else:
+            mu = sum(ui * wi for ui, wi in zip(u, w, strict=True)) / sw
+            mx = sum(xi * wi for xi, wi in zip(x, w, strict=True)) / sw
+            cov = (
+                sum(
+                    wi * (ui - mu) * (xi - mx)
+                    for ui, xi, wi in zip(u, x, w, strict=True)
+                )
+                / sw
+            )
+            independent_var = max(0.0, var - cov * cov / vx)
+    return span >= 0.15 and independent_var >= 0.005, span, var
+
+
 @dataclass
 class _Solved:
     theta: list[float]
@@ -272,15 +324,23 @@ class _Problem:
         self.effort = effort
         self.fixed = fixed or {}
         n = len(ds)
-        u0 = [e if (e := effort[k]) is not None else 0.0 for k in ds.k]
+        known = [
+            (float(e), wi)
+            for k, wi in zip(ds.k, ds.w, strict=True)
+            if (e := effort[k]) is not None
+        ]
+        u0 = [e for e, _ in known]
+        w0 = [wi for _, wi in known]
         mean_w = (sum(ds.w) / n) if n else 1.0
         n0 = prior.hours / ds.dt_h * mean_w
-        var_u = max(_wvar(u0, ds.w), 0.05)
+        var_u = max(_wvar(u0, w0), 0.05)
         var_x = max(_wvar(ds.x, ds.w), 1.0)
         self.prior_diag = [n0 * var_u, n0 * var_x, n0]
         c0 = prior.c if ds.use_outdoor else prior.c + prior.b * NO_OUTDOOR_REF_C
         self.theta0 = [prior.a, prior.b, c0]
-        self._cache: dict[int, tuple[list[float], list[float], list[float], list[float]]] = {}
+        self._cache: dict[
+            int, tuple[list[float], list[float], list[float], list[float]]
+        ] = {}
 
     def rows(self, d: int) -> tuple[list[float], list[float], list[float], list[float]]:
         """(u, x, y, w) for dead time ``d`` steps (rows lacking u[k−d] are dropped)."""
@@ -291,13 +351,26 @@ class _Problem:
         idx: list[int] = []
         for i, k in enumerate(ds.k):
             j = k - d
-            if j >= 0 and (e := eff[j]) is not None:
+            if (
+                j >= 0
+                and (e := eff[j]) is not None
+                and all(eff[h] is not None for h in range(j, k + 1))
+                and (
+                    ds.eligible is None
+                    or all(h in ds.eligible for h in range(j, k + 1))
+                )
+            ):
                 u.append(e)
                 idx.append(i)
         if len(idx) == len(ds.k):
             res = (u, ds.x, ds.y, ds.w)
         else:
-            res = (u, [ds.x[i] for i in idx], [ds.y[i] for i in idx], [ds.w[i] for i in idx])
+            res = (
+                u,
+                [ds.x[i] for i in idx],
+                [ds.y[i] for i in idx],
+                [ds.w[i] for i in idx],
+            )
         self._cache[d] = res
         return res
 
@@ -343,15 +416,20 @@ def fit_rc(
     d_candidates: list[int] | None = None,
     fixed: dict[int, float] | None = None,
     scale: float | None = None,
+    min_rows: int = 12,
 ) -> FitResult | None:
     """Fit (a, b, c, d). ``fixed`` maps parameter index (0=a, 1=b, 2=c) to a value."""
-    if len(ds) < 12:
+    if len(ds) < min_rows:
         return None
     if d_candidates is None:
         dmax = round(config.max_dead_time_minutes / config.step_minutes)
         d_candidates = list(range(max(dmax, 0) + 1))
     prob = _Problem(ds, effort, prior or Prior(), fixed)
-    cands = [d for d in d_candidates if len(prob.rows(d)[0]) >= 12]
+    cands = []
+    for d in d_candidates:
+        u, x, _, w = prob.rows(d)
+        if len(u) >= min_rows and excitation(u, w, x)[0]:
+            cands.append(d)
     if not cands:
         return None
 
@@ -361,7 +439,9 @@ def fit_rc(
         best_res: list[float] = []
         for d in cands:
             sol = prob.solve(d, None)
-            sse = sum(wi * r * r for r, wi in zip(sol.resid, sol.w, strict=True)) / sum(sol.w)
+            sse = sum(wi * r * r for r, wi in zip(sol.resid, sol.w, strict=True)) / sum(
+                sol.w
+            )
             if sse < best_sse:
                 best_sse, best_res = sse, sol.resid
         scale = 1.4826 * _median([abs(r) for r in best_res])
@@ -383,9 +463,13 @@ def fit_rc(
     jmin = crit[best]
     flat = (max(crit.values()) - jmin) / jmin if jmin > 0 else 0.0
     sw = sum(sol.w)
-    rms = math.sqrt(sum(wi * r * r for r, wi in zip(sol.resid, sol.w, strict=True)) / sw)
+    rms = math.sqrt(
+        sum(wi * r * r for r, wi in zip(sol.resid, sol.w, strict=True)) / sw
+    )
     down = sum(1 for hi in sol.h if hi < 1.0) / len(sol.h)
     a, b, c = sol.theta
+    u_best, _, _, w_best = prob.rows(best)
+    _, command_range, command_variance = excitation(u_best, w_best)
     return FitResult(
         a=a,
         b=b,
@@ -398,4 +482,6 @@ def fit_rc(
         criterion=crit,
         flatness=flat,
         projected=sorted(set(sol.projected)),
+        command_range=command_range,
+        command_variance=command_variance,
     )

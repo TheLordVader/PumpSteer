@@ -179,6 +179,8 @@ class ForecastAudit:
         pending = self.fixed_pending
         if pending is None:
             return
+        if pending.get("kind") == "shared_command_response":
+            return
         if (
             now is None
             or now < pending["issued"]
@@ -214,6 +216,7 @@ class ForecastAudit:
                 r
                 for r in self.fixed_records
                 if r["horizon"] == horizon
+                and r.get("kind") != "shared_command_response"
                 and (identity is None or tuple(r["identity"]) == tuple(identity))
             ]
             # Common actual endpoints for all three methods; one row per episode.
@@ -258,7 +261,132 @@ class ForecastAudit:
                 "passive_only": True,
                 "assumption": "constant_outdoor_net_response_under_actual_control",
             }
+        result["shared_by_revision"] = self.shared_summary(identity)
         return result
+
+    def issue_shared(
+        self, at, indoor, outdoor, k, identity, *, revision, context_id,
+        command, mode, candidate=None, source_reported=None,
+    ):
+        """Freeze passive curves before an outcome; no model is consulted later.
+
+        Command is an empirical input coordinate, never measured heat delivery.
+        Context IDs must change on every source/mode/command interruption, even
+        when the original values subsequently return.
+        """
+        from .pilot_forecast import _timestamp
+
+        at = _timestamp(at)
+        reported = at if source_reported is None else _timestamp(source_reported)
+        numeric = lambda x: isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+        if (
+            at is None or reported is None or self.fixed_pending is not None
+            or (self.fixed_next is not None and at < self.fixed_next)
+            or not 0 <= (at - reported).total_seconds() <= 300
+            or not all(numeric(x) and -100 <= x <= 100 for x in (indoor, outdoor))
+            or (command is None and candidate is not None)
+            or (command is not None and (not numeric(command) or not 0 <= command <= 1))
+            or not all(isinstance(x, str) and 0 < len(x) <= 160 for x in (revision, context_id, mode))
+            or not isinstance(identity, (tuple, list)) or len(identity) != 2
+            or not all(isinstance(x, str) and len(x) <= 2048 for x in identity)
+            or (k is not None and (not numeric(k) or not _K_MIN < k < _K_MAX))
+        ):
+            return False
+        curves = []
+        if k is not None:
+            curves.extend([
+                {"name": "linear", "rate": -k * max(0.0, indoor - outdoor)},
+                {"name": "bounded", "loss": k, "input": k * max(0.0, outdoor - indoor)},
+            ])
+        if candidate is not None:
+            keys = ("loss_per_hour", "command_gain_per_hour", "background_per_hour")
+            if not isinstance(candidate, dict) or not all(
+                numeric(candidate.get(key)) and abs(candidate[key]) <= 50 for key in keys
+            ) or candidate["loss_per_hour"] <= 0:
+                return False
+            curves.append({
+                "name": "empirical_command_response", "loss": candidate["loss_per_hour"],
+                "input": candidate["command_gain_per_hour"] * command + candidate["background_per_hour"],
+            })
+        curves.append({"name": "persistence", "rate": 0.0})
+        self.fixed_pending = {
+            "kind": "shared_command_response", "issued": at, "last": at,
+            "source_reported": reported.isoformat(), "identity": tuple(identity),
+            "revision": revision, "context_id": context_id, "command": command,
+            "mode": mode, "initial": indoor, "outdoor": outdoor,
+            "curves": curves, "predictions": {h: None for h in (30, 60, 120)},
+        }
+        self.fixed_next = at + timedelta(minutes=125)
+        return True
+
+    def observe_shared(self, now, indoor, identity, *, command, mode, context_id):
+        """Use one actual reported endpoint for every frozen curve."""
+        from .pilot_forecast import _timestamp
+        from .pilot_passive import PilotPassive
+
+        now = _timestamp(now)
+        p = self.fixed_pending
+        if p is None or p.get("kind") != "shared_command_response":
+            return False
+        if (now is None or now < p["last"] or not isinstance(identity, (tuple, list)) or tuple(identity) != p["identity"]
+            or command != p["command"] or mode != p["mode"] or context_id != p["context_id"]):
+            self.fixed_pending = None
+            return False
+        p["last"] = now
+        reading = PilotPassive._report(indoor, now, temperature=True, max_age=None)
+        scored = False
+        for h in list(p["predictions"]):
+            due = p["issued"] + timedelta(minutes=h)
+            if reading and due <= reading[0] <= due + timedelta(minutes=5):
+                elapsed = (reading[0] - p["issued"]).total_seconds() / 3600
+                predictions = []
+                for curve in p["curves"]:
+                    if "rate" in curve:
+                        prediction = p["initial"] + curve["rate"] * elapsed
+                    else:
+                        response = -math.expm1(-curve["loss"] * elapsed)
+                        prediction = (p["initial"] + (p["outdoor"] - p["initial"]) * response
+                                      + curve["input"] * (response / curve["loss"]))
+                    predictions.append(prediction)
+                self.fixed_records.append({
+                    **{key: p[key] for key in ("kind", "source_reported", "revision", "context_id", "command", "mode", "initial", "outdoor")},
+                    "issued": p["issued"].isoformat(), "observed": reading[0].isoformat(),
+                    "horizon": h, "identity": list(identity), "curves": [dict(c) for c in p["curves"]],
+                    "model_order": [c["name"] for c in p["curves"]], "predictions": predictions,
+                    "actual": reading[1], "physical_measurement_time": "unknown", "passive_only": True,
+                })
+                self.fixed_records = self.fixed_records[-96:]
+                p["predictions"].pop(h)
+                scored = True
+            elif now > due + timedelta(minutes=5):
+                p["predictions"].pop(h)
+        if not p["predictions"]:
+            self.fixed_pending = None
+        return scored
+
+    def shared_summary(self, identity=None):
+        """Revision/horizon diagnostics only; never pool fits into qualification."""
+        groups = {}
+        rows = [r for r in self.fixed_records if r.get("kind") == "shared_command_response"
+                and (identity is None or tuple(r["identity"]) == tuple(identity))]
+        for row in rows:
+            groups.setdefault(row["revision"], {}).setdefault(str(row["horizon"]), []).append(row)
+        for revision, horizons in groups.items():
+            for horizon, items in horizons.items():
+                # A revision also freezes its curve set; malformed/manual mixed
+                # groups cannot silently combine different candidates.
+                orders = {tuple(r["model_order"]) for r in items}
+                order = items[-1]["model_order"]
+                items = list({r["issued"]: r for r in items if r["model_order"] == order}.values())[-24:]
+                mae = [sum(abs(r["predictions"][i] - r["actual"]) for r in items) / len(items) for i in range(len(order))]
+                horizons[horizon] = {"count": len(items), "model_order": order, "mae": mae,
+                    "persistence_mae": mae[-1],
+                    "skill": [1 - error / mae[-1] for error in mae] if mae[-1] >= 0.02 else None,
+                    "status": "monitoring_passive" if len(orders) == 1 else "inconsistent_revision",
+                    "passive_only": True, "physical_measurement_time": "unknown",
+                    "live_endpoint_basis": "accepted_numeric_changes_only",
+                    "assumption": "constant_outdoor_and_empirical_command_coordinate"}
+        return groups
 
     def issue(
         self,
@@ -746,7 +874,8 @@ class ForecastAudit:
 
     def export_plan(self):
         return {
-            "fixed_v1": list(self.fixed_records),
+            "fixed_v1": [r for r in self.fixed_records if r.get("kind") != "shared_command_response"],
+            "fixed_v2": [r for r in self.fixed_records if r.get("kind") == "shared_command_response"],
             "records": list(self.plan_records),
             "pending_count": sum(len(p["horizons"]) for p in self.plan_pending),
             "unverifiable": self.plan_unverifiable,
@@ -766,6 +895,58 @@ class ForecastAudit:
         now = _timestamp(now)
         if not isinstance(payload, dict) or now is None:
             return
+        shared = payload.get("fixed_v2", [])
+        if isinstance(shared, list) and len(shared) <= 96:
+            candidates, conflicts = {}, set()
+            for row in shared:
+                if not isinstance(row, dict) or row.get("kind") != "shared_command_response":
+                    continue
+                issued, observed = _timestamp(row.get("issued")), _timestamp(row.get("observed"))
+                h = row.get("horizon")
+                curves, predictions = row.get("curves"), row.get("predictions")
+                if (issued is None or observed is None or observed > now or h not in (30, 60, 120)
+                    or not issued + timedelta(minutes=h) <= observed <= issued + timedelta(minutes=h + 5)
+                    or not isinstance(curves, list) or not 1 <= len(curves) <= 4
+                    or not all(isinstance(c, dict) for c in curves)
+                    or not isinstance(predictions, list) or len(predictions) != len(curves)
+                    or any(isinstance(x, bool) or not isinstance(x, (float, int)) or not math.isfinite(x)
+                           or not -100 <= x <= 100 for x in [*predictions, row.get("actual")])):
+                    continue
+                order = [c.get("name") for c in curves]
+                if order not in (["persistence"], ["linear", "bounded", "persistence"],
+                                 ["empirical_command_response", "persistence"],
+                                 ["linear", "bounded", "empirical_command_response", "persistence"]):
+                    continue
+                empirical = next((c for c in curves if c.get("name") == "empirical_command_response"), None)
+                candidate = None
+                if empirical:
+                    candidate = {"loss_per_hour": empirical.get("loss"), "command_gain_per_hour": 0,
+                                 "background_per_hour": empirical.get("input")}
+                probe = ForecastAudit()
+                if not probe.issue_shared(issued, row.get("initial"), row.get("outdoor"),
+                    curves[1].get("loss") if order[0] == "linear" else None, row.get("identity"),
+                    revision=row.get("revision"), context_id=row.get("context_id"), command=row.get("command"),
+                    mode=row.get("mode"), candidate=candidate, source_reported=row.get("source_reported")):
+                    continue
+                if probe.fixed_pending["curves"] != curves or row.get("model_order") != order:
+                    continue
+                from types import SimpleNamespace
+                state = SimpleNamespace(state=str(row["actual"]), last_reported=observed,
+                                        attributes={"unit_of_measurement": "°C"})
+                probe.observe_shared(observed, state, row["identity"], command=row["command"],
+                                     mode=row["mode"], context_id=row["context_id"])
+                expected = next((r for r in probe.fixed_records if r["horizon"] == h), None)
+                if expected is None or any(abs(a - b) > 1e-9 for a, b in zip(expected["predictions"], predictions)):
+                    continue
+                key = (issued, h)
+                if key in conflicts:
+                    continue
+                if key in candidates and candidates[key] != expected:
+                    conflicts.add(key)
+                    del candidates[key]
+                else:
+                    candidates[key] = expected
+            self.fixed_records = sorted(candidates.values(), key=lambda r: r["issued"])
         fixed = payload.get("fixed_v1", [])
         if isinstance(fixed, list) and len(fixed) <= 96:
             seen = set()
@@ -807,6 +988,7 @@ class ForecastAudit:
                 seen.add(key)
                 self.fixed_records.append(dict(row))
             self.fixed_records.sort(key=lambda r: r["issued"])
+            self.fixed_records = self.fixed_records[-96:]
             if self.fixed_records:
                 self.fixed_next = max(
                     _timestamp(r["issued"]) for r in self.fixed_records

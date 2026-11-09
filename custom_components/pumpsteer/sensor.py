@@ -187,6 +187,8 @@ class PumpSteerSensor(RestoreEntity):
         self._thermal_intelligence = ThermalIntelligence()
         self._thermal_store_restored = False
         self._thermal_fit_task: Optional[asyncio.Task] = None
+        self._thermal_store_last_at = None
+        self._thermal_store_signature = None
         self._adaptive_context = None
         self._adaptive_configuration = None
         self._adaptive_report = None
@@ -719,6 +721,7 @@ class PumpSteerSensor(RestoreEntity):
         async_dispatcher_send(self.hass, self._input_temperature_signal)
         if self._cfg().get("thermal_intelligence_enabled") is True:
             try:
+                self._thermal_intelligence.suspend("unload", dt_util.now())
                 self._plan_audit.cancel_plans("unload")
                 await self._save_pilot_store()
                 await self._flush_pilot_store()
@@ -1273,16 +1276,6 @@ class PumpSteerSensor(RestoreEntity):
                 self._thermal_model.end_validation_session(now, indoor)
             return
 
-        if not was_active and self._cfg().get("thermal_intelligence_enabled") is True:
-            cfg = self._cfg()
-            if self._thermal_model.is_valid:
-                self._plan_audit.issue_fixed(
-                    now,
-                    indoor,
-                    outdoor,
-                    self._thermal_model.k,
-                    self._fixed_audit_identity(cfg),
-                )
         if not was_active:
             # Never infer the stable brake cooling rate from earlier PI/ramp history.
             self._thermal_model.reset_temp_history(
@@ -1308,6 +1301,7 @@ class PumpSteerSensor(RestoreEntity):
             self._thermal_learning_reason = "observation_gap"
 
         self._thermal_model.collect_braking_sample(indoor, outdoor)
+
 
     async def _enter_safe_mode(
         self,
@@ -1727,6 +1721,50 @@ class PumpSteerSensor(RestoreEntity):
         except Exception:
             _LOGGER.debug("Thermal Intelligence output capture failed", exc_info=True)
 
+    def _update_shared_thermal_audit(self, now, cfg):
+        """Use the single audit for persistence and a frozen passive candidate."""
+        from types import SimpleNamespace
+
+        runtime = self._thermal_intelligence
+        observation = runtime.latest_observation
+        if observation is None or observation.get("segment") != runtime.context_id:
+            self._plan_audit.fixed_pending = None
+            return
+        reported = datetime.fromisoformat(observation["indoor_reported_at"])
+        command = runtime.current_command
+        coordinate = command.get("coordinate") if command is not None else None
+        identity = self._fixed_audit_identity(cfg)
+        state = SimpleNamespace(
+            state=str(observation["indoor_c"]), last_reported=reported,
+            last_updated=reported, last_changed=reported,
+            attributes={"unit_of_measurement": "°C"},
+        )
+        audit = self._plan_audit
+        context = str(runtime.context_id)
+        mode = observation["mode"]
+        audit.observe_shared(now, state, identity, command=coordinate,
+                             mode=mode, context_id=context)
+        params = runtime.model.parameters()
+        candidate = None
+        revision = "persistence"
+        if params is not None and coordinate is not None and command is not None:
+            established = datetime.fromisoformat(command["established_at"])
+            if now - established >= timedelta(minutes=params.dead_time_minutes):
+                candidate = {
+                    "loss_per_hour": params.loss_rate_per_h,
+                    "command_gain_per_hour": params.heating_rate_k_per_h,
+                    "background_per_hour": params.gains_k_per_h,
+                }
+                import hashlib
+                revision = "rtm:" + hashlib.sha256(
+                    repr((runtime.model._last_fit_ts, candidate)).encode()
+                ).hexdigest()
+        audit.issue_shared(
+            now, observation["indoor_c"], observation["outdoor_c"], None, identity,
+            revision=revision, context_id=context, command=coordinate, mode=mode,
+            candidate=candidate, source_reported=reported,
+        )
+
     def _maybe_schedule_thermal_fit(self, now: datetime) -> None:
         """Schedule asynchronous model fitting in an HA executor thread."""
         if self._thermal_fit_task is not None and not self._thermal_fit_task.done():
@@ -1757,6 +1795,7 @@ class PumpSteerSensor(RestoreEntity):
 
     def _thermal_cycle(self, at, indoor, outdoor, fake_temp, mode, extra, cfg):
         """Capture a bounded source snapshot without affecting the control result."""
+        import hashlib
         indoor_state = self._temperature_state(cfg, "indoor_temp_entity")
         indoor_attrs = getattr(indoor_state, "attributes", {}) or {}
         used = indoor_attrs.get("source_temperatures_used")
@@ -1833,12 +1872,12 @@ class PumpSteerSensor(RestoreEntity):
             "command_span": safe_float(
                 cfg.get("pid_output_clamp", PID_OUTPUT_CLAMP)
             ),
-            "command_source": (
-                "ohmigo_single"
-                if cfg.get("ohmigo_entity")
-                and not str(cfg.get("modbus_service", "")).strip()
-                else "unverified_or_multiple_transports"
-            ),
+            "gos_active": bool(str(cfg.get("modbus_service", "")).strip()),
+            "command_source": repr((
+                cfg.get("ohmigo_entity"), cfg.get("modbus_service"),
+                hashlib.sha256(str(cfg.get("modbus_payload_template", "")).encode()).hexdigest(),
+                safe_float(cfg.get("pid_output_clamp", PID_OUTPUT_CLAMP)),
+            )),
         }
 
     def _update_brake_ramp(
@@ -3985,104 +4024,23 @@ class PumpSteerSensor(RestoreEntity):
             expected,
         )
         if cfg.get("thermal_intelligence_enabled") is True:
+            try:
+                self._update_shared_thermal_audit(now, cfg)
+            except Exception:
+                self._plan_audit.fixed_pending = None
+                _LOGGER.debug("Shared thermal audit unavailable", exc_info=True)
             self._maybe_schedule_thermal_fit(now)
             try:
                 if self._pilot_store_read_failed:
                     await self._load_pilot_store()
                 if self._temperature_inputs_match(cfg, expected):
                     self._observe_plan_outcomes(cfg, dt_util.now())
-                    sample = self._observe_pilot(cfg, now, mode)
-                    if sample is not None and self._pilot is not None:
-                        import asyncio
-                        import copy
-                        from .ohmigo import _switch_entity_id
-
-                        observed_pilot = self._pilot
-                        entities = [
-                            cfg.get(key)
-                            for key in (
-                                "indoor_temp_entity",
-                                "indoor_temp_entity_2",
-                                "indoor_temp_entity_3",
-                                "real_outdoor_entity",
-                                "outdoor_temp_entity_2",
-                                "electricity_price_entity",
-                                "price_tomorrow_entity",
-                                "thermal_heat_activity_entity",
-                                "thermal_supply_temp_entity",
-                                "thermal_heating_mode_entity",
-                                "thermal_hot_water_mode_entity",
-                                "thermal_compressor_entity",
-                                "thermal_return_temp_entity",
-                                "thermal_power_entity",
-                                "ohmigo_entity",
-                                "ohmigo_relay_entity",
-                            )
-                        ]
-                        entities.append(
-                            _switch_entity_id(self.hass, self._config_entry.entry_id)
-                        )
-
-                        def snapshot():
-                            states = [
-                                self.hass.states.get(entity) if entity else None
-                                for entity in entities
-                            ]
-                            return tuple(
-                                (
-                                    getattr(state, "state", None),
-                                    getattr(state, "last_reported", None),
-                                    getattr(state, "last_changed", None),
-                                    repr(getattr(state, "attributes", None)),
-                                )
-                                for state in states
-                            )
-
-                        before = snapshot()
-                        fitted_pump = copy.deepcopy(observed_pilot.manager.pump)
-                        try:
-                            await asyncio.to_thread(fitted_pump.add_interval, sample)
-                        except asyncio.CancelledError:
-                            if self._pilot is observed_pilot:
-                                observed_pilot.reset_interval()
-                                self._pilot_plan = {
-                                    "planning_status": "unavailable",
-                                    "reason": "learning_cancelled",
-                                }
-                                self._pilot_plan_next = None
-                            raise
-                        if self._pilot is not observed_pilot:
-                            return
-                        if (
-                            self._temperature_unloaded
-                            or snapshot() != before
-                            or self._cfg() != cfg
-                            or not self._temperature_inputs_match(cfg, expected)
-                        ):
-                            observed_pilot.reset_interval()
-                            self._pilot_grid_marginal = {
-                                "status": "unavailable",
-                                "reason": "inputs_changed_during_learning",
-                            }
-                            self._pilot_plan = {
-                                "planning_status": "unavailable",
-                                "reason": "inputs_changed_during_learning",
-                            }
-                            self._pilot_plan_next = None
-                            return
-                        observed_pilot.manager.pump = fitted_pump
+                    # Keep heat/price diagnostics, retire the separate live
+                    # Pilot learner and its parallel passive planner.
+                    self._observe_pilot(cfg, now, mode, collect_model=False)
+                    self._pilot_plan = {"planning_status": "unavailable",
+                                        "reason": "shared_evidence_chain"}
                     await self._save_pilot_store()
-                    try:
-                        await self._plan_pilot(cfg, now, extra, fake_temp)
-                    except Exception:
-                        _LOGGER.exception(
-                            "Passive plan failed; standard control continues"
-                        )
-                        self._pilot_plan = {
-                            "planning_status": "unavailable",
-                            "reason": "planning_error",
-                        }
-                        self._pilot_plan_next = None
                 else:
                     self._pilot_grid_marginal = {
                         "status": "unavailable",
@@ -4446,6 +4404,11 @@ class PumpSteerSensor(RestoreEntity):
                     "samples": self._heat_operation.export(),
                 }
                 self._pilot_persisted = payload
+            if self._thermal_intelligence.has_evidence:
+                self._pilot_persisted = {
+                    **self._pilot_persisted,
+                    "thermal_intelligence": self._thermal_intelligence.export_state(),
+                }
             await self._pilot_store.async_save(self._pilot_persisted)
 
     async def _save_pilot_store(self):
@@ -4472,6 +4435,7 @@ class PumpSteerSensor(RestoreEntity):
                 or plan_data["pending_count"]
                 or plan_data["unverifiable"]
                 or plan_data["fixed_v1"]
+                or plan_data.get("fixed_v2")
             )
         ):
             return
@@ -4493,6 +4457,16 @@ class PumpSteerSensor(RestoreEntity):
         plan_last = (
             plan_data["records"][-1]["observed"] if plan_data["records"] else None
         )
+        thermal_signature = self._thermal_intelligence.store_signature
+        store_now = dt_util.now()
+        thermal_last_at = getattr(self, "_thermal_store_last_at", None)
+        thermal_due = thermal_available and (
+            thermal_last_at is None or store_now - thermal_last_at >= timedelta(minutes=5)
+        )
+        thermal_key = (
+            thermal_signature if thermal_due
+            else getattr(self, "_thermal_store_signature", None)
+        )
         key = (
             self._pilot_sources,
             pilot.house_intervals if model_available else None,
@@ -4502,17 +4476,19 @@ class PumpSteerSensor(RestoreEntity):
             plan_last,
             plan_data["pending_count"],
             plan_data["unverifiable"],
+            len(plan_data.get("fixed_v2", [])),
+            plan_data["fixed_v2"][-1]["observed"] if plan_data.get("fixed_v2") else None,
             len(plan_data["fixed_v1"]),
             plan_data["fixed_v1"][-1]["observed"] if plan_data["fixed_v1"] else None,
             self._heat_operation_signature if operation_available else None,
             operation.sample_count // 18 if operation_available else None,
-            self._thermal_intelligence.store_signature,
+            thermal_key,
         )
         if key == self._pilot_saved:
             return
         payload = dict(self._pilot_persisted or {})
         payload.update(version=1, plan_audit=plan_data)
-        if thermal_available:
+        if thermal_due:
             payload["thermal_intelligence"] = (
                 self._thermal_intelligence.export_state()
             )
@@ -4533,6 +4509,9 @@ class PumpSteerSensor(RestoreEntity):
             self._pilot_store.async_delay_save(lambda: payload, 30)
             self._pilot_saved = key
             self._pilot_persisted = payload
+            if thermal_due:
+                self._thermal_store_last_at = store_now
+                self._thermal_store_signature = thermal_signature
         except Exception:
             _LOGGER.warning("Passive thermal history could not be saved", exc_info=True)
 
@@ -5352,7 +5331,7 @@ class PumpSteerSensor(RestoreEntity):
                     result.pop("plan_outcome_reason", None)
                     await self._save_pilot_store()
 
-    def _observe_pilot(self, cfg, now, mode):
+    def _observe_pilot(self, cfg, now, mode, *, collect_model=True):
         """Passive learning from explicitly selected delivered-house-heat state."""
         self._pilot_operating_mode = "unknown"
         self._pilot_operating_quality = "insufficient_evidence"
@@ -5590,7 +5569,7 @@ class PumpSteerSensor(RestoreEntity):
         if not use_supply and (
             not isinstance(source, str) or not source.startswith("binary_sensor.")
         ):
-            if operation is not None:
+            if operation is not None and collect_model:
                 if self._pilot is None:
                     from .pilot_passive import PilotPassive
 
@@ -5737,7 +5716,7 @@ class PumpSteerSensor(RestoreEntity):
 
                 self._pilot = PilotPassive()
                 self._restore_pilot_history(self._pilot, signature, now)
-            if operation is not None:
+            if operation is not None and collect_model:
                 self._pilot.observe_indicated(
                     now,
                     self._temperature_state(cfg, "indoor_temp_entity"),
@@ -5756,6 +5735,15 @@ class PumpSteerSensor(RestoreEntity):
                     if self._pilot.indicated_observations
                     else None
                 )
+            if not collect_model:
+                from .pilot_passive import PilotPassive
+                heat_report = PilotPassive._report(
+                    heat_state, now, reported_after=self._temperature_reported_after
+                )
+                self._pilot_status = hot_water_status or (
+                    "heat_signal_unavailable" if heat_report is None else "shared_evidence_chain"
+                )
+                return
             if mode in {"normal", "preheating", "pre_braking", "braking", "brake_hold"}:
                 paired = self._pilot.audit.observe(
                     now,

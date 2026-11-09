@@ -7,7 +7,7 @@ Row ``k`` of a :class:`Grid` describes the interval ``[t_k, t_k + step)``:
   ``max_gap`` (``outdoor_max_gap`` for outdoor). Large gaps therefore break the series.
 - ``effort[k]``: time-weighted mean of the (piecewise constant) effort over the interval.
   Each effort observation is held until the next one, at most ``max_gap``; ``None`` when
-  less than half of the interval is covered.
+  any part of the interval has unknown effort.
 - ``excluded[k]``: an excluded observation is in force somewhere in the interval.
 
 Samples are ``Sample`` objects; ``None`` in a field means "not observed in this sample".
@@ -73,7 +73,9 @@ class Grid:
 
     def valid_indoor_count(self) -> int:
         return sum(
-            1 for v, ex in zip(self.indoor, self.excluded, strict=True) if v is not None and not ex
+            1
+            for v, ex in zip(self.indoor, self.excluded, strict=True)
+            if v is not None and not ex
         )
 
     def append_rows(self, other: Grid) -> None:
@@ -154,12 +156,18 @@ class Grid:
     def snapshot(self) -> Grid:
         """Consistent copy, safe against rows appended/trimmed concurrently."""
         start = self.start_ts
-        indoor, outdoor, effort = list(self.indoor), list(self.outdoor), list(self.effort)
+        indoor, outdoor, effort = (
+            list(self.indoor),
+            list(self.outdoor),
+            list(self.effort),
+        )
         excluded = list(self.excluded)
         n = min(len(indoor), len(outdoor), len(effort), len(excluded))
         if start is not None and self.start_ts != start:  # trimmed while copying: retry
             return self.snapshot()
-        return Grid(self.step_minutes, start, indoor[:n], outdoor[:n], effort[:n], excluded[:n])
+        return Grid(
+            self.step_minutes, start, indoor[:n], outdoor[:n], effort[:n], excluded[:n]
+        )
 
     # -- compact JSON form ------------------------------------------------------------
     def to_dict(self) -> dict[str, Any]:
@@ -173,11 +181,15 @@ class Grid:
         return {
             "step_minutes": self.step_minutes,
             "start_ts": self.start_ts,
-            "indoor_rle": rle_encode([None if v is None else round(v * 100) for v in self.indoor]),
+            "indoor_rle": rle_encode(
+                [None if v is None else round(v * 100) for v in self.indoor]
+            ),
             "outdoor_rle": rle_encode(
                 [None if v is None else round(v * 100) for v in self.outdoor]
             ),
-            "effort_rle": rle_encode([None if v is None else round(v * 1000) for v in self.effort]),
+            "effort_rle": rle_encode(
+                [None if v is None else round(v * 1000) for v in self.effort]
+            ),
             "excluded_rows": [i for i, ex in enumerate(self.excluded) if ex],
         }
 
@@ -194,7 +206,9 @@ class Grid:
             if 0 <= i < n:
                 excluded[i] = True
         start = data.get("start_ts")
-        return cls(float(data["step_minutes"]), start, indoor, outdoor, effort, excluded)
+        return cls(
+            float(data["step_minutes"]), start, indoor, outdoor, effort, excluded
+        )
 
 
 def rle_encode(values: list[int | None]) -> list[int | None]:
@@ -265,12 +279,20 @@ def resample(
         return grid
 
     indoor_ev = [
-        (t, s.indoor_c) for t, s in zip(times, rows, strict=True) if s.indoor_c is not None
+        (t, None if s.excluded else s.indoor_c)
+        for t, s in zip(times, rows, strict=True)
+        if s.indoor_c is not None or s.excluded
     ]
     outdoor_ev = [
-        (t, s.outdoor_c) for t, s in zip(times, rows, strict=True) if s.outdoor_c is not None
+        (t, None if s.excluded else s.outdoor_c)
+        for t, s in zip(times, rows, strict=True)
+        if s.outdoor_c is not None or s.excluded
     ]
-    effort_ev = [(t, s.effort) for t, s in zip(times, rows, strict=True) if s.effort is not None]
+    effort_ev = [
+        (t, None if s.excluded else s.effort)
+        for t, s in zip(times, rows, strict=True)
+        if s.effort is not None or s.excluded
+    ]
 
     grid.indoor = _locf(indoor_ev, start_ts, step_s, n, max_gap_s)
     grid.outdoor = _locf(outdoor_ev, start_ts, step_s, n, out_gap_s)
@@ -291,7 +313,11 @@ def resample(
 
 
 def _locf(
-    events: list[tuple[float, float]], start: float, step: float, n: int, max_age: float
+    events: list[tuple[float, float | None]],
+    start: float,
+    step: float,
+    n: int,
+    max_age: float,
 ) -> list[float | None]:
     out: list[float | None] = [None] * n
     j = -1
@@ -306,7 +332,11 @@ def _locf(
 
 
 def _step_mean(
-    events: list[tuple[float, float]], start: float, step: float, n: int, max_hold: float
+    events: list[tuple[float, float | None]],
+    start: float,
+    step: float,
+    n: int,
+    max_hold: float,
 ) -> list[float | None]:
     out: list[float | None] = [None] * n
     m = len(events)
@@ -326,10 +356,10 @@ def _step_mean(
             hold_end = min(t_next, t_i + max_hold)
             lo = max(a, t_i)
             hi = min(b, hold_end)
-            if hi > lo:
+            if hi > lo and v is not None:
                 covered += hi - lo
                 integral += (hi - lo) * v
             i += 1
-        if covered >= 0.5 * step:
+        if covered >= step - 1e-6:
             out[k] = integral / covered
     return out

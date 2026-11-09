@@ -161,7 +161,7 @@ def test_weather_initial_interval_rejects_invalid_observation(outdoor):
     assert _weather_intervals(rows, T + timedelta(minutes=20), 2, current_outdoor=outdoor) is None
 
 
-def test_ha_cycle_runs_optimizer_with_no_heat_sensor_and_keeps_pi_unchanged(
+def test_ha_cycle_retires_parallel_optimizer_and_keeps_pi_unchanged(
     monkeypatch,
 ):
     from custom_components.pumpsteer import forecast
@@ -218,38 +218,33 @@ def test_ha_cycle_runs_optimizer_with_no_heat_sensor_and_keeps_pi_unchanged(
     monkeypatch.setattr(response_optimizer, "optimize", spy)
     before = _cycle(base, monkeypatch, 0)
     attrs = _cycle(candidate, monkeypatch, 0)
-    assert calls
-    assert attrs["thermal_intelligence_planning_status"] == "hypothetical_unvalidated"
-    assert (
-        attrs["thermal_intelligence_plan_detail"]["comparison"]["baseline"]
-        == "conditional_pi_only"
-    )
-    assert (
-        attrs["thermal_intelligence_plan_detail"]["cost_kind"] == "proxy_not_currency"
-    )
+    assert calls == []
+    assert attrs["thermal_intelligence_planning_status"] == "unavailable"
+    assert attrs["thermal_intelligence_plan_detail"]["reason"] == "shared_evidence_chain"
     assert candidate.state == base.state
     assert attrs["mode"] == before["mode"]
+    assert candidate._pi._integral == base._pi._integral
+    assert candidate._pi._last_error == base._pi._last_error
+    pending = candidate._plan_audit.fixed_pending
+    assert pending["kind"] == "shared_command_response"
+    assert pending["curves"] == [{"name": "persistence", "rate": 0.0}]
+    assert candidate._pilot is None
     candidate._config_entry.options["target_temperature"] = 21.5
     changed = _cycle(candidate, monkeypatch, 1)
     assert changed["thermal_intelligence_planning_status"] == "unavailable"
-    assert (
-        changed["thermal_intelligence_plan_detail"]["reason"]
-        == "context_changed_waiting_for_replan"
-    )
+    assert changed["thermal_intelligence_plan_detail"]["reason"] == "shared_evidence_chain"
     states["weather.local"].state = "unavailable"
     unavailable = _cycle(candidate, monkeypatch, 2)
     assert unavailable["thermal_intelligence_planning_status"] == "unavailable"
-    assert (
-        unavailable["thermal_intelligence_plan_detail"]["reason"]
-        == "weather_forecast_unavailable"
-    )
+    assert unavailable["thermal_intelligence_plan_detail"]["reason"] == "shared_evidence_chain"
+    assert calls == []
 
 
 @pytest.mark.parametrize("mismatched_forecast", [False, True])
-def test_ha_cycle_compares_pi_in_known_normal_price_window(
+def test_ha_cycle_keeps_pi_and_price_context_without_parallel_comparison(
     monkeypatch, mismatched_forecast
 ):
-    """The conditional PI path is connected to real price classifications."""
+    """Real price classifications remain passive inputs to the shared chain."""
     from custom_components.pumpsteer import forecast
     from test_brake_provenance import _sensor, _cycle
 
@@ -305,12 +300,12 @@ def test_ha_cycle_compares_pi_in_known_normal_price_window(
     assert attrs["mode"] == before["mode"] == "normal"
     assert candidate.state == base.state
     assert candidate._pilot_price_context is not None
-    comparison = attrs["thermal_intelligence_plan_detail"]["comparison"]
-    if mismatched_forecast:
-        assert comparison["baseline"] == "unavailable"
-    else:
-        assert comparison["baseline"] == "conditional_pi_only"
-        assert comparison["baseline_reason"] == "no_expensive_period_in_known_window"
+    assert candidate._pi._integral == base._pi._integral
+    assert candidate._pi._last_error == base._pi._last_error
+    assert attrs["thermal_intelligence_planning_status"] == "unavailable"
+    assert attrs["thermal_intelligence_plan_detail"]["reason"] == "shared_evidence_chain"
+    assert "comparison" not in attrs["thermal_intelligence_plan_detail"]
+    assert candidate._plan_audit.fixed_pending["kind"] == "shared_command_response"
 
 
 def test_store_roundtrip_keeps_historical_model_unvalidated():
@@ -370,7 +365,7 @@ def test_corrupt_or_future_history_is_not_restored():
     assert not pilot.manager.pump.ready
 
 
-def test_sensor_lifecycle_saves_and_restores_qualified_history(monkeypatch):
+def test_sensor_lifecycle_saves_and_restores_shared_evidence_history(monkeypatch):
     import asyncio
     import copy
     import sys
@@ -407,6 +402,7 @@ def test_sensor_lifecycle_saves_and_restores_qualified_history(monkeypatch):
     sensor._config_entry.options.update(
         thermal_intelligence_enabled=True,
         thermal_heat_activity_entity="binary_sensor.house_heat",
+        aggressiveness=0,
     )
     for key in ("sensor.indoor", "sensor.outdoor"):
         states[key].attributes["unit_of_measurement"] = "°C"
@@ -420,9 +416,16 @@ def test_sensor_lifecycle_saves_and_restores_qualified_history(monkeypatch):
             last_changed=at - timedelta(minutes=1),
             attributes={},
         )
+        states["sensor.indoor"].state = str(20.5 - minute / 1000)
         _cycle(sensor, monkeypatch, minute)
     assert persisted
-    assert len(next(iter(persisted.values()))["house"]["observations"]) == 1
+    history = copy.deepcopy(next(iter(persisted.values())))
+    assert "house" not in history
+    observations = [row for row in history["thermal_intelligence"]["events"] if row["kind"] == "observation"]
+    assert len(observations) == 14
+    assert history["plan_audit"]["fixed_v2"]
+    assert {row["horizon"] for row in history["plan_audit"]["fixed_v2"]} == {30, 60}
+    assert all(row["model_order"] == ["persistence"] for row in history["plan_audit"]["fixed_v2"])
     restored, other = _sensor()
     monkeypatch.setattr(
         restored, "async_get_last_extra_data", no_extra_data, raising=False
@@ -430,6 +433,7 @@ def test_sensor_lifecycle_saves_and_restores_qualified_history(monkeypatch):
     restored._config_entry.options.update(
         thermal_intelligence_enabled=True,
         thermal_heat_activity_entity="binary_sensor.house_heat",
+        aggressiveness=0,
     )
     for key in ("sensor.indoor", "sensor.outdoor"):
         other[key].attributes["unit_of_measurement"] = "°C"
@@ -446,9 +450,15 @@ def test_sensor_lifecycle_saves_and_restores_qualified_history(monkeypatch):
         attributes={},
     )
     _cycle(restored, monkeypatch, 70)
-    assert restored._pilot.house_intervals == 1
+    restored_events = restored._thermal_intelligence.export_state()["events"]
+    assert all(row in restored_events for row in observations)
+    assert any(row["kind"] == "interruption" and row["reason"] == "restart" for row in restored_events)
+    assert restored._plan_audit.fixed_records == history["plan_audit"]["fixed_v2"]
+    assert restored._plan_audit.fixed_pending is None
+    assert restored._pilot.house_intervals == 0
+    assert not restored._pilot.manager.model.history
     assert not restored._pilot.manager.pump.ready
-    assert restored._pilot.manager.house.start == when.timestamp()
+    assert restored._pilot.manager.house.start is None
 
 
 @__import__("pytest").mark.parametrize("bad", [float("nan"), "nan", "1e999"])
@@ -620,7 +630,7 @@ def test_validated_passive_plan_uses_response_and_qualified_house_parameters():
     assert result["planning_status"] == "hypothetical_unvalidated"
 
 
-def test_ha_cycle_exposes_validated_passive_with_synthetic_qualified_fixture(
+def test_ha_cycle_cannot_reactivate_retired_planner_from_legacy_qualified_fixture(
     monkeypatch,
 ):
     from custom_components.pumpsteer import forecast
@@ -716,62 +726,28 @@ def test_ha_cycle_exposes_validated_passive_with_synthetic_qualified_fixture(
         "binary_sensor.heat",
         False,
     )
-    monkeypatch.setattr(sensor, "_observe_pilot", lambda *args: None)
-    attrs = _cycle(sensor, monkeypatch, 0)
-    assert attrs["thermal_intelligence_planning_status"] == "validated_passive"
-    assert attrs["thermal_intelligence_plan_detail"]["validation"]["samples"] == 8
-    assert saved[-1]["forecast_audit"]["pending"]["issued"] == at.isoformat()
-    assert (
-        attrs["thermal_intelligence_plan_detail"]["monitoring_forecast"][
-            "horizon_minutes"
-        ]
-        == 15
-    )
-    assert (
-        attrs["thermal_intelligence_plan_detail"]["cost_kind"] == "proxy_not_currency"
-    )
-    sensor._config_entry.options["external_heat_sources"] = True
-    sensor._pilot_plan_next = None
-    attrs = _cycle(sensor, monkeypatch, 1)
-    assert attrs["thermal_intelligence_planning_status"] == "hypothetical_unvalidated"
+    monkeypatch.setattr(sensor, "_observe_pilot", lambda *args, **kwargs: None)
     from custom_components.pumpsteer.pilot_vendor import response_optimizer
-
-    original = response_optimizer.optimize
-
-    def change_weather(*args, **kwargs):
-        states["weather.local"].state = "unavailable"
-        return original(*args, **kwargs)
-
-    monkeypatch.setattr(response_optimizer, "optimize", change_weather)
-    sensor._pilot_grid_marginal = {"status": "available_conditional_grid_import"}
-    sensor._pilot_plan_next = None
-    attrs = _cycle(sensor, monkeypatch, 2)
-    assert attrs["thermal_intelligence_planning_status"] == "unavailable"
-    assert (
-        attrs["thermal_intelligence_plan_detail"]["reason"]
-        == "inputs_changed_during_planning"
-    )
-    assert attrs["thermal_intelligence_grid_marginal"]["status"] == "unavailable"
-    states["weather.local"].state = "cloudy"
-    sensor._config_entry.options["thermal_hot_water_mode_entity"] = (
-        "binary_sensor.hot_water"
-    )
-    states["binary_sensor.hot_water"] = SimpleNamespace(
-        state="off", last_reported=at, last_changed=at, attributes={}
-    )
-
-    def change_hot_water(*args, **kwargs):
-        states["binary_sensor.hot_water"].state = "on"
-        return original(*args, **kwargs)
-
-    monkeypatch.setattr(response_optimizer, "optimize", change_hot_water)
-    sensor._pilot_plan_next = None
-    attrs = _cycle(sensor, monkeypatch, 3)
-    assert attrs["thermal_intelligence_planning_status"] == "unavailable"
-    assert (
-        attrs["thermal_intelligence_plan_detail"]["reason"]
-        == "inputs_changed_during_planning"
-    )
+    calls = []
+    monkeypatch.setattr(response_optimizer, "optimize", lambda *args, **kwargs: calls.append(True))
+    for minute in range(4):
+        if minute == 1:
+            sensor._config_entry.options["external_heat_sources"] = True
+        if minute == 2:
+            states["weather.local"].state = "unavailable"
+        if minute == 3:
+            sensor._config_entry.options["thermal_hot_water_mode_entity"] = "binary_sensor.hot_water"
+            states["binary_sensor.hot_water"] = SimpleNamespace(
+                state="on", last_reported=at, last_changed=at, attributes={}
+            )
+        attrs = _cycle(sensor, monkeypatch, minute)
+        assert attrs["thermal_intelligence_planning_status"] == "unavailable"
+        assert attrs["thermal_intelligence_plan_detail"]["reason"] == "shared_evidence_chain"
+        assert sensor._pilot.audit.pending is None
+        assert sensor._plan_audit.fixed_pending["curves"] == [{"name": "persistence", "rate": 0.0}]
+    assert calls == []
+    assert saved
+    assert all(row["forecast_audit"]["pending"] is None for row in saved)
 
 
 def test_extended_horizon_reports_terminal_state_without_claiming_savings():

@@ -1,0 +1,9 @@
+{
+  "cycles": 2880,
+  "events": 2048,
+  "json_bytes": 850569,
+  "capture_median_ms": 0.045454129576683044,
+  "capture_p95_ms": 0.11206697672605515,
+  "capture_max_ms": 0.2746167592704296,
+  "export_json_ms": 24.684957694262266
+}

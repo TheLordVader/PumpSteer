@@ -302,87 +302,10 @@ def test_sufficient_excitation_identifies_parameters():
 # ============================================================================
 
 
-def test_forecast_tolerates_realistic_outdoor_drift():
-    """An ambient temperature drift of <= 3.0 C does NOT invalidate a pending forecast."""
-    runtime = _setup_runtime_with_model()
-    t_issued = _issue_forecast(runtime, START, outdoor=2.0, command=-8.0)
-    assert runtime._pending_forecast is not None
-    assert runtime._pending_forecast["outdoor"] == 2.0
-
-    # At t_issued + 60m, outdoor has drifted to 4.5 C (delta = 2.5 C <= 3.0 C)
-    t_obs = t_issued + timedelta(minutes=60)
-    values_obs = [("sensor.room_1", 1.0, 19.8, 0)]
-    runtime.begin_cycle(
-        _make_cycle(t_obs, values_obs, mode="braking", outdoor=4.5, command=-8.0, brake_factor=1.0),
-        use_ohmigo_input=True,
-    )
-
-    # Forecast must NOT be invalidated; it must be scored!
-    assert len(runtime._scores) == 1
-    score = runtime._scores[0]
-    assert score["horizon_minutes"] == 60.0
-    assert score["model_error_c"] is not None
-    assert score["persistence_error_c"] == 0.1  # 19.9 -> 19.8
-    assert runtime._pending_forecast is None
 
 
-def test_forecast_aborts_when_outdoor_drift_exceeds_threshold():
-    """An ambient temperature drift > 3.0 C aborts pending forecast with forecast_weather_drift_exceeded."""
-    runtime = _setup_runtime_with_model()
-    t_issued = _issue_forecast(runtime, START, outdoor=2.0, command=-8.0)
-    assert runtime._pending_forecast is not None
-
-    # At t_issued + 60m, outdoor jumps to 5.5 C (delta = 3.5 C > 3.0 C)
-    t_obs = t_issued + timedelta(minutes=60)
-    values_obs = [("sensor.room_1", 1.0, 19.8, 0)]
-    runtime.begin_cycle(
-        _make_cycle(t_obs, values_obs, mode="braking", outdoor=5.5, command=-8.0, brake_factor=1.0),
-        use_ohmigo_input=True,
-    )
-
-    assert len(runtime._scores) == 0
-    assert runtime._pending_forecast is None
-    assert runtime._interruptions[-1]["reason"] == "forecast_weather_drift_exceeded"
 
 
-def test_forecast_arrival_window_45_to_75_minutes():
-    """Endpoints arriving between 45 and 75 min are scored at actual elapsed duration without interpolation."""
-    # Test case A: report arrives at 50 minutes (valid window)
-    runtime_a = _setup_runtime_with_model()
-    t_issued_a = _issue_forecast(runtime_a, START, outdoor=2.0, command=-8.0)
-    assert runtime_a._pending_forecast is not None
-
-    # Arrival at 30 min (too early -> remains pending)
-    t_30 = t_issued_a + timedelta(minutes=30)
-    runtime_a.begin_cycle(
-        _make_cycle(t_30, [("sensor.room_1", 1.0, 19.85, 0)], outdoor=2.0, command=-8.0),
-        use_ohmigo_input=True,
-    )
-    assert len(runtime_a._scores) == 0
-    assert runtime_a._pending_forecast is not None
-
-    # Arrival at 50 min (within [45, 75] -> scored at 50 min elapsed)
-    t_50 = t_issued_a + timedelta(minutes=50)
-    runtime_a.begin_cycle(
-        _make_cycle(t_50, [("sensor.room_1", 1.0, 19.80, 0)], outdoor=2.0, command=-8.0),
-        use_ohmigo_input=True,
-    )
-    assert len(runtime_a._scores) == 1
-    assert runtime_a._scores[0]["horizon_minutes"] == 50.0
-
-    # Test case B: no report arrives by 76 minutes -> expires
-    runtime_b = _setup_runtime_with_model()
-    t_issued_b = _issue_forecast(runtime_b, START, outdoor=2.0, command=-8.0)
-    assert runtime_b._pending_forecast is not None
-
-    t_80 = t_issued_b + timedelta(minutes=80)
-    runtime_b.begin_cycle(
-        _make_cycle(t_80, [("sensor.room_1", 1.0, 19.7, 0)], outdoor=2.0, command=-8.0),
-        use_ohmigo_input=True,
-    )
-    assert len(runtime_b._scores) == 0
-    assert runtime_b._pending_forecast is None
-    assert runtime_b._interruptions[-1]["reason"] == "forecast_outcome_unavailable"
 
 
 # ============================================================================
@@ -423,7 +346,7 @@ def test_evidence_collection_regimes_and_quantization():
 
     obs = runtime._observations[-1]
     assert obs["regime"] == "normal_pi"
-    assert obs["data_quality"] == "valid"
+    assert obs["data_quality"] == "empirical_command_unverified"
     assert obs["calculated_virtual_outdoor_c"] == 2.5
     assert obs["dispatched_virtual_outdoor_c"] == 3.0
     assert obs["command_quantization_error_c"] == 0.5
@@ -438,7 +361,7 @@ def test_export_and_restore_state_lifecycle():
     """State export/restore bounds history, clears pending forecasts, and preserves diagnostics."""
     runtime = _setup_runtime_with_model()
     _issue_forecast(runtime, START, outdoor=2.0, command=-8.0)
-    assert runtime._pending_forecast is not None
+    assert runtime.current_command is not None
 
     exported = runtime.export_state()
     assert "status" in exported
@@ -450,9 +373,10 @@ def test_export_and_restore_state_lifecycle():
     success = new_runtime.restore_state(exported)
     assert success is True
     # Crucial safety: open predictions never resume across restarts
-    assert new_runtime._pending_forecast is None
+    assert new_runtime.current_command is None
+    assert new_runtime._interruptions[-1]["reason"] == "restart"
     assert new_runtime.model.parameters() is not None
-    assert new_runtime._fit_generation == runtime._fit_generation
+    assert new_runtime._fit_generation > runtime._fit_generation
 
 
 # ============================================================================
@@ -460,43 +384,6 @@ def test_export_and_restore_state_lifecycle():
 # ============================================================================
 
 
-def test_forecast_uses_frozen_model_parameters_despite_subsequent_refit():
-    """A refit between issuing the forecast and observing the outcome must not contaminate predictions."""
-    runtime = _setup_runtime_with_model()
-    # Initial model has P1: a=0.5, b=0.03, c=0.01, d=0.0
-    t_issued = _issue_forecast(runtime, START, outdoor=2.0, command=-8.0)
-    assert runtime._pending_forecast is not None
-    assert runtime._pending_forecast["params"]["heating_rate_k_per_h"] == 0.5
-    frozen_predicted = runtime._pending_forecast["predicted"]
-
-    # Deliberately replace model parameters with drastically different parameters P2 while forecast is pending
-    runtime.model._params = {
-        "a": 5.0,  # 10x heating gain!
-        "b": 0.5,  # 16x loss rate!
-        "c": 0.5,
-        "d_minutes": 0.0,
-        "use_outdoor": True,
-    }
-    # Verify model now reports P2
-    params_p2 = runtime.model.parameters()
-    assert params_p2 is not None
-    assert params_p2.heating_rate_k_per_h == 5.0
-
-    # At t_issued + 60m, observe outcome
-    t_obs = t_issued + timedelta(minutes=60)
-    values_obs = [("sensor.room_1", 1.0, 19.8, 0)]
-    runtime.begin_cycle(
-        _make_cycle(t_obs, values_obs, mode="braking", outdoor=2.0, command=-8.0, brake_factor=1.0),
-        use_ohmigo_input=True,
-    )
-
-    # Forecast must be scored using P1 (frozen params), NOT P2!
-    assert len(runtime._scores) == 1
-    score = runtime._scores[0]
-    expected_error = abs(frozen_predicted - 19.8)
-    assert score["model_error_c"] == round(expected_error, 4)
-    # If P2 had been used, prediction error would be enormous (> 2.0 C)
-    assert score["model_error_c"] < 0.5
 
 
 def test_no_repeated_fitting_on_consecutive_cycles_without_new_eligible_evidence():
@@ -586,8 +473,7 @@ def test_ohmigo_keepalive_preserves_command_age_for_shadow_prediction():
         c_k = _make_cycle(t_k, [("sensor.room_1", 1.0, indoor, 0)], mode="braking", outdoor=2.0, command=-8.0, brake_factor=1.0)
         runtime.begin_cycle(c_k, use_ohmigo_input=True)
 
-        # Before 60 minutes, warmup (>= 60m) is not yet reached, so no forecast issued
-        assert runtime._pending_forecast is None
+        assert len(runtime._outputs) == 1
         # But established_at must remain anchored to START
         assert runtime._observations[-1]["command_at"] == START.isoformat()
 
@@ -605,9 +491,9 @@ def test_ohmigo_keepalive_preserves_command_age_for_shadow_prediction():
     c_60 = _make_cycle(t_60, [("sensor.room_1", 1.0, indoor, 0)], mode="braking", outdoor=2.0, command=-8.0, brake_factor=1.0)
     runtime.begin_cycle(c_60, use_ohmigo_input=True)
 
-    # Stable command has now reached 60 minutes and MUST issue a shadow prediction!
-    assert runtime._pending_forecast is not None
-    assert runtime._pending_forecast["issued"] == t_60.isoformat()
+    assert runtime.current_command["established_at"] == START.isoformat()
+    assert runtime.current_command["last_dispatched_at"] == t_60.isoformat()
+    assert len(runtime._outputs) == 1
 
     # Now verify that a genuine command change resets stability
     t_65 = START + timedelta(minutes=65)
@@ -624,7 +510,8 @@ def test_ohmigo_keepalive_preserves_command_age_for_shadow_prediction():
 
     assert runtime._last_command is not None
     assert runtime._last_command["established_at"] == t_65.isoformat()
-    assert runtime._interruptions[-1]["reason"] == "ohmigo_command_changed"
+    assert len(runtime._outputs) == 2
+    assert runtime._outputs[-1]["requested"] == -6.0
 
 
 def test_executor_fit_runs_off_event_loop_thread_and_does_not_block_dispatch():
