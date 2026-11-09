@@ -15,6 +15,9 @@ _MAX_RECORDS = 2048
 _MAX_GAP_MINUTES = 60.0
 _OUTDOOR_MAX_AGE = timedelta(hours=3)
 _AUDIT_HORIZON = timedelta(hours=1)
+_OUTDOOR_DRIFT_TOLERANCE_C = 3.0
+_FORECAST_MIN_MINUTES = 45.0
+_FORECAST_MAX_MINUTES = 75.0
 
 
 def _number(value: Any) -> float | None:
@@ -55,6 +58,26 @@ def command_coordinate(outdoor: float, virtual_outdoor: float, span: float) -> f
     return min(1.0, max(0.0, (outdoor + span - virtual_outdoor) / (2.0 * span)))
 
 
+def classify_regime(mode: str | None, brake_factor: float | None) -> str:
+    """Label operating regime for evidence segregation without cross-mode pollution."""
+    bf = brake_factor or 0.0
+    if mode == "braking" and bf >= 0.98:
+        return "braking_stable"
+    if mode in ("braking", "pre_braking", "brake_hold"):
+        return "braking_transition"
+    if mode == "preheating":
+        return "preheating"
+    if mode in ("normal", "holiday") and bf <= 0.02:
+        return "normal_pi"
+    if mode == "precool":
+        return "precool"
+    if mode == "summer_mode":
+        return "summer"
+    if mode == "safe_mode":
+        return "safe_mode"
+    return mode or "unknown"
+
+
 class ThermalIntelligence:
     """Bounded, restart-safe passive data path; never controls PumpSteer outputs."""
 
@@ -86,9 +109,14 @@ class ThermalIntelligence:
         self._last_training_at: datetime | None = None
         self._braking_episode_active = False
         self._braking_episode_forecasted = False
+        self._fit_generation: int = 0
+        self._fit_in_progress: bool = False
+        self._fit_summary: dict[str, Any] = {}
 
     @property
     def status(self) -> str:
+        if self._status == "candidate_insufficient_excitation":
+            return "candidate_insufficient_excitation"
         if self.model.parameters() is None:
             return self._status
         return "candidate_unvalidated"
@@ -102,9 +130,78 @@ class ThermalIntelligence:
             len(self._observations),
             len(self._outputs),
             self._samples,
+            self._status,
+            self._fit_generation,
             self._interruptions[-1].get("at") if self._interruptions else None,
             len(self._interruptions),
         )
+
+    def fit_due(self, now: datetime) -> bool:
+        """True when a refit is worthwhile and no fit is currently in progress."""
+        if self._fit_in_progress:
+            return False
+        return self.model.fit_due(now)
+
+    def prepare_fit_job(self, now: datetime) -> tuple[int, dict[str, Any]] | None:
+        """Prepare an isolated immutable snapshot for executor fitting."""
+        if not self.fit_due(now):
+            return None
+        self._fit_generation += 1
+        self._fit_in_progress = True
+        token = self._fit_generation
+        snapshot_data = {
+            "grid": self.model._grid.snapshot(),
+            "config": self.model.config,
+            "now_ts": now.timestamp(),
+            "group_prior": self.model._group_prior,
+        }
+        return token, snapshot_data
+
+    @staticmethod
+    def static_fit(snapshot_data: dict[str, Any]) -> dict[str, Any]:
+        """Pure CPU-bound fitting function safe for asyncio executor execution."""
+        return RCThermalModel.fit_snapshot(
+            snapshot_data["grid"],
+            snapshot_data["config"],
+            snapshot_data["now_ts"],
+            snapshot_data.get("group_prior"),
+        )
+
+    def apply_fit_result(self, token: int, result: dict[str, Any]) -> bool:
+        """Apply fitted results if still current. Discards results from obsolete generations."""
+        self._fit_in_progress = False
+        if token != self._fit_generation:
+            return False
+        self._fit_summary = result
+        status = result.get("status")
+        if status == "candidate_insufficient_excitation":
+            self._status = "candidate_insufficient_excitation"
+            self.model._params = None
+            self.model._quality = None
+            return True
+        if status == "ok" and result.get("params"):
+            self.model._params = result["params"]
+            self.model._quality = result.get("quality")
+            self.model._last_fit_ts = result.get("fit_ts")
+            self.model._data_end_at_fit = result.get("data_end_ts")
+            self.model._summary = result
+            self.model._outdoor_ref = result.get("outdoor_ref")
+            self._status = "candidate_learning"
+            return True
+        self._status = status or "candidate_fit_failed"
+        self.model._params = None
+        self.model._quality = None
+        return False
+
+    def fit_sync(self, now: datetime) -> dict[str, Any]:
+        """Synchronous fitting for tests and offline harnesses."""
+        job = self.prepare_fit_job(now)
+        if job is None:
+            return {"status": "fit_not_due"}
+        token, data = job
+        result = self.static_fit(data)
+        self.apply_fit_result(token, result)
+        return result
 
     @property
     def has_evidence(self) -> bool:
@@ -159,23 +256,33 @@ class ThermalIntelligence:
             self._samples = 0
             self._last_training_at = None
             self._last_forecast_at = None
+            self._fit_generation += 1
+            self._fit_in_progress = False
+            self._fit_summary.clear()
+            self._status = "collecting"
         if source_signature:
             self._source_signature = source_signature
+
         pending = self._pending_forecast
-        if pending is not None and (
-            tuple(pending["identity"]) != self._source_signature
-            or mode != pending["mode"]
-            or abs(
-                (_number(cycle.get("brake_factor")) or 0.0)
-                - (_number(pending.get("brake_factor")) or 0.0)
+        if pending is not None:
+            context_changed = (
+                tuple(pending["identity"]) != self._source_signature
+                or mode != pending["mode"]
+                or abs(
+                    (_number(cycle.get("brake_factor")) or 0.0)
+                    - (_number(pending.get("brake_factor")) or 0.0)
+                )
+                > 0.05
             )
-            > 0.02
-            or (
+            outdoor_drift = (
                 _number(cycle.get("outdoor")) is not None
-                and abs(_number(cycle.get("outdoor")) - pending["outdoor"]) > 1e-9
+                and abs(_number(cycle.get("outdoor")) - pending["outdoor"])
+                > _OUTDOOR_DRIFT_TOLERANCE_C
             )
-        ):
-            self._interrupt("forecast_context_changed", at)
+            if context_changed:
+                self._interrupt("forecast_context_changed", at)
+            elif outdoor_drift:
+                self._interrupt("forecast_weather_drift_exceeded", at)
 
         changed = False
         source_rows = []
@@ -240,7 +347,7 @@ class ThermalIntelligence:
             coordinate = command_coordinate(
                 outdoor,
                 command_value,
-                _number(cycle.get("command_span")) or 20.0,
+                _number(cycle.get("command_span")) or 12.0,
             )
             if (
                 mode == "braking"
@@ -259,11 +366,25 @@ class ThermalIntelligence:
                 )
                 self._last_training_at = indoor_at
                 self._samples += 1
-                if self.model.fit_due(at):
-                    summary = self.model.fit(at)
-                    self._status = summary.get("status", "candidate_fit_failed")
-                else:
+                if self._status != "candidate_insufficient_excitation":
                     self._status = "candidate_learning"
+
+        regime = classify_regime(mode, _number(cycle.get("brake_factor")))
+        quality = "valid"
+        if cycle.get("command_source") == "unverified_or_multiple_transports":
+            quality = "unverified_transport"
+        if outdoor_at is None or at - outdoor_at > _OUTDOOR_MAX_AGE:
+            quality = "stale_outdoor"
+        if self._last_interruption is not None:
+            quality = "interrupted"
+
+        calculated_virtual = _number(cycle.get("requested_virtual_outdoor"))
+        dispatched_virtual = command_value
+        quantization_error = (
+            round(dispatched_virtual - calculated_virtual, 4)
+            if calculated_virtual is not None and dispatched_virtual is not None
+            else None
+        )
 
         record = {
             "at": at.isoformat(),
@@ -273,10 +394,13 @@ class ThermalIntelligence:
             "outdoor_c": outdoor,
             "outdoor_source": cycle.get("outdoor_source"),
             "sources": source_rows,
-            "requested_virtual_outdoor_c": _number(
-                cycle.get("requested_virtual_outdoor")
-            ),
+            "requested_virtual_outdoor_c": calculated_virtual,
+            "calculated_virtual_outdoor_c": calculated_virtual,
+            "dispatched_virtual_outdoor_c": dispatched_virtual,
+            "command_quantization_error_c": quantization_error,
             "mode": mode,
+            "regime": regime,
+            "data_quality": quality,
             "brake_factor": _number(cycle.get("brake_factor")),
             "pi_demand_c": _number(cycle.get("pi_demand_c")),
             "command_coordinate": coordinate,
@@ -344,19 +468,27 @@ class ThermalIntelligence:
             if params is not None
             else False
         )
-        if self._pending_forecast is not None and (
-            tuple(self._pending_forecast["identity"]) != self._source_signature
-            or record.get("mode") != self._pending_forecast["mode"]
-            or abs(
-                (_number(record.get("brake_factor")) or 0.0)
-                - (_number(self._pending_forecast.get("brake_factor")) or 0.0)
+        if self._pending_forecast is not None:
+            context_changed = (
+                tuple(self._pending_forecast["identity"]) != self._source_signature
+                or record.get("mode") != self._pending_forecast["mode"]
+                or abs(
+                    (_number(record.get("brake_factor")) or 0.0)
+                    - (_number(self._pending_forecast.get("brake_factor")) or 0.0)
+                )
+                > 0.05
+                or coordinate is None
+                or abs(coordinate - self._pending_forecast["coordinate"]) > 0.15
             )
-            > 0.02
-            or abs(outdoor - self._pending_forecast["outdoor"]) > 1e-9
-            or coordinate is None
-            or abs(coordinate - self._pending_forecast["coordinate"]) > 1e-6
-        ):
-            self._interrupt("forecast_context_changed", at)
+            outdoor_drift = (
+                abs(outdoor - self._pending_forecast["outdoor"])
+                > _OUTDOOR_DRIFT_TOLERANCE_C
+            )
+            if context_changed:
+                self._interrupt("forecast_context_changed", at)
+            elif outdoor_drift:
+                self._interrupt("forecast_weather_drift_exceeded", at)
+
         if (
             params is None
             or at is None
@@ -369,7 +501,9 @@ class ThermalIntelligence:
             or self._braking_episode_forecasted
         ):
             return
-        prediction = self._predict(record["indoor_c"], outdoor, coordinate, params)
+        prediction = self._predict(
+            record["indoor_c"], outdoor, coordinate, params, duration_hours=1.0
+        )
         if prediction is None:
             return
         self._pending_forecast = {
@@ -389,8 +523,18 @@ class ThermalIntelligence:
         self._last_forecast_at = at
 
     @staticmethod
-    def _predict(indoor, outdoor, coordinate, params) -> float | None:
-        """Forecast a frozen, constant command/outdoor scenario for one hour."""
+    def _predict(
+        indoor: float,
+        outdoor: float,
+        coordinate: float,
+        params: Any,
+        duration_hours: float = 1.0,
+    ) -> float | None:
+        """Forecast a frozen, constant command/outdoor scenario for elapsed duration."""
+        if not math.isfinite(duration_hours) or duration_hours < 0:
+            return None
+        if duration_hours == 0:
+            return indoor
         values = (
             params.heating_rate_k_per_h,
             params.loss_rate_per_h,
@@ -398,60 +542,113 @@ class ThermalIntelligence:
         )
         if not all(math.isfinite(value) for value in values):
             return None
+        a = params.heating_rate_k_per_h
+        b = params.loss_rate_per_h
+        c = params.gains_k_per_h
         step_h = 0.25
         temp = indoor
         effort = coordinate
-        for index in range(4):
+        remaining = duration_hours
+        while remaining > 1e-6:
+            dt = min(step_h, remaining)
             temp = step_temperature(
                 temp,
                 effort,
                 outdoor,
-                params.heating_rate_k_per_h,
-                params.loss_rate_per_h,
-                params.gains_k_per_h,
-                step_h,
+                a,
+                b,
+                c,
+                dt,
             )
             if not math.isfinite(temp):
                 return None
+            remaining -= dt
         return temp
 
-    def _score_pending(self, at, indoor, indoor_at, outdoor, mode, coordinate):
+    def _score_pending(
+        self,
+        at: datetime,
+        indoor: float,
+        indoor_at: datetime,
+        outdoor: float,
+        mode: str,
+        coordinate: float | None,
+    ) -> None:
         pending = self._pending_forecast
         if pending is None:
             return
         issued = _timestamp(pending["issued"])
         due = _timestamp(pending["due"])
-        if (
-            issued is None
-            or due is None
-            or pending["invalidated"]
-            or tuple(pending["identity"]) != self._source_signature
-            or mode != pending["mode"]
-            or indoor_at < due
-            or indoor_at > due + timedelta(minutes=5)
-        ):
-            if at > (due + timedelta(minutes=5) if due else at):
-                self._pending_forecast = None
-                self._interrupt("forecast_outcome_unavailable", at)
+        if issued is None or due is None or pending.get("invalidated"):
+            self._pending_forecast = None
             return
-        if coordinate is None or abs(coordinate - pending["coordinate"]) > 1e-6:
+
+        if (
+            tuple(pending["identity"]) != self._source_signature
+            or mode != pending["mode"]
+        ):
+            self._pending_forecast = None
+            self._interrupt("forecast_context_changed", at)
+            return
+
+        if coordinate is None or abs(coordinate - pending["coordinate"]) > 0.15:
             self._pending_forecast = None
             self._interrupt("forecast_command_unverified_or_changed", at)
             return
-        elapsed = (indoor_at - issued).total_seconds() / 3600.0
-        if not 0 < elapsed <= 65 / 60:
+
+        if abs(outdoor - pending["outdoor"]) > _OUTDOOR_DRIFT_TOLERANCE_C:
             self._pending_forecast = None
-            self._interrupt("forecast_endpoint_out_of_window", at)
+            self._interrupt("forecast_weather_drift_exceeded", at)
             return
-        error = abs(pending["predicted"] - indoor)
+
+        elapsed_seconds = (indoor_at - issued).total_seconds()
+        elapsed_minutes = elapsed_seconds / 60.0
+
+        # If overall clock has passed the maximum horizon window without a valid report:
+        if (
+            at - issued
+        ).total_seconds() > _FORECAST_MAX_MINUTES * 60.0 and elapsed_minutes < _FORECAST_MIN_MINUTES:
+            self._pending_forecast = None
+            self._interrupt("forecast_outcome_unavailable", at)
+            return
+
+        if elapsed_minutes < _FORECAST_MIN_MINUTES:
+            return
+
+        if elapsed_minutes > _FORECAST_MAX_MINUTES:
+            self._pending_forecast = None
+            self._interrupt("forecast_outcome_unavailable", at)
+            return
+
+        elapsed_hours = elapsed_seconds / 3600.0
+        params = self.model.parameters()
+        if params is None:
+            self._pending_forecast = None
+            self._interrupt("forecast_model_unavailable", at)
+            return
+
+        predicted = self._predict(
+            pending["indoor"],
+            pending["outdoor"],
+            pending["coordinate"],
+            params,
+            duration_hours=elapsed_hours,
+        )
+        if predicted is None or not math.isfinite(predicted):
+            self._pending_forecast = None
+            self._interrupt("forecast_evaluation_failed", at)
+            return
+
+        error = abs(predicted - indoor)
         persistence_error = abs(pending["indoor"] - indoor)
+
         self._scores.append(
             {
                 "issued": pending["issued"],
                 "observed": indoor_at.isoformat(),
-                "horizon_minutes": round(elapsed * 60, 2),
-                "model_error_c": error,
-                "persistence_error_c": persistence_error,
+                "horizon_minutes": round(elapsed_minutes, 2),
+                "model_error_c": round(error, 4),
+                "persistence_error_c": round(persistence_error, 4),
                 "model": "rtm_command_v1",
                 "independent_unit": "non_overlapping_braking_episode",
                 "command_application": "service_completed_unverified",
@@ -503,6 +700,9 @@ class ThermalIntelligence:
             "last_forecast_at": (
                 self._last_forecast_at.isoformat() if self._last_forecast_at else None
             ),
+            "status": self._status,
+            "fit_summary": dict(self._fit_summary),
+            "fit_generation": self._fit_generation,
         }
 
     def restore_state(self, data: Any) -> bool:
@@ -568,6 +768,10 @@ class ThermalIntelligence:
             self._pending_forecast = None
             self._last_forecast_at = _timestamp(data.get("last_forecast_at"))
             self._active_cycle = None
+            self._fit_summary = dict(data.get("fit_summary", {}))
+            self._status = data.get("status", "collecting")
+            self._fit_generation = int(data.get("fit_generation", 0))
+            self._fit_in_progress = False
         except (KeyError, TypeError, ValueError, OverflowError):
             return False
         return True
@@ -589,17 +793,34 @@ class ThermalIntelligence:
             if scores
             else None
         )
+        excitation_info = self._fit_summary.get("excitation_sufficient")
+        command_range = self._fit_summary.get("command_range")
+        command_variance = self._fit_summary.get("command_variance")
+        fit_reason = self._fit_summary.get("reason")
+
+        current_status = self.status
+        reason = fit_reason or (
+            "insufficient_command_excitation_for_dual_gain_identification"
+            if current_status == "candidate_insufficient_excitation"
+            else "passive_diagnostics_only"
+        )
+
         return {
-            "status": self.status,
+            "status": current_status,
             "model": "adaptive_preheat_rtm_empirical_command_response",
             "samples": self._samples,
             "fit_parameters_available": params is not None,
             "fit_trusted": False,
+            "excitation_sufficient": excitation_info,
+            "command_range": command_range,
+            "command_variance": command_variance,
             "forecast_count": len(scores),
-            "forecast_mae_c": model_mae,
-            "persistence_mae_c": persistence_mae,
+            "forecast_mae_c": round(model_mae, 4) if model_mae is not None else None,
+            "persistence_mae_c": (
+                round(persistence_mae, 4) if persistence_mae is not None else None
+            ),
             "forecast_skill": (
-                1.0 - model_mae / persistence_mae
+                round(1.0 - model_mae / persistence_mae, 4)
                 if model_mae is not None
                 and persistence_mae is not None
                 and persistence_mae > 0
@@ -610,5 +831,5 @@ class ThermalIntelligence:
             "last_interruption": (
                 self._interruptions[-1]["reason"] if self._interruptions else None
             ),
-            "reason": "passive_diagnostics_only",
+            "reason": reason,
         }
