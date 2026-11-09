@@ -46,6 +46,9 @@ def test_controller_issues_before_fit_and_stores_same_actual_outcome(request):
     assert row["actual"] == 20.8
     assert row["predictions"] == [21]
     assert row["physical_measurement_time"] == "unknown"
+    # A score created after this cycle's checkpoint waits for the next bounded
+    # whole-file checkpoint; it must not force a second write at the same time.
+    clock[0] += timedelta(minutes=5)
     asyncio.run(sensor._save_pilot_store())
     assert saved[-1]["plan_audit"]["fixed_v2"] == rows
     assert saved[-1]["plan_audit"]["fixed_v1"] == []

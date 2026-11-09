@@ -1143,6 +1143,27 @@ class PumpSteerSensor(RestoreEntity):
         heating_demand_c: float = 0.0,
     ) -> Dict[str, Any]:
         """Return standard attributes included in all modes."""
+        thermal = None
+        thermal_audit = None
+        if self._cfg().get("thermal_intelligence_enabled") is True:
+            try:
+                thermal = dict(self._thermal_intelligence.summary())
+            except Exception:
+                _LOGGER.debug("Passive thermal summary unavailable", exc_info=True)
+                thermal = {"status": "diagnostics_unavailable", "active_control": False}
+            residual = (getattr(self, "_control_modifier_state", None) or {}).get("adaptive")
+            returning = bool(residual and residual[0] > 0) or self._adaptive_braking.get("multiplier", 1.0) < 1.0
+            thermal["legacy_adaptive_return_pending"] = returning
+            thermal["passive_field_trial_safe"] = self._cfg().get("adaptive_braking_enabled") is not True and not returning
+            thermal["legacy_adaptive_enabled"] = self._cfg().get("adaptive_braking_enabled") is True
+            checkpoint = getattr(self, "_thermal_store_last_at", None)
+            thermal["last_checkpoint_requested_at"] = checkpoint.isoformat() if checkpoint else None
+            thermal["store_read_failed"] = self._pilot_store_read_failed
+            try:
+                thermal_audit = self._plan_audit.fixed_summary(self._fixed_audit_identity(self._cfg()))
+            except Exception:
+                _LOGGER.debug("Passive forecast summary unavailable", exc_info=True)
+                thermal_audit = {"status": "diagnostics_unavailable", "passive_only": True}
         return {
             "heating_demand_c": round(heating_demand_c, 2),
             "indoor_temperature": indoor,
@@ -1198,11 +1219,7 @@ class PumpSteerSensor(RestoreEntity):
             "thermal_learning_sessions": self._thermal_model.learning_sessions,
             "thermal_validated_sessions": self._thermal_model.validated_sessions,
             "thermal_validation_basis": VALIDATION_BASIS,
-            "thermal_fixed_horizon_audit": (
-                self._plan_audit.fixed_summary(self._fixed_audit_identity(self._cfg()))
-                if self._cfg().get("thermal_intelligence_enabled") is True
-                else None
-            ),
+            "thermal_fixed_horizon_audit": thermal_audit,
             "thermal_conditional_drop_60m_c": (
                 self._thermal_model.predict_bounded_drop(indoor, outdoor, 60)
                 if self._thermal_learning_active
@@ -1237,11 +1254,7 @@ class PumpSteerSensor(RestoreEntity):
                 if self._thermal_model.last_session_predicted_drop is not None
                 else None
             ),
-            "thermal_intelligence": (
-                self._thermal_intelligence.summary()
-                if self._cfg().get("thermal_intelligence_enabled") is True
-                else None
-            ),
+            "thermal_intelligence": thermal,
         }
 
     def _update_thermal_learning(
@@ -1791,7 +1804,12 @@ class PumpSteerSensor(RestoreEntity):
                 )
 
         create_task = getattr(self.hass, "async_create_task", asyncio.create_task)
-        self._thermal_fit_task = create_task(_async_fit_worker())
+        worker = _async_fit_worker()
+        try:
+            self._thermal_fit_task = create_task(worker)
+        except Exception:
+            worker.close()
+            raise
 
     def _thermal_cycle(self, at, indoor, outdoor, fake_temp, mode, extra, cfg):
         """Capture a bounded source snapshot without affecting the control result."""
@@ -4029,7 +4047,14 @@ class PumpSteerSensor(RestoreEntity):
             except Exception:
                 self._plan_audit.fixed_pending = None
                 _LOGGER.debug("Shared thermal audit unavailable", exc_info=True)
-            self._maybe_schedule_thermal_fit(now)
+            try:
+                self._maybe_schedule_thermal_fit(now)
+            except Exception:
+                # Diagnostics must never replace a valid Base result, even if
+                # snapshot preparation or the HA task scheduler fails.
+                self._thermal_intelligence._fit_generation += 1
+                self._thermal_intelligence._fit_in_progress = False
+                _LOGGER.debug("Passive thermal fit scheduling failed", exc_info=True)
             try:
                 if self._pilot_store_read_failed:
                     await self._load_pilot_store()
@@ -4404,6 +4429,9 @@ class PumpSteerSensor(RestoreEntity):
                     "samples": self._heat_operation.export(),
                 }
                 self._pilot_persisted = payload
+            self._pilot_persisted = {
+                **self._pilot_persisted, "plan_audit": self._plan_audit.export_plan()
+            }
             if self._thermal_intelligence.has_evidence:
                 self._pilot_persisted = {
                     **self._pilot_persisted,
@@ -4415,6 +4443,12 @@ class PumpSteerSensor(RestoreEntity):
         """Save bounded model or plan evidence, only when it changes."""
         pilot = self._pilot
         if self._pilot_store is None or self._pilot_store_read_failed:
+            return
+        # One Store file means every diagnostic update rewrites the thermal
+        # payload too. Bound the whole-file checkpoint rate while it is present.
+        last_checkpoint = getattr(self, "_thermal_store_last_at", None)
+        if (self._thermal_intelligence.has_evidence and last_checkpoint is not None
+            and timedelta(0) <= dt_util.now() - last_checkpoint < timedelta(minutes=5)):
             return
         model_available = pilot is not None and (
             pilot.house_intervals or pilot.manager.pump.history

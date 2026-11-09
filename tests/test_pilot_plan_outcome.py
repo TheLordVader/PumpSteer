@@ -515,11 +515,13 @@ def test_basic_ha_chain_scores_shared_persistence_and_keeps_completed_pairs(monk
     assert records[0]["model_order"] == ["persistence"]
     assert records[0]["actual"] == 20.2
     assert records[0]["physical_measurement_time"] == "unknown"
+    # The outcome is checkpointed at the next bounded whole-file write.
+    _cycle(sensor, monkeypatch, 35)
     assert sensor._pilot_store.payload["plan_audit"]["fixed_v2"]
     restored = ForecastAudit()
     restored.restore_plan(
         sensor._pilot_store.payload["plan_audit"],
-        START + timedelta(minutes=31),
+        START + timedelta(minutes=36),
     )
     assert restored.fixed_records == records
     assert restored.fixed_pending is None

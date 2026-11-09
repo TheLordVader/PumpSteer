@@ -26,3 +26,19 @@ def test_thermal_store_batches_changes_and_flushes_latest_on_unload(request):
     assert len(saved) <= 3
     asyncio.run(controller._flush_pilot_store())
     assert flushed[-1]['thermal_intelligence'] == controller._thermal_intelligence.export_state()
+
+
+def test_other_audit_updates_cannot_rewrite_full_thermal_store_every_minute(request):
+    controller, states, clock = request.getfixturevalue('control')
+    saved = []
+    controller._pilot_store = SimpleNamespace(
+        async_delay_save=lambda callback, delay: saved.append(callback()))
+    controller._thermal_intelligence.record_output({
+        'at': clock[0].isoformat(), 'transport': 'ohmigo',
+        'status': 'service_completed_unverified', 'requested': -5,
+    })
+    for minute in range(11):
+        controller._plan_audit.plan_unverifiable += 1
+        asyncio.run(controller._save_pilot_store())
+        clock[0] += timedelta(minutes=1)
+    assert len(saved) <= 3

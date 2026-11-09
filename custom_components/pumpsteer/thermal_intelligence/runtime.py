@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import itertools
 import math
-from copy import deepcopy
 from collections import deque
+from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -15,6 +16,16 @@ _STATE_VERSION = 2
 _MAX_RECORDS = 2048
 _MAX_GAP_MINUTES = 60.0
 _OUTDOOR_MAX_AGE = timedelta(hours=3)
+_COUNTER_LIMIT = 2**63 - 1
+_COUNTER_KEYS = (
+    "source_numeric_changes", "source_change_attempts", "source_changes_accepted",
+    "source_changes_rejected", "accepted_indoor_changes", "accepted_outdoor_changes",
+    "accepted_changes_physical_time_unknown", "identical_source_rechecks",
+    "reject_report_time_missing", "reject_report_time_future", "reject_report_time_stale",
+    "reject_report_out_of_order", "aggregate_observations", "command_establishments",
+    "command_value_changes", "command_confirmations", "dispatch_failures",
+    "interruptions", "restarts", "fit_attempts", "fit_results_applied", "fit_results_stale",
+)
 
 
 def _number(value: Any) -> float | None:
@@ -87,9 +98,13 @@ class ThermalIntelligence:
         ))
         self._events: deque[dict[str, Any]] = deque(maxlen=_MAX_RECORDS)
         self._sequence = 0
+        self._counters = dict.fromkeys(_COUNTER_KEYS, 0)
+        self._counter_revision = 0
+        self._counter_started_at: datetime | None = None
         self._source_signature: tuple = ()
         self._source_values: dict[str, tuple[float, datetime | None]] = {}
         self._captured_values: dict[str, tuple] = {}
+        self._last_numeric_values: dict[str, float] = {}
         self._observation_values: dict[str, float] = {}
         self._latest_observation: dict[str, Any] | None = None
         self._context_signature: tuple = ()
@@ -141,11 +156,17 @@ class ThermalIntelligence:
 
     @property
     def store_signature(self) -> tuple:
-        return (self._sequence, self._fit_generation, self._status, self._samples)
+        return (self._sequence, self._fit_generation, self._status, self._samples, self._counter_revision)
 
     @property
     def has_evidence(self) -> bool:
         return bool(self._events)
+
+    def _count(self, key: str, at: datetime | None = None) -> None:
+        self._counters[key] = min(_COUNTER_LIMIT, self._counters[key] + 1)
+        self._counter_revision += 1
+        if self._counter_started_at is None and at is not None:
+            self._counter_started_at = at
 
     def _append(self, kind: str, at: datetime, **values: Any) -> dict[str, Any]:
         # Wall clock may move backwards; chain order follows capture order, while
@@ -162,6 +183,7 @@ class ThermalIntelligence:
         while self._events and _timestamp(self._events[0]["at"]) < cutoff:
             self._events.popleft()
         if kind == "observation":
+            self._count("aggregate_observations", at)
             self._latest_observation = row
         elif kind == "interruption":
             self._last_interruption_event = row
@@ -178,6 +200,7 @@ class ThermalIntelligence:
         if not self.fit_due(now):
             return None
         self._fit_generation += 1
+        self._count("fit_attempts", now)
         if hasattr(self.model, "record_fit_attempt"):
             self.model.record_fit_attempt(self.model._grid, now.timestamp())
         self._fit_in_progress = True
@@ -203,8 +226,10 @@ class ThermalIntelligence:
     def apply_fit_result(self, token: int, result: dict[str, Any]) -> bool:
         """Apply fitted results if still current. Discards results from obsolete generations."""
         if token != self._fit_generation:
+            self._count("fit_results_stale")
             return False
         self._fit_in_progress = False
+        self._count("fit_results_applied")
         self._fit_summary = result
         status = result.get("status")
         if result.get("fit_ts") is not None:
@@ -279,6 +304,7 @@ class ThermalIntelligence:
         if self._source_signature and signature != self._source_signature:
             self._source_values.clear()
             self._captured_values.clear()
+            self._last_numeric_values.clear()
             self._observation_values.clear()
             self.model = RCThermalModel(self.model.config)
             self._fit_summary.clear()
@@ -307,13 +333,39 @@ class ThermalIntelligence:
             advanced = value is not None and (previous is None or value != previous[0])
             ordered = previous is None or previous[1] is None or (reported is not None and (reported > previous[1] or (reported == previous[1] and not advanced)))
             accepted = advanced and ordered
-            row = dict(entity=entity, weight=_number(raw.get("weight")), value=value,
-                       reported_at=reported.isoformat() if reported else None,
-                       physical_time_known=raw.get("physical_time_known") is True and valid_time,
-                       timestamp_valid=valid_time and ordered, value_advanced=accepted,
-                       physical_time_status="known" if raw.get("physical_time_known") is True and valid_time else "physical_time_unknown")
+            row = {"entity": entity, "weight": _number(raw.get("weight")), "value": value,
+                       "reported_at": reported.isoformat() if reported else None,
+                       "physical_time_known": raw.get("physical_time_known") is True and valid_time,
+                       "timestamp_valid": valid_time and ordered, "value_advanced": accepted,
+                       "physical_time_status": "known" if raw.get("physical_time_known") is True and valid_time else "physical_time_unknown"}
             captured = (value, valid_time, ordered)
-            if advanced and self._captured_values.get(key) != captured:
+            numeric_changed = value is not None and self._last_numeric_values.get(key) != value
+            captured_change = advanced and self._captured_values.get(key) != captured
+            if value is not None:
+                self._last_numeric_values[key] = value
+            if numeric_changed:
+                self._count("source_numeric_changes", at)
+            elif not advanced and value is not None and valid_time and ordered:
+                self._count("identical_source_rechecks", at)
+            if numeric_changed or captured_change:
+                self._count("source_change_attempts", at)
+                if valid_time and ordered:
+                    self._count("source_changes_accepted", at)
+                    self._count("accepted_outdoor_changes" if role == "outdoor" else "accepted_indoor_changes", at)
+                    if not row["physical_time_known"]:
+                        self._count("accepted_changes_physical_time_unknown", at)
+                else:
+                    self._count("source_changes_rejected", at)
+                    if reported is None:
+                        rejection = "reject_report_time_missing"
+                    elif reported > at:
+                        rejection = "reject_report_time_future"
+                    elif at - reported > age_limit:
+                        rejection = "reject_report_time_stale"
+                    else:
+                        rejection = "reject_report_out_of_order"
+                    self._count(rejection, at)
+            if captured_change:
                 self._captured_values[key] = captured
                 self._append("temperature", at, role=role, **row,
                              quality="valid_report_time" if valid_time and ordered else "invalid_or_unknown_report_time")
@@ -399,9 +451,12 @@ class ThermalIntelligence:
         success = transport == "ohmigo" and status == "service_completed_unverified" and row["requested"] is not None
         if success:
             same = previous is not None and previous["requested"] == row["requested"]
+            self._count("command_confirmations" if same else "command_establishments", at)
+            if previous is not None and not same:
+                self._count("command_value_changes", at)
             established = previous["established_at"] if same else at.isoformat()
-            self._last_command = dict(coordinate=previous.get("coordinate") if same else None, requested=row["requested"], established_at=established,
-                                      at=established, last_dispatched_at=at.isoformat(), status=status)
+            self._last_command = {"coordinate": previous.get("coordinate") if same else None, "requested": row["requested"], "established_at": established,
+                                      "at": established, "last_dispatched_at": at.isoformat(), "status": status}
             if self._active_cycle:
                 cycle = self._active_cycle
                 outdoor = _number(cycle.get("outdoor"))
@@ -417,6 +472,8 @@ class ThermalIntelligence:
                         self.model.add_sample(Sample(at, None, None, coordinate))
                         self._last_command_sample_at = at
         elif transport == "ohmigo" and status in {"dispatch_failed", "skipped", "disabled", "not_configured", "invalid_configuration"}:
+            if status == "dispatch_failed":
+                self._count("dispatch_failures", at)
             self._last_command = None
             self._interrupt("ohmigo_" + status, at)
         if not repeated:
@@ -474,6 +531,9 @@ class ThermalIntelligence:
     def _interrupt(self, reason: str, at: datetime | None = None) -> None:
         at = at or datetime.now(UTC)
         if reason != self._last_interruption:
+            self._count("interruptions", at)
+            if reason == "restart":
+                self._count("restarts", at)
             self._boundary(at)
             self._append("interruption", at, reason=reason)
         self._last_interruption = reason
@@ -482,11 +542,12 @@ class ThermalIntelligence:
         """Persist one chain; unfinished command and interpolation never resume."""
         model_state = self.model.to_dict()
         model_state["pending"] = []  # Open interpolation intervals never resume.
-        return deepcopy(dict(version=_STATE_VERSION, model=model_state,
-                    events=list(self._events), sequence=self._sequence,
-                    samples=self._samples, status=self._status,
-                    fit_summary=dict(self._fit_summary), fit_generation=self._fit_generation,
-                    segment=self._segment))
+        return deepcopy({"version": _STATE_VERSION, "model": model_state,
+                    "events": list(self._events), "sequence": self._sequence,
+                    "samples": self._samples, "status": self._status,
+                    "fit_summary": dict(self._fit_summary), "fit_generation": self._fit_generation,
+                    "segment": self._segment, "diagnostic_counters": dict(self._counters),
+                    "counter_started_at": self._counter_started_at.isoformat() if self._counter_started_at else None})
 
     def restore_state(self, data: Any) -> bool:
         restored = ThermalIntelligence()
@@ -499,12 +560,23 @@ class ThermalIntelligence:
         if not isinstance(data, dict) or data.get("version") != _STATE_VERSION:
             return False
         try:
+            counters = data.get("diagnostic_counters", {})
+            if not isinstance(counters, dict) or any(
+                key not in _COUNTER_KEYS or isinstance(value, bool)
+                or not isinstance(value, int) or not 0 <= value <= _COUNTER_LIMIT
+                for key, value in counters.items()
+            ):
+                return False
+            self._counters.update(counters)
+            self._counter_started_at = _timestamp(data.get("counter_started_at"))
+            if data.get("counter_started_at") is not None and self._counter_started_at is None:
+                return False
             events = deepcopy(data["events"])
             if any(key in data for key in ("scores", "observations", "outputs", "interruptions")):
                 return False
             if not isinstance(events, list) or any(not isinstance(row, dict) or _timestamp(row.get("at")) is None or row.get("kind") not in {"temperature", "context", "output", "observation", "interruption"} for row in events):
                 return False
-            if any(_timestamp(a["at"]) > _timestamp(b["at"]) or int(a["sequence"]) >= int(b["sequence"]) for a, b in zip(events, events[1:])):
+            if any(_timestamp(a["at"]) > _timestamp(b["at"]) or int(a["sequence"]) >= int(b["sequence"]) for a, b in itertools.pairwise(events)):
                 return False
             model = RCThermalModel.from_dict(data["model"], self.model.config)
             model._pending.clear()
@@ -522,10 +594,13 @@ class ThermalIntelligence:
             self._last_command = None
             self._source_values.clear()
             self._captured_values.clear()
+            self._last_numeric_values.clear()
             self._observation_values.clear()
             self._latest_observation = None
             # Reconstruct source values only to suppress identical republishes.
             for row in self._events:
+                if row["kind"] == "temperature" and _number(row.get("value")) is not None:
+                    self._last_numeric_values[row["role"] + ":" + row["entity"]] = _number(row["value"])
                 if row["kind"] == "temperature" and row.get("timestamp_valid"):
                     value = _number(row.get("value"))
                     if value is not None:
@@ -560,6 +635,20 @@ class ThermalIntelligence:
             "model": "adaptive_preheat_rtm_empirical_command_response",
             "samples": self._samples,
             "evidence_events": len(self._events),
+            "evidence_diagnostics": {
+                "scope": "since_counter_start_not_retained_event_window",
+                "started_at": self._counter_started_at.isoformat() if self._counter_started_at else None,
+                "source_rejection_denominator": "numeric_change_validation_attempts_including_quality_retries",
+                "accepted_source_semantics": "valid_numeric_report_provenance_not_model_eligibility",
+                "source_rejection_fraction": (
+                    self._counters["source_changes_rejected"] / self._counters["source_change_attempts"]
+                    if self._counters["source_change_attempts"] else None
+                ),
+                "counts": dict(self._counters),
+            },
+            "fit_in_progress": self._fit_in_progress,
+            "last_fit_status": self._fit_summary.get("status"),
+            "last_fit_attempt_epoch": _number(self.model._last_fit_ts),
             "oldest_evidence_at": self._events[0]["at"] if self._events else None,
             "latest_evidence_at": self._events[-1]["at"] if self._events else None,
             "forecast_endpoint_basis": "accepted_numeric_changes_only",
