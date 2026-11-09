@@ -186,6 +186,7 @@ class PumpSteerSensor(RestoreEntity):
         self._thermal_model = ThermalModel()
         self._thermal_intelligence = ThermalIntelligence()
         self._thermal_store_restored = False
+        self._thermal_fit_task: Optional[asyncio.Task] = None
         self._adaptive_context = None
         self._adaptive_configuration = None
         self._adaptive_report = None
@@ -710,6 +711,10 @@ class PumpSteerSensor(RestoreEntity):
             task.cancel()
         if pending:
             await asyncio.gather(*(task for _, task in pending), return_exceptions=True)
+        fit_task = getattr(self, "_thermal_fit_task", None)
+        if fit_task is not None and not fit_task.done():
+            fit_task.cancel()
+            await asyncio.gather(fit_task, return_exceptions=True)
         self._input_temperatures = {}
         async_dispatcher_send(self.hass, self._input_temperature_signal)
         if self._cfg().get("thermal_intelligence_enabled") is True:
@@ -1717,6 +1722,34 @@ class PumpSteerSensor(RestoreEntity):
             self._thermal_intelligence.record_output(event)
         except Exception:
             _LOGGER.debug("Thermal Intelligence output capture failed", exc_info=True)
+
+    def _maybe_schedule_thermal_fit(self, now: datetime) -> None:
+        """Schedule asynchronous model fitting in an HA executor thread."""
+        if self._thermal_fit_task is not None and not self._thermal_fit_task.done():
+            return
+        if not self._thermal_intelligence.fit_due(now):
+            return
+        job = self._thermal_intelligence.prepare_fit_job(now)
+        if job is None:
+            return
+        token, snapshot_data = job
+
+        async def _async_fit_worker():
+            try:
+                add_executor = getattr(self.hass, "async_add_executor_job", None)
+                if add_executor is not None:
+                    result = await add_executor(ThermalIntelligence.static_fit, snapshot_data)
+                else:
+                    result = await asyncio.to_thread(ThermalIntelligence.static_fit, snapshot_data)
+                self._thermal_intelligence.apply_fit_result(token, result)
+            except Exception:
+                _LOGGER.debug("Thermal Intelligence background fit failed", exc_info=True)
+                self._thermal_intelligence.apply_fit_result(
+                    token, {"status": "candidate_fit_failed"}
+                )
+
+        create_task = getattr(self.hass, "async_create_task", asyncio.create_task)
+        self._thermal_fit_task = create_task(_async_fit_worker())
 
     def _thermal_cycle(self, at, indoor, outdoor, fake_temp, mode, extra, cfg):
         """Capture a bounded source snapshot without affecting the control result."""
@@ -3948,6 +3981,7 @@ class PumpSteerSensor(RestoreEntity):
             expected,
         )
         if cfg.get("thermal_intelligence_enabled") is True:
+            self._maybe_schedule_thermal_fit(now)
             try:
                 if self._pilot_store_read_failed:
                     await self._load_pilot_store()

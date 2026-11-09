@@ -20,7 +20,7 @@ from .base import (
 )
 from .cooling import cooling_tau
 from .deadtime import tangent_dead_time
-from .fit import FitResult, build_dataset, fit_rc
+from .fit import FitResult, _wvar, build_dataset, fit_rc
 from .forecast import mean_over, outdoor_curve, solve_duration
 from .grid import Grid, ceil_ts, dt_of, floor_ts, resample, ts_of
 from .physics import coast_temperature, equilibrium, preheat_minutes
@@ -38,6 +38,7 @@ from .trust import FitFacts, FitTrust, assess_fit
 STATE_VERSION = 1
 MIN_FIT_HOURS = 3.0  # usable data needed before the first fit
 MIN_QUALITY_HOURS = 12.0  # usable data needed for a holdout evaluation
+MIN_NEW_DATA_HOURS = 1.0  # new eligible data needed since last fit before refitting
 REFIT_SECONDS = 3600.0
 WEAK_EXCITATION_HOURS = 3.0
 OUTDOOR_REF_HOURS = 24.0
@@ -165,32 +166,71 @@ class RCThermalModel(ThermalModel):
             return False
         if self._last_fit_ts is None:
             return self._usable_hours() >= MIN_FIT_HOURS
-        if ts_of(now) - self._last_fit_ts < REFIT_SECONDS:
-            return False
-        return self._data_end_at_fit is None or self._grid.end_ts > self._data_end_at_fit
+        # Meaningful new eligible data is required since the last fit attempt
+        if self._data_end_at_fit is not None:
+            new_data_s = self._grid.end_ts - self._data_end_at_fit
+            if new_data_s < MIN_NEW_DATA_HOURS * 3600.0:
+                return False
+        if self._summary.get("status") == "candidate_insufficient_excitation":
+            efforts = [e for e in self._grid.effort if e is not None]
+            if not efforts or (max(efforts) - min(efforts)) < 0.15:
+                return False
+        return (ts_of(now) - self._last_fit_ts) >= REFIT_SECONDS
 
     def _usable_hours(self) -> float:
         return self._grid.valid_indoor_count() * self.config.step_minutes / 60.0
 
-    def fit(self, now: datetime) -> dict[str, Any]:
+    @classmethod
+    def fit_snapshot(
+        cls,
+        grid: Grid,
+        config: ModelConfig,
+        now_ts: float,
+        group_prior: GroupPrior | None = None,
+    ) -> dict[str, Any]:
+        """Fit model parameters from a grid snapshot. Pure, thread-safe function."""
         t_start = time.perf_counter()
-        cfg = self.config
-        now_ts = ts_of(now)
-        self._last_fit_ts = now_ts
-        # fit runs in an executor while samples keep arriving: work on a snapshot
-        grid = self._grid.snapshot()
-        self._data_end_at_fit = grid.end_ts
-        gp = self._group_prior  # immutable: the executor works on this one
+        cfg = config
+        gp = group_prior
         prior = gp.as_prior() if gp is not None else None
         prior_info = gp.as_dict() if gp is not None else dict(DEFAULT_PRIOR_INFO)
         ds = build_dataset(grid, cfg, now_ts)
         if len(ds) * ds.dt_h < MIN_FIT_HOURS:
-            self._summary = {"status": "insufficient_data", "rows": len(ds)}
-            return dict(self._summary)
+            return {
+                "status": "insufficient_data",
+                "rows": len(ds),
+                "excitation_sufficient": False,
+                "fit_ts": now_ts,
+                "data_end_ts": grid.end_ts,
+            }
+
+        # Check command excitation before running regressions. A nearly constant command
+        # cannot independently identify heating response gain a and background gain c.
+        u0 = [e if (e := grid.effort[k]) is not None else 0.0 for k in ds.k]
+        range_u = (max(u0) - min(u0)) if u0 else 0.0
+        var_u = _wvar(u0, ds.w)
+        if range_u < 0.15 or var_u < 0.005:
+            return {
+                "status": "candidate_insufficient_excitation",
+                "reason": "insufficient_command_excitation_for_dual_gain_identification",
+                "rows": len(ds),
+                "command_range": round(range_u, 4),
+                "command_variance": round(var_u, 6),
+                "excitation_sufficient": False,
+                "params": None,
+                "fit_ts": now_ts,
+                "data_end_ts": grid.end_ts,
+            }
+
         res = fit_rc(ds, grid.effort, cfg, prior=prior)
         if res is None:
-            self._summary = {"status": "insufficient_data", "rows": len(ds)}
-            return dict(self._summary)
+            return {
+                "status": "fit_failed",
+                "rows": len(ds),
+                "excitation_sufficient": True,
+                "fit_ts": now_ts,
+                "data_end_ts": grid.end_ts,
+            }
 
         bad = bad_rows(grid, cfg.max_step_delta_k)
         heat_h, cool_h = experience_hours(grid, bad)
@@ -245,18 +285,18 @@ class RCThermalModel(ThermalModel):
                 p_tr = Params(r_tr.a, r_tr.b, r_tr.c, r_tr.d_steps, ds.use_outdoor)
                 evaluation = evaluate(grid, p_tr, bad, k_hold)
 
-        self._params = {
+        params = {
             "a": res.a,
             "b": res.b,
             "c": res.c,
             "d_minutes": res.d_steps * step,
             "use_outdoor": ds.use_outdoor,
         }
-        self._outdoor_ref = self._recent_outdoor()
+        outdoor_ref = cls._recent_outdoor_grid(grid, step)
         rmse = evaluation.rmse if evaluation else None
         base = evaluation.baseline_rmse if evaluation else None
         mat = maturity(heat_h, cool_h, rmse, base)
-        self._quality = {
+        quality = {
             "maturity": mat,
             "samples": grid.valid_indoor_count(),
             "heating_hours": heat_h,
@@ -274,32 +314,61 @@ class RCThermalModel(ThermalModel):
         if tangent is not None:
             cross["tangent_dead_time_min"] = round(tangent.minutes, 1)
             cross["tangent_edges"] = tangent.edges
-        self._summary = {
+
+        return {
             "status": "ok",
             "mode": "outdoor" if ds.use_outdoor else "no_outdoor",
-            **self._fit_dict(res),
+            **cls._fit_dict(res, step),
             "time_constant_h": round(1.0 / res.b, 3),
             "fallbacks": fallbacks,
             "prior": prior_info,
             "cross_check": cross,
-            "quality": {k: _r(v) if isinstance(v, float) else v for k, v in self._quality.items()},
+            "quality": {k: _r(v) if isinstance(v, float) else v for k, v in quality.items()},
             "evaluation_windows": evaluation.windows if evaluation else 0,
             "episode_errors_min": evaluation.episode_errors if evaluation else [],
             "fit_seconds": round(time.perf_counter() - t_start, 3),
+            "excitation_sufficient": True,
+            "command_range": round(range_u, 4),
+            "command_variance": round(var_u, 6),
+            "params": params,
+            "outdoor_ref": outdoor_ref,
+            "fit_ts": now_ts,
+            "data_end_ts": grid.end_ts,
         }
+
+    def fit(self, now: datetime) -> dict[str, Any]:
+        """Synchronous fitting on the local instance."""
+        now_ts = ts_of(now)
+        self._last_fit_ts = now_ts
+        grid = self._grid.snapshot()
+        self._data_end_at_fit = grid.end_ts
+        res = self.fit_snapshot(grid, self.config, now_ts, self._group_prior)
+        self._summary = res
+        if res.get("status") == "ok" and res.get("params"):
+            self._params = res["params"]
+            self._quality = res.get("quality")
+            self._outdoor_ref = res.get("outdoor_ref")
+        else:
+            self._params = None
+            self._quality = None
         return dict(self._summary)
 
-    def _fit_dict(self, res: FitResult) -> dict[str, Any]:
-        d = res.as_dict(self.config.step_minutes)
+    @staticmethod
+    def _fit_dict(res: FitResult, step_minutes: float) -> dict[str, Any]:
+        d = res.as_dict(step_minutes)
         d["criterion"] = {
-            str(int(k * self.config.step_minutes)): round(v, 5) for k, v in res.criterion.items()
+            str(int(k * step_minutes)): round(v, 5) for k, v in res.criterion.items()
         }
         return d
 
-    def _recent_outdoor(self) -> float | None:
-        n = int(OUTDOOR_REF_HOURS * 60 / self.config.step_minutes)
-        vals = [v for v in self._grid.outdoor[-n:] if v is not None]
+    @staticmethod
+    def _recent_outdoor_grid(grid: Grid, step_minutes: float) -> float | None:
+        n = int(OUTDOOR_REF_HOURS * 60 / step_minutes)
+        vals = [v for v in grid.outdoor[-n:] if v is not None]
         return sum(vals) / len(vals) if vals else None
+
+    def _recent_outdoor(self) -> float | None:
+        return self._recent_outdoor_grid(self._grid, self.config.step_minutes)
 
     # -- queries ------------------------------------------------------------------------
     def trust(self, target_c: float) -> FitTrust | None:
