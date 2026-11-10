@@ -26,6 +26,7 @@ from .thermal_intelligence.runtime import ThermalIntelligence
 from .const import (
     DEFAULT_OUTDOOR_REPORT_MAX_AGE_MINUTES,
     DEFAULT_TEMPERATURE_REPORT_MAX_AGE_MINUTES,
+    STARTUP_REPORT_GRACE_MINUTES,
 )
 
 from .control import PIController
@@ -176,6 +177,7 @@ class PumpSteerSensor(RestoreEntity):
         )
         self._ohmigo_last_push = None
         self._temperature_reported_after: Optional[datetime] = None
+        self._temperature_startup_gate = True
         self._remove_start_listener = None
         self._temperature_unloaded = False
         self._update_in_progress = False
@@ -584,6 +586,9 @@ class PumpSteerSensor(RestoreEntity):
 
     async def async_added_to_hass(self) -> None:
         self._temperature_reported_after = dt_util.now()
+        # Running HA sources may be change-only. Retain the activation anchor
+        # for age limits and evidence; only the control read gate is relaxed.
+        self._temperature_startup_gate = not self.hass.is_running
         self._temperature_unloaded = False
         await super().async_added_to_hass()
         self._setup_power_telemetry()
@@ -809,6 +814,7 @@ class PumpSteerSensor(RestoreEntity):
             and fired <= now
             else now
         )
+        self._temperature_startup_gate = True
         await self.async_update()
         self.async_write_ha_state()
 
@@ -1400,11 +1406,12 @@ class PumpSteerSensor(RestoreEntity):
     def _temperature_cutoff(self, cfg, *, outdoor=False):
         """Use a configured HA-report age, without claiming physical freshness.
 
-        The lifecycle startup gate remains in force. The age limit is a bound
-        on HA reports, not a claim about physical sampling.
+        The control startup gate expires after five minutes; configured/default
+        age limits and the separate evidence activation anchor remain in force.
+        HA reports are not proof of physical sampling.
         """
         # Before HA lifecycle setup, offline callers can lack report timestamps.
-        # A running integration always establishes a startup cutoff.
+        # A running integration always establishes an activation anchor.
         configured_default = (
             DEFAULT_OUTDOOR_REPORT_MAX_AGE_MINUTES
             if outdoor
@@ -1428,8 +1435,19 @@ class PumpSteerSensor(RestoreEntity):
                 return None
             minutes = configured_default
         cutoff = dt_util.now().astimezone(timezone.utc) - timedelta(minutes=minutes)
-        if self._temperature_reported_after is not None:
-            cutoff = max(cutoff, self._temperature_reported_after)
+        anchor = self._temperature_reported_after
+        if anchor is not None and self._temperature_startup_gate:
+            if (
+                dt_util.now().timestamp() - anchor.timestamp()
+                >= STARTUP_REPORT_GRACE_MINUTES * 60
+            ):
+                self._temperature_startup_gate = False
+                _LOGGER.info(
+                    "PumpSteer startup report window elapsed; accepting unchanged "
+                    "non-restored temperatures within existing HA report age limits"
+                )
+            else:
+                cutoff = max(cutoff, anchor)
         return cutoff
 
     def _temperature_state(self, cfg, key):

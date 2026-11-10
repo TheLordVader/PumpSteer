@@ -134,7 +134,7 @@ def test_start_invalid_event_time_uses_conservative_now(control, event_time):
     assert len(sensor.hass.services.calls) == 2
 
 
-def test_reload_waits_for_new_reports(control, monkeypatch):
+def test_reload_uses_current_non_restored_reports(control, monkeypatch):
     sensor, states, clock = control
     _report(states, clock)
     sensor.hass.is_running = True
@@ -149,7 +149,8 @@ def test_reload_waits_for_new_reports(control, monkeypatch):
 
     monkeypatch.setattr(sensor, "async_get_last_extra_data", no_extra, raising=False)
     asyncio.run(sensor.async_added_to_hass())
-    assert sensor.hass.services.calls == []
+    assert sensor.extra_state_attributes["mode"] == MODE_PI
+    assert len(sensor.hass.services.calls) == 2
     assert subscriptions == []  # HA is already running
     clock[0] += timedelta(seconds=1)
     _report(states, clock)

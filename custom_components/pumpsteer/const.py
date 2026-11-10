@@ -14,6 +14,9 @@ NOTIFICATION_LEVELS = frozenset(
 )
 NOTIFICATION_COOLDOWN_CHOICES = (0, 30, 60, 120)
 
+# Control-only startup gate; age/provenance checks continue after release.
+STARTUP_REPORT_GRACE_MINUTES = 5
+
 # Six hours exceeds the observed 333-minute temperature report gap in the
 # reference Recorder sample. Installations with slower sources must adjust it.
 DEFAULT_TEMPERATURE_REPORT_MAX_AGE_MINUTES = 360

@@ -145,7 +145,8 @@ def test_start_restore_reload_and_fresh_report(temperatures, monkeypatch):
         entity.hass = controller.hass
         entity.async_write_ha_state = lambda: None
         asyncio.run(entity.async_added_to_hass())
-    assert [e.available for e in replacements] == [False, False]
+    assert [e.available for e in replacements] == [True, True]
+    assert [e.native_value for e in replacements] == [21.0, -3.3]
     assert [e._attr_unique_id for e in replacements] == [
         e._attr_unique_id for e in entities
     ]

@@ -95,8 +95,8 @@ def get_temperature(
     entity = hass.states.get(entity_id)
     if entity is None or entity.attributes.get("restored"):
         return None
+    reported = getattr(entity, "last_reported", None)
     if reported_after is not None:
-        reported = getattr(entity, "last_reported", None)
         try:
             if (
                 not isinstance(reported, datetime)
@@ -108,6 +108,13 @@ def get_temperature(
                 return None
         except TypeError:
             return None
+    elif isinstance(reported, datetime) and (
+        reported.utcoffset() is None
+        or reported.timestamp() > dt_util.now().timestamp()
+    ):
+        # Even an ungated read must reject ambiguous or future report times.
+        # After a clock rollback, the original report qualifies when time catches up.
+        return None
     return temperature_from_state(entity)
 
 

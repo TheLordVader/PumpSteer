@@ -332,12 +332,19 @@ also unavailable. Monitor the system after installation and configuration change
 
 ### Offline temperature-validation candidate — not approved for active operation
 
-Temperature inputs marked `restored` are rejected. Startup/reload requires a
-non-restored numeric HA report with `last_reported` later than activation (or
-the HA-start event). An unchanged value can qualify through a new report.
+Temperature inputs marked `restored` are rejected. After HA startup, new
+non-restored HA reports qualify immediately. The control-only startup barrier
+expires five minutes after the `homeassistant_started` event, so change-only
+sensors can then use their existing report if it still meets the report-age limit.
+An integration reload while HA is already running does not wait for another report.
+
+The existing age limits still apply: indoor reports default to six hours and outdoor
+reports to two hours; stricter configured limits remain in force. Missing, naive or
+future report timestamps, invalid numbers and incompatible units do not qualify.
 This requires Home Assistant 2024.4 or later, matching the HACS minimum version.
-Missing timestamp metadata cannot qualify after activation. This is a HA-report
-barrier, **not proof of a fresh physical measurement**; a source may republish cache.
+HA report time is **not proof of a fresh physical measurement**; a source may
+republish cache. Startup/activation timestamps remain unchanged for optional verified
+signals and adaptive learning, and grace release does not create new observations.
 
 Inputs and configured source identities are rechecked after asynchronous data
 retrieval and immediately before each output service call. Changed or invalid

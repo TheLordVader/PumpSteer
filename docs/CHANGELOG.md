@@ -14,6 +14,7 @@ Versions follow [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added / improved
+- Adapt upstream 2.2.7's change-only temperature startup/reload fix ([ec496a9](https://github.com/JohanAlvedal/PumpSteer/commit/ec496a92daad1d9d88cf46f419b9df3c9a434747)): release the control-only startup gate after five minutes, and omit that gate on a running-HA reload. Preserve PumpSteer 3's existing report-age limits, provenance and per-output validation; do not change adaptive steering, brake defaults or the version.
 - Include the actual current-slot electricity price in preheating notifications too, using the same PumpSteer state snapshot introduced in 2.2.2.
 - Correct the preheating message so it does not claim the current price is always cheap.
 - Add opt-in price-notification levels (all, braking only, none) and independent per-mode repeat cooldowns (0, 30, 60 or 120 minutes). The existing Notifications switch remains the master control.
