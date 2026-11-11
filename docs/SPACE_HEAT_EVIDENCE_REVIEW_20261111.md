@@ -1,8 +1,8 @@
 # Passive space-heating evidence review
 
 Base: a239245692b4c00baafda5cb646430b9e201a157, with the pinned RoomMind
-adapter. This branch adds regression contracts and this review only. No production
-configuration, active control, thresholds or model was changed.
+adapter. This branch adds regression contracts, this review and explicit diagnostic provenance.
+No production configuration, active control, thresholds or model was changed.
 
 ## What the available signals establish
 
@@ -85,3 +85,32 @@ Results: 39 operation/provenance/common-chain tests passed (0.60s); all 21
 external RoomMind adapter tests passed (5.61s). Ruff and whitespace checks passed.
 Integration diff against a239245 is empty. The full 1642-test regression belongs
 to the previous adapter commit; it was not rerun or represented as a new result.
+
+
+## Follow-up: optional source semantics and diagnostics
+
+The configured heating-mode inversion in `_heating_mode_state` flips only on/off
+and preserves original HA times. A valve used both as inverted heating selection
+and direct DHW selection describes circuit selection, not two independent witnesses
+of production. MQTT entity metadata identifies transport, not register semantics.
+Binary reports without a source heartbeat/expiry contract cannot be promoted to
+current physical state by increasing freshness limits. A pump-labelled entity is
+not a flow meter, and retained startup on states need source-level verification.
+
+Bounded read-only production investigation supports this limitation; detailed
+household observations remain in a separate private note outside this branch.
+The register/payload polarity and reporting contract are still missing, so no
+automatic RTM exclusion is wired from these sources. The existing `suspend` and
+segment mechanism remains the appropriate path for known interval exclusions.
+
+Small diagnostic change: HeatOperation always exposes `heat_delivery_verified=false`
+because it accepts operating labels rather than a circuit-specific thermal meter;
+conflicting heat/compressor/radiator labels explicitly report
+`contradictory_operating_reports`. Existing learning qualification is unchanged.
+New tests first failed on missing keys and passed after the change. Targeted
+operation/provenance/common-chain suite: 41 passed (0.61s).
+
+Follow-up full regression with pinned RoomMind enabled: **1650 passed (50.47s)**.
+Only runtime diff is the two diagnostic fields/reason in HeatOperation; active
+control and all model qualification decisions are unchanged. No production write,
+installation or service call; no private data added to git. Local commit only.

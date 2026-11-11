@@ -53,3 +53,18 @@ def test_hot_pipes_without_flow_are_only_gradient_evidence():
     assert result["delta_t_status"] == "positive_transfer_indication"
     assert result["mode"] == "unknown"
     assert not result["learning_qualified"]
+
+
+def test_accepted_heat_label_is_not_physical_heat_delivery_verification():
+    result = HeatOperation().observe(T, heat=reading("on", T))
+    assert result["learning_qualified"]  # existing independent-label contract
+    assert result["heat_delivery_verified"] is False
+
+
+def test_conflicting_operating_reports_have_an_explicit_reason():
+    result = HeatOperation().observe(
+        T, heat=reading("on", T), compressor=reading("off", T)
+    )
+    assert result["mode"] == "unknown"
+    assert result["reason"] == "contradictory_operating_reports"
+    assert not result["learning_qualified"]

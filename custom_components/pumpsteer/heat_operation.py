@@ -91,6 +91,8 @@ class HeatOperation:
             "quality": "unknown",
             "signals": [],
             "learning_qualified": False,
+            # Accepted operating labels are not a circuit-specific heat meter.
+            "heat_delivery_verified": False,
             "calibration": "insufficient_evidence",
             "physical_measurement_time": "unknown",
             "delta_t_c": None,
@@ -187,7 +189,7 @@ class HeatOperation:
                 reason="hot_water_mode_report_not_production",
             )
         elif conflict:
-            pass
+            result["reason"] = "contradictory_operating_reports"
         elif h is not None and (water is None or w is not None):
             if h[1] == 1 and (radiator is None or (r is not None and r[1] == 1)):
                 result.update(
