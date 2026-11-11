@@ -114,3 +114,47 @@ Follow-up full regression with pinned RoomMind enabled: **1650 passed (50.47s)**
 Only runtime diff is the two diagnostic fields/reason in HeatOperation; active
 control and all model qualification decisions are unchanged. No production write,
 installation or service call; no private data added to git. Local commit only.
+
+## Gateway trace correction: HA state age is not MQTT silence
+
+A subsequent read-only trace found both archived and live gateway republishes,
+roughly every 20 minutes. This supersedes any inference above that an old HA
+binary-state timestamp establishes missing source heartbeat. These are distinct
+clocks: raw MQTT receipt, HA entity write, gateway register read, physical state.
+
+[Husdata settings](https://husdata.se/docs/h60-manual/settings-explanation/)
+defines MQTT_PUBALL (minutes, zero means change-only; documented default20).
+Observed periodic traffic does not independently establish the local setting.
+Discovery inspected for the relevant binaries has payload_on=1/payload_off=0,
+without expire_after, availability or force_update. Transport liveliness is not
+pump-communication liveliness or physical sampling.
+
+[HA Core2026.10.4 binary_sensor.py](https://github.com/home-assistant/core/blob/2026.10.4/homeassistant/components/mqtt/binary_sensor.py)
+tracks is_on/expired attributes. In
+[entity.py:_message_callback](https://github.com/home-assistant/core/blob/2026.10.4/homeassistant/components/mqtt/entity.py),
+MQTT messages enter debug history but state writes occur only after tracked
+attribute changes or force_update. This accounts for old last_reported despite
+recent identical raw MQTT messages. Recorder alone cannot recover those receipts.
+No age threshold was relaxed and no HA force_update setting was changed.
+
+[Manufacturer C50 register definitions](https://online.husdata.se/h-docs/C50.pdf):
+1A01 compressor;1A04 ground-source pump;1A05 internal circulation pump;1A06 radiator
+pump;1A07 valve0=radiators,1=DHW. Binaries0=off,1=on. Actual interface/firmware
+identity and hydraulic applicability still need checking; a device's friendly
+name is not an interface-type certificate. A valve label does not prove production.
+
+Manufacturer source references reviewed:
+- [H60-OS at14e047f5a12e9401bb73154bc9c015f2dcb03d4b](https://github.com/peterarandis/H60-OS/tree/14e047f5a12e9401bb73154bc9c015f2dcb03d4b):
+  HD_H1comm.h H1_HandleData parses interface-provided XL/XR register lists/values;
+  H1_CommInit has a periodic XR reread path. This is H60 starter code, not the
+  installed H66/H1 firmware or proof of its physical polling interval.
+- [Manufacturer Homey client at5409a901bf03b23b541e977d7606c8d2103b3a91](https://github.com/peterarandis/husdata-h60-homey/tree/5409a901bf03b23b541e977d7606c8d2103b3a91):
+  drivers/H60/device.js maps compressor/valve IDX and polls API. Its client timer
+  is not the gateway's register freshness contract.
+
+No algorithm defect or safe replacement freshness policy has been established.
+The existing HA-report guard can reject a transport-live unchanged binary; simply
+holding it longer could also admit a stale gateway cache. Keep unknown until the
+source contract is established. This trace adds documentation only; previous test
+results are unchanged, not a newly executed regression run. Detailed household
+observations and raw debug payloads remain private and are not committed.
