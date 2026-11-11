@@ -158,3 +158,22 @@ holding it longer could also admit a stale gateway cache. Keep unknown until the
 source contract is established. This trace adds documentation only; previous test
 results are unchanged, not a newly executed regression run. Detailed household
 observations and raw debug payloads remain private and are not committed.
+
+## Installed-source follow-up
+
+A further read-only gateway UI inspection now resolves installed controller-family
+and firmware identity; the configured republication interval also matches raw MQTT
+observations. Details remain in the private audit. This supersedes the earlier
+statement that installed family/version and the local publish setting were wholly
+unknown. It does **not** resolve per-register bus read time, update schedule,
+cache invalidation or physical device state. The read-only pages/log expose no
+individual update timestamp for the four operating registers. Detailed logging
+was not enabled, API access was not enabled and no command was published.
+
+The gateway web display and its MQTT export are two views of the same source;
+agreement is not independent corroboration. Independent pump-display evidence is
+still missing. Vendor H60 example code is not the installed H66 firmware. Keep
+unknown register freshness distinct from transport heartbeat, retain known external
+interval exclusions, and request the exact firmware/interface register-update
+contract before changing automatic learning eligibility. No code change or new test
+claim is made in this documentation-only follow-up.
