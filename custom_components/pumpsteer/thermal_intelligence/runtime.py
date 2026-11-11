@@ -314,6 +314,7 @@ class ThermalIntelligence:
         indoor = _number(cycle.get("indoor"))
         outdoor = _number(cycle.get("outdoor"))
         source_rows = []
+        temperature_reports = []
         changed = False
         for raw in sources + [{"entity": cycle.get("outdoor_source") or "outdoor",
                                "value": outdoor,
@@ -340,6 +341,24 @@ class ThermalIntelligence:
                        "physical_time_status": "known" if raw.get("physical_time_known") is True and valid_time else "physical_time_unknown"}
             captured = (value, valid_time, ordered)
             numeric_changed = value is not None and self._last_numeric_values.get(key) != value
+            # Diagnostic provenance only: never changes acceptance or model inputs.
+            blocker = (
+                "missing_or_invalid_value" if value is None else
+                "report_time_missing" if reported is None else
+                "report_time_future" if reported > at else
+                "report_time_stale" if at - reported > age_limit else
+                "report_out_of_order" if not ordered else None
+            )
+            temperature_reports.append({
+                "entity": entity, "role": role, "weight": row["weight"],
+                "value": value, "reported_at": row["reported_at"],
+                "age_seconds": (at - reported).total_seconds() if reported else None,
+                "age_limit_seconds": age_limit.total_seconds(),
+                "numeric_value_changed": numeric_changed,
+                "change_basis": "last_seen_numeric_value_not_physical_sample",
+                "physical_time_known": row["physical_time_known"],
+                "blocker": blocker,
+            })
             captured_change = advanced and self._captured_values.get(key) != captured
             if value is not None:
                 self._last_numeric_values[key] = value
@@ -387,7 +406,14 @@ class ThermalIntelligence:
         if indoor is None or outdoor is None or not source_rows or any(
             row["value"] is None or not row["timestamp_valid"] for row in source_rows
         ):
-            self._interrupt("required_temperature_missing_or_stale", at)
+            self._interrupt("required_temperature_missing_or_stale", at,
+                            temperature_diagnostics={
+                                "snapshot_scope": "interruption_start_only",
+                                "sources": temperature_reports[:4],
+                                "sources_truncated": len(temperature_reports) > 4,
+                                "aggregate_indoor_available": indoor is not None,
+                                "aggregate_outdoor_available": outdoor is not None,
+                            })
             self._status = "waiting_for_temperatures"
             return
         changed_times = [self._source_values["indoor:" + row["entity"]][1]
@@ -528,14 +554,17 @@ class ThermalIntelligence:
         self._active_cycle = None
         self._context_signature = ()
 
-    def _interrupt(self, reason: str, at: datetime | None = None) -> None:
+    def _interrupt(self, reason: str, at: datetime | None = None, *,
+                   temperature_diagnostics: dict[str, Any] | None = None) -> None:
         at = at or datetime.now(UTC)
         if reason != self._last_interruption:
             self._count("interruptions", at)
             if reason == "restart":
                 self._count("restarts", at)
             self._boundary(at)
-            self._append("interruption", at, reason=reason)
+            details = ({"temperature_diagnostics": temperature_diagnostics}
+                       if temperature_diagnostics is not None else {})
+            self._append("interruption", at, reason=reason, **details)
         self._last_interruption = reason
 
     def export_state(self) -> dict[str, Any]:
