@@ -4,23 +4,9 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
+from options_form_helpers import submit_group
 
 from custom_components.pumpsteer.options_flow import PumpSteerOptionsFlowHandler
-from custom_components.pumpsteer import options_flow
-
-
-@pytest.fixture(autouse=True)
-def selectors(monkeypatch):
-    monkeypatch.setattr(
-        options_flow.vol,
-        "Optional",
-        lambda name, default=None, **kwargs: (name, default),
-    )
-    monkeypatch.setattr(
-        options_flow.vol,
-        "Required",
-        lambda name, default=None, **kwargs: (name, default),
-    )
 
 
 def _flow(options=None):
@@ -69,12 +55,14 @@ def test_numeric_alarm_settings_are_saved_without_changing_other_options():
         {"thermal_alarm_entity": "sensor.fault", "zone_1_entity": "sensor.room"}
     )
     result = asyncio.run(
-        flow.async_step_heat_pump_telemetry(
+        submit_group(
+            flow,
+            "heat_pump_telemetry",
             {
                 "thermal_alarm_entity": "sensor.fault",
                 "thermal_alarm_numeric_verified": True,
                 "thermal_alarm_numeric_normal": 0,
-            }
+            },
         )
     )
     assert result["data"]["thermal_alarm_numeric_normal"] == 0
@@ -99,5 +87,5 @@ def test_changed_numeric_source_or_normal_value_revokes_previous_verification(ch
         "thermal_alarm_numeric_normal": 0,
     }
     values[changed] = "sensor.new" if changed == "thermal_alarm_entity" else 1
-    result = asyncio.run(flow.async_step_heat_pump_telemetry(values))
+    result = asyncio.run(submit_group(flow, "heat_pump_telemetry", values))
     assert result["data"]["thermal_alarm_numeric_verified"] is False
