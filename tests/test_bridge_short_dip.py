@@ -67,13 +67,13 @@ def _make_sensor(brake_hold_minutes=30.0):
     return sensor
 
 
-def _run_cycle(sensor, monkeypatch, now, categories, forecast_temps=None):
+def _run_cycle(sensor, monkeypatch, now, categories, forecast_temps=None, prices=None):
     async def fake_holiday(*args, **kwargs):
         return False
 
     async def fake_prices(cfg, update_time):
         return (
-            [1.0] * len(categories),
+            prices if prices is not None else [1.0] * len(categories),
             categories,
             15,
             0,
