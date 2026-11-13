@@ -2,44 +2,54 @@
 
 import asyncio
 import json
-import pytest
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+from options_form_helpers import schema_marker, submit_group
+from test_brake_provenance import _cycle, _sensor
+
 from custom_components.pumpsteer import options_flow
-from test_brake_provenance import _sensor, _cycle
 
 
 def test_options_flow_defaults_and_retains_explicit_values(monkeypatch):
     flow = options_flow.PumpSteerOptionsFlowHandler()
     flow.config_entry = SimpleNamespace(data={}, options={})
     flow.hass = SimpleNamespace(states=SimpleNamespace(async_all=lambda domain: []))
-    monkeypatch.setattr(
-        options_flow.vol,
-        "Optional",
-        lambda name, default=None, **kwargs: (name, default),
-    )
-    monkeypatch.setattr(
-        options_flow.vol,
-        "Required",
-        lambda name, default=None, **kwargs: (name, default),
-    )
     flow.async_show_form = lambda **kwargs: kwargs
-    schema = asyncio.run(flow.async_step_thermal())["data_schema"]
-    assert ("thermal_intelligence_enabled", False) in schema
-    assert ("external_heat_sources", False) in schema
+    schema = asyncio.run(submit_group(flow, "thermal"))["data_schema"]
+    assert (
+        schema_marker(schema, "thermal_intelligence_enabled").description[
+            "suggested_value"
+        ]
+        is False
+    )
+    assert (
+        schema_marker(schema, "external_heat_sources").description["suggested_value"]
+        is False
+    )
     flow.config_entry.options = {
         "thermal_intelligence_enabled": True,
         "external_heat_sources": True,
     }
-    schema = asyncio.run(flow.async_step_thermal())["data_schema"]
-    assert ("thermal_intelligence_enabled", True) in schema
-    assert ("external_heat_sources", True) in schema
+    schema = asyncio.run(submit_group(flow, "thermal"))["data_schema"]
+    assert (
+        schema_marker(schema, "thermal_intelligence_enabled").description[
+            "suggested_value"
+        ]
+        is True
+    )
+    assert (
+        schema_marker(schema, "external_heat_sources").description["suggested_value"]
+        is True
+    )
     flow._validate_entities = lambda data: {}
     flow.async_create_entry = lambda **kwargs: kwargs
     saved = asyncio.run(
-        flow.async_step_thermal(
-            {"thermal_intelligence_enabled": True, "external_heat_sources": True}
+        submit_group(
+            flow,
+            "thermal",
+            {"thermal_intelligence_enabled": True, "external_heat_sources": True},
         )
     )
     assert saved["data"] == {
@@ -97,7 +107,9 @@ def test_safe_and_recovery_never_turn_on_assistance(monkeypatch):
 def test_both_settings_have_english_and_swedish_text():
     root = Path(__file__).parents[1] / "custom_components/pumpsteer"
     for name in ("strings.json", "translations/en.json", "translations/sv.json"):
-        section = json.loads((root / name).read_text())["options"]["step"]["thermal"]
+        section = json.loads((root / name).read_text())["options"]["step"]["init"][
+            "sections"
+        ]["thermal"]
         for key in ("thermal_intelligence_enabled", "external_heat_sources"):
             assert section["data"][key] and section["data_description"][key]
 
@@ -196,6 +208,7 @@ def test_update_error_breaks_pending_pilot_interval(monkeypatch):
 )
 def test_live_diagnostics_never_run_retired_fit_for_optional_signals(monkeypatch, role):
     from datetime import datetime, timezone
+
     from custom_components.pumpsteer import sensor as sensor_module
 
     sensor, states = _sensor()
@@ -400,9 +413,10 @@ def test_live_cycle_never_fits_retired_pump_response_model(monkeypatch):
         ohmigo_entity="number.reported_command",
         ohmigo_relay_entity="switch.active",
     )
+    import threading
+
     from custom_components.pumpsteer import ohmigo
     from custom_components.pumpsteer.pilot_vendor.pump_response import PumpResponseModel
-    import threading
 
     thread_ids = []
     original = PumpResponseModel.add_interval
@@ -840,6 +854,7 @@ def test_offline_automatic_collects_indication_but_never_qualifies_pilot_without
     monkeypatch,
 ):
     from datetime import datetime, timedelta, timezone
+
     from custom_components.pumpsteer.pilot_passive import PilotPassive
 
     calls = []
@@ -962,42 +977,37 @@ def test_options_offer_supply_mode_and_threshold(monkeypatch):
     flow = options_flow.PumpSteerOptionsFlowHandler()
     flow.config_entry = SimpleNamespace(data={}, options={})
     flow.hass = SimpleNamespace(states=SimpleNamespace(async_all=lambda domain: []))
-    monkeypatch.setattr(
-        options_flow.vol,
-        "Optional",
-        lambda name, default=None, **kwargs: (name, default),
-    )
-    monkeypatch.setattr(
-        options_flow.vol,
-        "Required",
-        lambda name, default=None, **kwargs: (name, default),
-    )
     flow.async_show_form = lambda **kwargs: kwargs
-    schema = asyncio.run(flow.async_step_heat_sensors())["data_schema"]
-    details = asyncio.run(flow.async_step_heat_details())["data_schema"]
+    schema = asyncio.run(submit_group(flow, "heat_sensors"))["data_schema"]
+    details = asyncio.run(submit_group(flow, "heat_details"))["data_schema"]
     assert any(
-        key[0] == "thermal_supply_temp_entity"
+        key.schema == "thermal_supply_temp_entity"
         for key in schema
-        if isinstance(key, tuple)
+        if hasattr(key, "schema")
     )
     assert any(
-        key[0] == "thermal_heating_mode_entity"
+        key.schema == "thermal_heating_mode_entity"
         for key in schema
-        if isinstance(key, tuple)
+        if hasattr(key, "schema")
     )
-    assert ("thermal_supply_threshold", 30) in schema
-    assert any(
-        key[0] == "thermal_detection_method" for key in schema if isinstance(key, tuple)
+    assert (
+        schema_marker(schema, "thermal_supply_threshold").description["suggested_value"]
+        == 30
     )
     assert any(
-        key[0] == "thermal_compressor_entity"
+        key.schema == "thermal_detection_method"
+        for key in schema
+        if hasattr(key, "schema")
+    )
+    assert any(
+        key.schema == "thermal_compressor_entity"
         for key in details
-        if isinstance(key, tuple)
+        if hasattr(key, "schema")
     )
     assert any(
-        key[0] == "thermal_return_temp_entity"
+        key.schema == "thermal_return_temp_entity"
         for key in details
-        if isinstance(key, tuple)
+        if hasattr(key, "schema")
     )
 
 
@@ -1048,8 +1058,9 @@ def test_live_cycle_discards_legacy_plan_without_consuming_legacy_audit(monkeypa
 def test_offline_quality_recovery_cannot_reactivate_retired_live_planner(
     monkeypatch,
 ):
-    from datetime import datetime, timedelta, timezone
     import hashlib
+    from datetime import datetime, timedelta, timezone
+
     from custom_components.pumpsteer import forecast
     from custom_components.pumpsteer.pilot_forecast_audit import ForecastAudit
     from custom_components.pumpsteer.pilot_vendor.pump_response import (
@@ -1244,6 +1255,7 @@ def test_offline_quality_recovery_cannot_reactivate_retired_live_planner(
 def test_power_telemetry_uses_bounded_event_subscription_and_no_new_entity(monkeypatch):
     import sys
     from datetime import datetime, timedelta, timezone
+
     from custom_components.pumpsteer import sensor as sensor_module
 
     sensor, states = _sensor()
@@ -1321,6 +1333,7 @@ def test_power_telemetry_uses_bounded_event_subscription_and_no_new_entity(monke
 @pytest.mark.parametrize("with_water", [False, True])
 def test_inverted_valve_classifies_power_without_changing_report_times(with_water):
     from datetime import datetime, timedelta, timezone
+
     from custom_components.pumpsteer.pilot_power_ledger import PowerLedger
 
     sensor, states = _sensor()
@@ -1376,6 +1389,7 @@ def test_inverted_valve_classifies_power_without_changing_report_times(with_wate
 def test_existing_control_cycle_recovers_unchanged_ha_power_reports(monkeypatch):
     import sys
     from datetime import datetime, timedelta, timezone
+
     from custom_components.pumpsteer import sensor as sensor_module
 
     sensor, states = _sensor()
@@ -1421,6 +1435,7 @@ def test_existing_control_cycle_recovers_unchanged_ha_power_reports(monkeypatch)
 def test_other_ha_event_never_fabricates_a_power_interval(monkeypatch):
     import sys
     from datetime import datetime, timedelta, timezone
+
     from custom_components.pumpsteer import sensor as sensor_module
 
     sensor, states = _sensor()
@@ -1664,6 +1679,7 @@ def test_energy_meter_subscription_tracks_asynchronous_reports_and_restarts_on_o
 ):
     import sys
     from datetime import datetime, timedelta, timezone
+
     from custom_components.pumpsteer import sensor as sensor_module
 
     sensor, states = _sensor()
@@ -1705,6 +1721,7 @@ def test_energy_meter_subscription_tracks_asynchronous_reports_and_restarts_on_o
 def test_energy_telemetry_errors_are_isolated_from_control_cycle(monkeypatch):
     import sys
     from datetime import datetime, timedelta, timezone
+
     from custom_components.pumpsteer import sensor as sensor_module
 
     sensor, states = _sensor()
@@ -1738,6 +1755,7 @@ def test_queued_energy_events_preserve_reset_even_if_current_state_is_newer(
 ):
     import sys
     from datetime import datetime, timedelta, timezone
+
     from custom_components.pumpsteer import sensor as sensor_module
 
     sensor, states = _sensor()
@@ -1781,6 +1799,7 @@ def test_queued_energy_events_preserve_reset_even_if_current_state_is_newer(
 def test_price_state_event_preserves_unchanged_forecast_across_boundary(monkeypatch):
     import sys
     from datetime import datetime, timedelta, timezone
+
     from custom_components.pumpsteer import sensor as sensor_module
 
     sensor, states = _sensor()
@@ -1851,6 +1870,7 @@ def test_price_state_event_preserves_unchanged_forecast_across_boundary(monkeypa
 def test_energy_poll_does_not_skip_queued_reset_event(monkeypatch):
     import sys
     from datetime import datetime, timedelta, timezone
+
     from custom_components.pumpsteer import sensor as sensor_module
 
     sensor, states = _sensor()
@@ -1902,6 +1922,7 @@ def test_energy_poll_does_not_skip_queued_reset_event(monkeypatch):
 def test_unchanged_energy_reports_are_polled_after_anchor(monkeypatch):
     import sys
     from datetime import datetime, timedelta, timezone
+
     from custom_components.pumpsteer import sensor as sensor_module
 
     sensor, states = _sensor()
@@ -1944,6 +1965,7 @@ def test_unchanged_energy_reports_are_polled_after_anchor(monkeypatch):
 def test_polled_energy_cannot_overtake_queued_price_correction(monkeypatch):
     import sys
     from datetime import datetime, timedelta, timezone
+
     from custom_components.pumpsteer import sensor as sensor_module
 
     sensor, states = _sensor()
@@ -2043,6 +2065,7 @@ def test_shared_chain_uses_control_weighted_temperature_and_resets_on_source_los
     monkeypatch,
 ):
     from datetime import datetime, timedelta, timezone
+
     from custom_components.pumpsteer.pilot_passive import PilotPassive
 
     captured = []

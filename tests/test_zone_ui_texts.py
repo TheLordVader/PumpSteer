@@ -17,7 +17,9 @@ import pytest
 )
 def test_zone_pages_explain_passive_monitoring_and_alarm_fields(filename):
     root = Path("custom_components/pumpsteer")
-    options = json.loads((root / filename).read_text())["options"]["step"]
+    options = json.loads((root / filename).read_text())["options"]["step"]["init"][
+        "sections"
+    ]
     for number in range(1, 5):
         page = options[f"zone_{number}"]
         descriptions = page["data_description"]
@@ -37,7 +39,7 @@ def test_zone_pages_explain_passive_monitoring_and_alarm_fields(filename):
 def test_english_options_and_swedish_alias_are_synchronized():
     root = Path("custom_components/pumpsteer")
     texts = [
-        json.loads((root / filename).read_text())["options"]["step"]
+        json.loads((root / filename).read_text())["options"]["step"]["init"]["sections"]
         for filename in (
             "strings.json",
             "translations/en.json",
@@ -45,6 +47,6 @@ def test_english_options_and_swedish_alias_are_synchronized():
             "translations/se.json",
         )
     ]
-    for page in ("zones", "zone_1", "zone_2", "zone_3", "zone_4", "zone_notifications"):
+    for page in ("zone_1", "zone_2", "zone_3", "zone_4", "notifications"):
         assert texts[0][page] == texts[1][page]
         assert texts[2][page] == texts[3][page]
