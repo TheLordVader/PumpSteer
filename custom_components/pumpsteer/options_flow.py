@@ -2,7 +2,7 @@ import logging
 import re
 
 import voluptuous as vol
-from homeassistant import config_entries
+from homeassistant import config_entries, data_entry_flow
 from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN
 from homeassistant.helpers.selector import selector
 
@@ -15,7 +15,6 @@ from .const import (
     NOTIFICATION_LEVELS,
     OHMIGO_RELAY_ENTITY,
 )
-
 from .utils import safe_float
 
 _LOGGER = logging.getLogger(__name__)
@@ -87,7 +86,7 @@ _GROUPS = {
         "modbus_interval_minutes",
     },
 }
-# Each page owns exactly its fields, including optional values that can be cleared.
+# Existing logical groups retain their validation scopes and clearable fields.
 _GROUPS["basic_settings"] = _GROUPS["basic"]
 _GROUPS["heat_sensors"] = _GROUPS["telemetry"]
 _GROUPS["ohmigo_settings"] = _GROUPS["ohmigo"]
@@ -175,6 +174,9 @@ _CLEARABLE = {
         _GROUPS["heat_pump_telemetry"]
         - {"thermal_balance_kind", "thermal_alarm_numeric_verified"}
     ),
+    "notify_service",
+    "modbus_service",
+    "modbus_payload_template",
     "control_measurement_time_attribute",
     "control_balance_scale",
     "control_balance_offset",
@@ -183,212 +185,247 @@ _CLEARABLE = {
 }
 
 
+# Preserve the original validation scopes even when a visual section combines them.
+_VALIDATION_GROUPS = tuple(
+    keys for name, keys in _GROUPS.items() if name not in {"zones"}
+)
+_BASIC_ORDER = (
+    "indoor_temp_entity",
+    "real_outdoor_entity",
+    "electricity_price_entity",
+    "price_tomorrow_entity",
+    "weather_entity",
+)
+_BASIC_FIELDS = set(_BASIC_ORDER)
+_REQUIRED_FIELDS = _BASIC_FIELDS - {"weather_entity"}
+_FORM_SECTIONS = {
+    "temperature_sources": _GROUPS["temperature_sources"] | _GROUPS["report_age"],
+    "outputs": _GROUPS["ohmigo_settings"] | _GROUPS["generic_output"],
+    "notifications": _GROUPS["notifications"] | _GROUPS["zone_notifications"],
+    **{f"zone_{i}": _GROUPS[f"zone_{i}"] for i in range(1, 5)},
+    "thermal": _GROUPS["thermal"],
+    "heat_pump_data": (
+        _GROUPS["heat_sensors"]
+        | _GROUPS["heat_details"]
+        | _GROUPS["heat_pump_telemetry"]
+        | _GROUPS["energy"]
+    ),
+    "advanced_control": _GROUPS["extended_control"] | _GROUPS["advanced_control"],
+}
+
+
+def _suggested_value(marker):
+    """Use the existing field's display conversion without materialising defaults."""
+    default = marker.default
+    fallback = None if default is vol.UNDEFINED else default()
+    return (marker.description or {}).get("suggested_value", fallback)
+
+
 class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
     """Handle options flow for PumpSteer."""
 
     async def async_step_init(self, user_input=None):
-        return self.async_show_menu(
-            step_id="init",
-            menu_options=[
-                "basic",
-                "thermal",
-                "telemetry",
-                "zones",
-                "notifications",
-                "ohmigo",
-            ],
-        )
-
-    async def async_step_basic(self, user_input=None):
-        return self.async_show_menu(
-            step_id="basic",
-            menu_options=["basic_settings", "temperature_sources", "report_age"],
-        )
-
-    async def async_step_basic_settings(self, user_input=None):
-        return await self._section("basic_settings", user_input)
-
-    async def async_step_zones(self, user_input=None):
-        return self.async_show_menu(
-            step_id="zones",
-            menu_options=["zone_1", "zone_2", "zone_3", "zone_4", "zone_notifications"],
-        )
-
-    async def async_step_zone_1(self, user_input=None):
-        return await self._section("zone_1", user_input)
-
-    async def async_step_zone_2(self, user_input=None):
-        return await self._section("zone_2", user_input)
-
-    async def async_step_zone_3(self, user_input=None):
-        return await self._section("zone_3", user_input)
-
-    async def async_step_zone_4(self, user_input=None):
-        return await self._section("zone_4", user_input)
-
-    async def async_step_zone_notifications(self, user_input=None):
-        return await self._section("zone_notifications", user_input)
-
-    async def async_step_temperature_sources(self, user_input=None):
-        return await self._section("temperature_sources", user_input)
-
-    async def async_step_report_age(self, user_input=None):
-        return await self._section("report_age", user_input)
-
-    async def async_step_heat_details(self, user_input=None):
-        return await self._section("heat_details", user_input)
-
-    async def async_step_heat_pump_telemetry(self, user_input=None):
-        return await self._section("heat_pump_telemetry", user_input)
-
-    async def async_step_extended_control(self, user_input=None):
-        return await self._section("extended_control", user_input)
-
-    async def async_step_advanced_control(self, user_input=None):
-        return await self._section("advanced_control", user_input)
-
-    async def async_step_energy(self, user_input=None):
-        return await self._section("energy", user_input)
-
-    async def async_step_generic_output(self, user_input=None):
-        return await self._section("generic_output", user_input)
-
-    async def async_step_thermal(self, user_input=None):
-        return await self._section("thermal", user_input)
-
-    async def async_step_telemetry(self, user_input=None):
-        return self.async_show_menu(
-            step_id="telemetry",
-            menu_options=[
-                "heat_sensors",
-                "heat_details",
-                "heat_pump_telemetry",
-                "extended_control",
-                "advanced_control",
-                "energy",
-            ],
-        )
-
-    async def async_step_heat_sensors(self, user_input=None):
-        return await self._section("heat_sensors", user_input)
-
-    async def async_step_notifications(self, user_input=None):
-        return await self._section("notifications", user_input)
-
-    async def async_step_ohmigo(self, user_input=None):
-        return self.async_show_menu(
-            step_id="ohmigo", menu_options=["ohmigo_settings", "generic_output"]
-        )
-
-    async def async_step_ohmigo_settings(self, user_input=None):
-        return await self._section("ohmigo_settings", user_input)
-
-    async def _section(self, section, user_input=None):
-        """Save only the selected page while preserving all other options."""
-        errors = {}
-
+        """Configure in one form; section names never enter stored options."""
         entry = self.config_entry
-        current_data = {**entry.data, **entry.options}
+        current = {**entry.data, **entry.options}
+        fields = self._fields(current)
+        displayed = {key.schema: _suggested_value(key) for key in fields}
+        errors = {}
+        draft = dict(current)
+        if user_input is not None:
+            try:
+                submitted = {
+                    key: value
+                    for key, value in user_input.items()
+                    if key in _BASIC_FIELDS
+                }
+                for name, keys in _FORM_SECTIONS.items():
+                    if name not in user_input:
+                        continue  # An omitted section cannot clear anything.
+                    values = user_input[name]
+                    if not isinstance(values, dict):
+                        errors[name] = "unknown"
+                        continue
+                    submitted.update({k: v for k, v in values.items() if k in keys})
+                    # HA removes cleared optional selectors from the section's JSON.
+                    # Existing suggested values are sent even when it is collapsed.
+                    for key in keys & _CLEARABLE:
+                        if key not in values and current.get(key) not in (None, "", []):
+                            submitted[key] = (
+                                [] if key == "thermal_energy_entities" else ""
+                            )
+                if (
+                    _REQUIRED_FIELDS <= user_input.keys()
+                    and "weather_entity" not in user_input
+                    and current.get("weather_entity")
+                ):
+                    submitted["weather_entity"] = ""
+                updated = dict(entry.options)
+                changed = set()
+                for key, value in submitted.items():
+                    if value is None and key in _CLEARABLE:
+                        value = [] if key == "thermal_energy_entities" else ""
+                    # Preserve data/options ownership, types and implicit defaults.
+                    if value == displayed.get(key):
+                        continue
+                    if value != current.get(key) or key not in current:
+                        updated[key] = value
+                        changed.add(key)
+                candidate = {**entry.data, **updated}
+                # A changed source can change an implicit fallback. Honour the
+                # method/limit the user actually saw, while leaving no-op saves
+                # and independent defaults untouched.
+                for key in self._fields(candidate):
+                    name = key.schema
+                    if (
+                        name in submitted
+                        and submitted[name] == displayed[name]
+                        and submitted[name] != _suggested_value(key)
+                    ):
+                        updated[name] = submitted[name]
+                        changed.add(name)
+                draft.update(submitted)
+                candidate = {**entry.data, **updated}
+                if changed:
+                    affected = set(changed)
+                    if changed & _BASIC_FIELDS:
+                        affected.update(_BASIC_FIELDS)
+                    for keys in _VALIDATION_GROUPS:
+                        if changed & keys:
+                            affected.update(keys)
+                    baseline_errors = self._validate_entities(current)
+                    for key, error in self._validate_entities(candidate).items():
+                        if (
+                            key == "base"
+                            or key in affected
+                            or baseline_errors.get(key) != error
+                        ):
+                            errors[key] = error
+                    for secondary, primary in (
+                        ("indoor_temp_entity_2", "indoor_temp_entity"),
+                        ("indoor_temp_entity_3", "indoor_temp_entity"),
+                        ("outdoor_temp_entity_2", "real_outdoor_entity"),
+                    ):
+                        if (
+                            errors.get(secondary) == "duplicate_temperature_sensor"
+                            and primary in changed
+                        ):
+                            errors[primary] = "duplicate_temperature_sensor"
+                    if (
+                        errors.get("thermal_heat_activity_entity")
+                        == "heat_signal_alias"
+                    ):
+                        for key in (
+                            "thermal_compressor_entity",
+                            "thermal_heating_mode_entity",
+                            "thermal_hot_water_mode_entity",
+                        ):
+                            if key in changed and candidate.get(key) == candidate.get(
+                                "thermal_heat_activity_entity"
+                            ):
+                                errors[key] = "heat_signal_alias"
+                if not errors:
+                    self._revoke_changed_verification(current, candidate, updated)
+                    return self.async_create_entry(title="", data=updated)
+            except Exception:
+                _LOGGER.exception("Options flow save failed")
+                errors["base"] = "unknown"
+
+        # Suggestions, rather than defaults, let an optional value be cleared.
+        # Rebuild from the complete draft so errors never discard another edit.
+        fields = self._fields(draft)
+        suggested_fields = {}
+        for key, validator in fields.items():
+            name = key.schema
+            description = dict(getattr(key, "description", None) or {})
+            value = _suggested_value(key)
+            if value not in (None, ""):
+                description["suggested_value"] = value
+            else:
+                # Empty entity suggestions become invalid nested JSON in HA.
+                # An absent suggestion renders the same empty optional field.
+                description.pop("suggested_value", None)
+            marker = vol.Required if name in _REQUIRED_FIELDS else vol.Optional
+            suggested_fields[marker(name, description=description)] = validator
+        schema = {
+            next(key for key in suggested_fields if key.schema == name): next(
+                value for key, value in suggested_fields.items() if key.schema == name
+            )
+            for name in _BASIC_ORDER
+        }
+        form_errors = {}
+        for key, error in errors.items():
+            section = next(
+                (name for name, keys in _FORM_SECTIONS.items() if key in keys), None
+            )
+            # Native HA displays section errors above the expanded section;
+            # arbitrary nested field paths are not rendered by ha-form.
+            form_errors.setdefault(section or key, error)
+        for name, keys in _FORM_SECTIONS.items():
+            section_fields = {
+                key: value
+                for key, value in suggested_fields.items()
+                if key.schema in keys
+            }
+            schema[vol.Optional(name)] = data_entry_flow.section(
+                vol.Schema(section_fields),
+                {"collapsed": not (name in errors or keys.intersection(errors))},
+            )
+        return self.async_show_form(
+            step_id="init", data_schema=vol.Schema(schema), errors=form_errors
+        )
+
+    @staticmethod
+    def _revoke_changed_verification(current, candidate, updated):
+        """Verification belongs to the exact source/calibration, not its slot."""
+        for flag, keys in (
+            (
+                "control_signals_verified",
+                (
+                    "thermal_compressor_entity",
+                    "thermal_heating_mode_entity",
+                    "thermal_heating_mode_inverted",
+                    "thermal_hot_water_mode_entity",
+                    "thermal_brine_pump_entity",
+                    "thermal_aux_heat_entity",
+                    "control_measurement_time_attribute",
+                ),
+            ),
+            (
+                "control_balance_verified",
+                (
+                    "thermal_balance_entity",
+                    "thermal_balance_kind",
+                    "control_balance_scale",
+                    "control_balance_offset",
+                    "control_balance_deficit_threshold",
+                    "control_balance_deficit_full",
+                ),
+            ),
+            (
+                "thermal_alarm_numeric_verified",
+                (
+                    "thermal_alarm_entity",
+                    "thermal_alarm_numeric_normal",
+                ),
+            ),
+        ):
+            if current.get(flag) is True and any(
+                candidate.get(key) != current.get(key) for key in keys
+            ):
+                updated[flag] = False
+
+    def _fields(self, current_data):
+        """Reuse all existing selectors, defaults and limits."""
         legacy_age = safe_float(current_data.get("temperature_report_max_age_minutes"))
         outdoor_default_age = (
             min(DEFAULT_OUTDOOR_REPORT_MAX_AGE_MINUTES, legacy_age)
             if legacy_age is not None and legacy_age > 0
             else DEFAULT_OUTDOOR_REPORT_MAX_AGE_MINUTES
         )
-
-        # Build list of number entities for the Ohmigo dropdown.
         number_entities = sorted(
             s.entity_id for s in self.hass.states.async_all("number")
         )
-
-        if user_input is not None:
-            try:
-                updated = {
-                    **entry.options,
-                    **{k: v for k, v in user_input.items() if k in _GROUPS[section]},
-                }
-                for key in _GROUPS[section] & _CLEARABLE:
-                    if key not in user_input and current_data.get(key) is not None:
-                        updated[key] = [] if key == "thermal_energy_entities" else ""
-                entity_errors = self._validate_entities({**entry.data, **updated})
-                errors = {
-                    k: v
-                    for k, v in entity_errors.items()
-                    if k in _GROUPS[section] or k == "base"
-                }
-
-                # Cross-page conflicts must be reported on the field being edited.
-                if section == "basic_settings":
-                    for key, primary in (
-                        ("indoor_temp_entity_2", "indoor_temp_entity"),
-                        ("indoor_temp_entity_3", "indoor_temp_entity"),
-                        ("outdoor_temp_entity_2", "real_outdoor_entity"),
-                    ):
-                        if (
-                            entity_errors.get(key) == "duplicate_temperature_sensor"
-                            and primary in user_input
-                        ):
-                            errors[primary] = "duplicate_temperature_sensor"
-                if (
-                    section == "heat_details"
-                    and entity_errors.get("thermal_heat_activity_entity")
-                    == "heat_signal_alias"
-                ):
-                    source = {**entry.data, **updated}.get(
-                        "thermal_heat_activity_entity"
-                    )
-                    for key in (
-                        "thermal_compressor_entity",
-                        "thermal_heating_mode_entity",
-                        "thermal_hot_water_mode_entity",
-                    ):
-                        if key in user_input and updated.get(key) == source:
-                            errors[key] = "heat_signal_alias"
-
-                if not errors:
-                    # Verification belongs to the exact source/calibration, not a slot.
-                    # A changed source can be saved, but must be confirmed again on
-                    # its control page before a limiter may resume.
-                    merged = {**entry.data, **updated}
-                    for flag, keys in (
-                        (
-                            "control_signals_verified",
-                            (
-                                "thermal_compressor_entity",
-                                "thermal_heating_mode_entity",
-                                "thermal_heating_mode_inverted",
-                                "thermal_hot_water_mode_entity",
-                                "thermal_brine_pump_entity",
-                                "thermal_aux_heat_entity",
-                                "control_measurement_time_attribute",
-                            ),
-                        ),
-                        (
-                            "control_balance_verified",
-                            (
-                                "thermal_balance_entity",
-                                "thermal_balance_kind",
-                                "control_balance_scale",
-                                "control_balance_offset",
-                                "control_balance_deficit_threshold",
-                                "control_balance_deficit_full",
-                            ),
-                        ),
-                        (
-                            "thermal_alarm_numeric_verified",
-                            ("thermal_alarm_entity", "thermal_alarm_numeric_normal"),
-                        ),
-                    ):
-                        if current_data.get(flag) is True and any(
-                            merged.get(key) != current_data.get(key) for key in keys
-                        ):
-                            updated[flag] = False
-                    return self.async_create_entry(title="", data=updated)
-
-            except Exception as err:
-                _LOGGER.exception("Options flow save failed: %s", err)
-                errors["base"] = "unknown"
-
         fields = {
             vol.Required(
                 "indoor_temp_entity",
@@ -655,14 +692,8 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
             ): selector(
                 {
                     "select": {
-                        "options": [
-                            {
-                                "value": "all",
-                                "label": "All price notifications",
-                            },
-                            {"value": "braking_only", "label": "Braking only"},
-                            {"value": "off", "label": "No price notifications"},
-                        ],
+                        "options": ["all", "braking_only", "off"],
+                        "translation_key": "notification_level",
                         "mode": "dropdown",
                     }
                 }
@@ -673,15 +704,8 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
             ): selector(
                 {
                     "select": {
-                        "options": [
-                            {"value": "0", "label": "No repeat limit"},
-                            {"value": "30", "label": "30 minutes"},
-                            {
-                                "value": "60",
-                                "label": "60 minutes (recommended)",
-                            },
-                            {"value": "120", "label": "120 minutes"},
-                        ],
+                        "options": ["0", "30", "60", "120"],
+                        "translation_key": "notification_cooldown",
                         "mode": "dropdown",
                     }
                 }
@@ -857,30 +881,7 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
             ] = selector(
                 {"number": {"min": -1e9, "max": 1e9, "step": 0.001, "mode": "box"}}
             )
-        selected = {
-            k: v
-            for k, v in fields.items()
-            if getattr(k, "schema", k[0] if isinstance(k, tuple) else k)
-            in _GROUPS[section]
-        }
-        if section == "temperature_sources":
-            order = [
-                "indoor_temp_weight_1",
-                "indoor_temp_entity_2",
-                "indoor_temp_weight_2",
-                "indoor_temp_entity_3",
-                "indoor_temp_weight_3",
-                "outdoor_temp_entity_2",
-            ]
-            selected = dict(
-                sorted(
-                    selected.items(),
-                    key=lambda item: order.index(getattr(item[0], "schema", item[0])),
-                )
-            )
-        return self.async_show_form(
-            step_id=section, data_schema=vol.Schema(selected), errors=errors
-        )
+        return fields
 
     def _validate_entities(self, user_input):
         """Validate that entities exist and are available."""

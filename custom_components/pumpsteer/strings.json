@@ -20,387 +20,268 @@
   "options": {
     "step": {
       "init": {
-        "title": "PumpSteer",
-        "menu_options": {
-          "basic": "Basic settings",
-          "thermal": "Thermal Intelligence",
-          "telemetry": "Advanced sensors",
-          "notifications": "Notifications",
-          "ohmigo": "Ohmigo and safety",
-          "zones": "Extra temperature zones"
-        }
-      },
-      "basic": {
-        "title": "Basic settings",
-        "menu_options": {
-          "basic_settings": "Indoor, outdoor and prices",
-          "temperature_sources": "Additional temperature sensors",
-          "report_age": "Report age – advanced"
-        },
-        "description": "Choose main control sensors or optional advanced sensors."
-      },
-      "thermal": {
-        "title": "Thermal Intelligence",
-        "data": {
-          "thermal_intelligence_enabled": "Thermal Intelligence (experimental diagnostics)",
-          "external_heat_sources": "Do you sometimes use an additional heat source?",
-          "adaptive_braking_enabled": "Adaptive price braking"
-        },
-        "data_description": {
-          "thermal_intelligence_enabled": "Passively collects qualified observations when a verified heat signal is selected. Does not affect heating control.",
-          "external_heat_sources": "Yes means extra heat may sometimes occur, not that it is on now. Adaptive braking can learn from stable temperature response, rejects clearly disturbed periods and needs later independent checks. Undetected extra heat remains a possible confound; this does not measure heat flow.",
-          "adaptive_braking_enabled": "Learns observed house temperature response using your ordinary indoor and outdoor sensors. After at least three checks against later temperatures, it can cautiously reduce price braking near the comfort floor. Off on upgrade. Uncertain or old data returns to Base; no extra heat pump sensors are required. Does not claim measured energy savings. Repeated unchanged reports do not add learning observations. Sparse or unresolved temperature changes can keep control in Base."
-        },
-        "description": "Passive analysis and optional adaptive price braking are separate choices. Adaptive braking uses observed temperature response, not assumed heat output. Advanced verified model learning requires reliable heat signals."
-      },
-      "telemetry": {
-        "title": "Advanced sensors",
-        "menu_options": {
-          "heat_sensors": "Analysis method and primary sensors",
-          "energy": "Electricity and energy",
-          "heat_details": "Additional heating sensors",
-          "heat_pump_telemetry": "Passive heat pump diagnostics",
-          "extended_control": "Extended – optional control limits",
-          "advanced_control": "Advanced – verified heat balance"
-        },
-        "description": "Base uses temperature and price without extra sensors. Extended and Advanced can limit existing control only after you explicitly enable each function. Selecting a sensor never enables a control intervention."
-      },
-      "notifications": {
-        "title": "Notifications",
-        "data": {
-          "notification_level": "Price notification level",
-          "notification_cooldown_minutes": "Repeat notification cooldown"
-        },
-        "data_description": {
-          "notification_level": "Choose all price alerts, braking only, or none. The existing Notifications switch remains the master on/off control.",
-          "notification_cooldown_minutes": "Minimum time between repeated alerts of the same type. Choose 0 for no limit; 60 minutes is recommended. Braking and preheating have independent timers."
-        },
-        "description": "Ordinary price and control notifications use this recipient, level and cooldown. Zone alerts have a separate shared recipient under Extra temperature zones."
-      },
-      "ohmigo": {
-        "title": "Ohmigo and safety",
-        "menu_options": {
-          "ohmigo_settings": "Ohmigo and relay",
-          "generic_output": "Generic output – advanced"
-        },
-        "description": "Choose Ohmigo or an optional generic output."
-      },
-      "zones": {
-        "title": "Extra temperature zones",
-        "description": "Choose a zone. It monitors room temperature and trends and can flag suspected heat shortage when there is enough evidence. Zones do not control heating.",
-        "menu_options": {
-          "zone_1": "Zone 1",
-          "zone_2": "Zone 2",
-          "zone_3": "Zone 3",
-          "zone_4": "Zone 4",
-          "zone_notifications": "Shared zone recipient"
-        }
-      },
-      "temperature_sources": {
-        "title": "Additional temperature sensors",
-        "description": "Optional. Weights are normalized automatically. If an indoor sensor is unavailable, the remaining sensors are reweighted. The outdoor backup is used when the primary is unavailable. These choices affect control.",
-        "data": {
-          "indoor_temp_entity_2": "Indoor sensor 2 (optional)",
-          "indoor_temp_entity_3": "Indoor sensor 3 (optional)",
-          "outdoor_temp_entity_2": "Backup outdoor sensor (optional)",
-          "indoor_temp_weight_1": "Weight for the primary indoor sensor (from basic settings)",
-          "indoor_temp_weight_2": "Indoor sensor 2 weight",
-          "indoor_temp_weight_3": "Indoor sensor 3 weight"
-        },
-        "data_description": {}
-      },
-      "report_age": {
-        "title": "Report age – advanced",
-        "description": "Defaults suit most installations. A limit that is too short can reject a working sensor and put control into safe mode. HA report time does not prove physical measurement time.",
-        "data": {
-          "outdoor_temperature_report_max_age_minutes": "Maximum outdoor temperature report age (minutes)",
-          "temperature_report_max_age_minutes": "Maximum indoor temperature report age (minutes)"
-        },
-        "data_description": {
-          "outdoor_temperature_report_max_age_minutes": "Default 120 minutes, based on observed reporting gaps. Adjust for your outdoor sensors. HA report time does not prove physical measurement time.",
-          "temperature_report_max_age_minutes": "The default is 360 minutes, based on observed reporting intervals. Adjust it to your sensors’ observed intervals. HA report time does not establish physical measurement time."
-        }
-      },
-      "energy": {
-        "title": "Electricity and energy",
-        "description": "Optional monitoring only. Electrical power or compressor operation alone does not prove heat delivery to radiators. Leave empty if no meter is available.",
-        "data": {
-          "thermal_power_entity": "Heat-pump electrical power (optional)",
-          "thermal_energy_entities": "Cumulative energy meters (optional)"
-        },
-        "data_description": {
-          "thermal_power_entity": "Measured electrical input for the equipment being analysed. Energy is estimated from HA reports; it is not delivered heat.",
-          "thermal_energy_entities": "Select one total meter or independent meters that can be summed. Selected meters take precedence for energy diagnostics. Only complete counter intervals with one unambiguous price are priced. Report gaps above 24 hours are excluded."
-        }
-      },
-      "generic_output": {
-        "title": "Generic output – advanced",
-        "description": "Optional for special installations. A service and template can control an external output. Leave empty when unused.",
-        "data": {
-          "modbus_service": "Generic output service",
-          "modbus_payload_template": "Generic output payload template",
-          "modbus_interval_minutes": "Generic output push interval"
-        },
-        "data_description": {
-          "modbus_service": "Home Assistant service to call, for example modbus.write_register, mqtt.publish or input_number.set_value.",
-          "modbus_payload_template": "YAML payload template for the service call. The template can use the fake_temp variable.",
-          "modbus_interval_minutes": "Minimum time between Generic Output System service calls."
-        }
-      },
-      "zone_1": {
-        "title": "Zone 1",
-        "description": "Monitoring only, even with alerts enabled. The zone does not change a thermostat setpoint or valve opening and does not control central heat production. A cold zone does not affect the shared PI controller.",
-        "data": {
-          "zone_1_name": "Zone 1 – name",
-          "zone_1_entity": "Zone 1 – temperature sensor",
-          "zone_1_enabled": "Zone 1 – alarm enabled",
-          "zone_1_profile": "Zone 1 – Profile",
-          "zone_1_threshold": "Zone 1 – Maintenance threshold",
-          "zone_1_comfort_threshold": "Zone 1 – Comfort minimum",
-          "zone_1_climate": "Zone 1 – Thermostat (optional)",
-          "zone_1_notify_service": "Zone 1 – Notification service",
-          "zone_1_alarm_delay_minutes": "Zone 1 – Alarm delay (minutes)"
-        },
-        "data_description": {
-          "zone_1_name": "The name appears in diagnostics and zone notifications.",
-          "zone_1_entity": "Choose a room temperature sensor in °C. A sensor near a radiator can read differently from the room.",
-          "zone_1_enabled": "Off by default. When enabled, the zone can alert on low temperature, a forecast, suspected heat shortage and sensor faults. Temperature remains monitored with alerts off.",
-          "zone_1_profile": "Choose manually which of the two zone temperature thresholds is used.",
-          "zone_1_threshold": "Temperature threshold for Maintenance heat. Default 5 °C. Used only when this profile is selected.",
-          "zone_1_comfort_threshold": "Temperature threshold for Comfort. Default 18 °C. Used only when this profile is selected.",
-          "zone_1_climate": "Optional and read-only. Room temperature monitoring still works without a thermostat, but thermostat diagnostics and heat-shortage analysis are limited. Its setpoint is not the zone alarm threshold.",
-          "zone_1_notify_service": "Optional override. Empty uses the shared zone recipient; if that is also empty no push is sent.",
-          "zone_1_alarm_delay_minutes": "Default 15 minutes, configurable from 1 to 240. A low-temperature alert requires at least two separate below-threshold reports spanning the delay. Other alerts have their own evidence requirements."
-        }
-      },
-      "zone_2": {
-        "title": "Zone 2",
-        "description": "Monitoring only, even with alerts enabled. The zone does not change a thermostat setpoint or valve opening and does not control central heat production. A cold zone does not affect the shared PI controller.",
-        "data": {
-          "zone_2_name": "Zone 2 – name",
-          "zone_2_entity": "Zone 2 – temperature sensor",
-          "zone_2_enabled": "Zone 2 – alarm enabled",
-          "zone_2_profile": "Zone 2 – Profile",
-          "zone_2_threshold": "Zone 2 – Maintenance threshold",
-          "zone_2_comfort_threshold": "Zone 2 – Comfort minimum",
-          "zone_2_climate": "Zone 2 – Thermostat (optional)",
-          "zone_2_notify_service": "Zone 2 – Notification service",
-          "zone_2_alarm_delay_minutes": "Zone 2 – Alarm delay (minutes)"
-        },
-        "data_description": {
-          "zone_2_name": "The name appears in diagnostics and zone notifications.",
-          "zone_2_entity": "Choose a room temperature sensor in °C. A sensor near a radiator can read differently from the room.",
-          "zone_2_enabled": "Off by default. When enabled, the zone can alert on low temperature, a forecast, suspected heat shortage and sensor faults. Temperature remains monitored with alerts off.",
-          "zone_2_profile": "Choose manually which of the two zone temperature thresholds is used.",
-          "zone_2_threshold": "Temperature threshold for Maintenance heat. Default 5 °C. Used only when this profile is selected.",
-          "zone_2_comfort_threshold": "Temperature threshold for Comfort. Default 18 °C. Used only when this profile is selected.",
-          "zone_2_climate": "Optional and read-only. Room temperature monitoring still works without a thermostat, but thermostat diagnostics and heat-shortage analysis are limited. Its setpoint is not the zone alarm threshold.",
-          "zone_2_notify_service": "Optional override. Empty uses the shared zone recipient; if that is also empty no push is sent.",
-          "zone_2_alarm_delay_minutes": "Default 15 minutes, configurable from 1 to 240. A low-temperature alert requires at least two separate below-threshold reports spanning the delay. Other alerts have their own evidence requirements."
-        }
-      },
-      "zone_3": {
-        "title": "Zone 3",
-        "description": "Monitoring only, even with alerts enabled. The zone does not change a thermostat setpoint or valve opening and does not control central heat production. A cold zone does not affect the shared PI controller.",
-        "data": {
-          "zone_3_name": "Zone 3 – name",
-          "zone_3_entity": "Zone 3 – temperature sensor",
-          "zone_3_enabled": "Zone 3 – alarm enabled",
-          "zone_3_profile": "Zone 3 – Profile",
-          "zone_3_threshold": "Zone 3 – Maintenance threshold",
-          "zone_3_comfort_threshold": "Zone 3 – Comfort minimum",
-          "zone_3_climate": "Zone 3 – Thermostat (optional)",
-          "zone_3_notify_service": "Zone 3 – Notification service",
-          "zone_3_alarm_delay_minutes": "Zone 3 – Alarm delay (minutes)"
-        },
-        "data_description": {
-          "zone_3_name": "The name appears in diagnostics and zone notifications.",
-          "zone_3_entity": "Choose a room temperature sensor in °C. A sensor near a radiator can read differently from the room.",
-          "zone_3_enabled": "Off by default. When enabled, the zone can alert on low temperature, a forecast, suspected heat shortage and sensor faults. Temperature remains monitored with alerts off.",
-          "zone_3_profile": "Choose manually which of the two zone temperature thresholds is used.",
-          "zone_3_threshold": "Temperature threshold for Maintenance heat. Default 5 °C. Used only when this profile is selected.",
-          "zone_3_comfort_threshold": "Temperature threshold for Comfort. Default 18 °C. Used only when this profile is selected.",
-          "zone_3_climate": "Optional and read-only. Room temperature monitoring still works without a thermostat, but thermostat diagnostics and heat-shortage analysis are limited. Its setpoint is not the zone alarm threshold.",
-          "zone_3_notify_service": "Optional override. Empty uses the shared zone recipient; if that is also empty no push is sent.",
-          "zone_3_alarm_delay_minutes": "Default 15 minutes, configurable from 1 to 240. A low-temperature alert requires at least two separate below-threshold reports spanning the delay. Other alerts have their own evidence requirements."
-        }
-      },
-      "zone_4": {
-        "title": "Zone 4",
-        "description": "Monitoring only, even with alerts enabled. The zone does not change a thermostat setpoint or valve opening and does not control central heat production. A cold zone does not affect the shared PI controller.",
-        "data": {
-          "zone_4_name": "Zone 4 – name",
-          "zone_4_entity": "Zone 4 – temperature sensor",
-          "zone_4_enabled": "Zone 4 – alarm enabled",
-          "zone_4_profile": "Zone 4 – Profile",
-          "zone_4_threshold": "Zone 4 – Maintenance threshold",
-          "zone_4_comfort_threshold": "Zone 4 – Comfort minimum",
-          "zone_4_climate": "Zone 4 – Thermostat (optional)",
-          "zone_4_notify_service": "Zone 4 – Notification service",
-          "zone_4_alarm_delay_minutes": "Zone 4 – Alarm delay (minutes)"
-        },
-        "data_description": {
-          "zone_4_name": "The name appears in diagnostics and zone notifications.",
-          "zone_4_entity": "Choose a room temperature sensor in °C. A sensor near a radiator can read differently from the room.",
-          "zone_4_enabled": "Off by default. When enabled, the zone can alert on low temperature, a forecast, suspected heat shortage and sensor faults. Temperature remains monitored with alerts off.",
-          "zone_4_profile": "Choose manually which of the two zone temperature thresholds is used.",
-          "zone_4_threshold": "Temperature threshold for Maintenance heat. Default 5 °C. Used only when this profile is selected.",
-          "zone_4_comfort_threshold": "Temperature threshold for Comfort. Default 18 °C. Used only when this profile is selected.",
-          "zone_4_climate": "Optional and read-only. Room temperature monitoring still works without a thermostat, but thermostat diagnostics and heat-shortage analysis are limited. Its setpoint is not the zone alarm threshold.",
-          "zone_4_notify_service": "Optional override. Empty uses the shared zone recipient; if that is also empty no push is sent.",
-          "zone_4_alarm_delay_minutes": "Default 15 minutes, configurable from 1 to 240. A low-temperature alert requires at least two separate below-threshold reports spanning the delay. Other alerts have their own evidence requirements."
-        }
-      },
-      "zone_notifications": {
-        "title": "Shared zone recipient",
-        "description": "Used for zone alerts and recovery when the zone has no individual recipient. Leave empty to disable push; zone alerts remain visible in diagnostics. This is separate from ordinary price notifications.",
-        "data": {
-          "zone_notify_service": "Notification service (notify.name)"
-        }
-      },
-      "basic_settings": {
-        "title": "Basic settings",
+        "title": "PumpSteer – configure",
+        "description": "Select temperature and price sources. Expand only the sections you need. Existing values are retained in collapsed sections; changes apply only when you save.",
         "data": {
           "indoor_temp_entity": "Indoor temperature sensor",
           "real_outdoor_entity": "Outdoor temperature sensor",
-          "electricity_price_entity": "Electricity price sensor",
-          "pid_kp": "Temperature response strength (Kp)",
-          "pid_ki": "Long-term correction strength (Ki)",
-          "pid_kd": "Rapid-change damping (Kd)",
-          "pid_integral_clamp": "Long-term correction limit",
-          "pid_output_clamp": "Maximum temperature adjustment",
-          "pid_integrator_on_brake": "Integrator behavior during brake",
-          "pid_decay_per_minute_on_brake": "Decay per minute",
-          "pi_price_feedforward_gain": "Price feedforward gain",
-          "pi_forecast_feedforward_gain": "Forecast feedforward gain",
-          "brake_ramp_in_minutes": "Brake ramp-in time",
-          "brake_ramp_out_minutes": "Brake ramp-out time",
-          "min_brake_strength": "Minimum brake strength",
-          "max_brake_strength": "Maximum brake strength",
-          "experimental_ml_enabled": "Enable Experimental ML",
-          "price_tomorrow_entity": "Tomorrow electricity price sensor"
+          "electricity_price_entity": "Electricity price today",
+          "price_tomorrow_entity": "Electricity price tomorrow",
+          "weather_entity": "Weather forecast (optional)"
         },
-        "data_description": {
-          "pid_kp": "How strongly PumpSteer reacts to current temperature error. Typical range: 2.0 to 5.0.",
-          "pid_ki": "How much PumpSteer corrects long-term drift. Typical range: 0.01 to 0.05.",
-          "pid_integral_clamp": "Limits built-up long-term correction to reduce windup. Typical range: 5.0 to 10.0.",
-          "pid_output_clamp": "Caps how many degrees PumpSteer may adjust the setpoint.",
-          "pid_integrator_on_brake": "What happens to the 'memory' when the price is high? 'Freeze' is usually safest.",
-          "pi_price_feedforward_gain": "How much the electricity price affects the pump before a temp drop occurs.",
-          "brake_ramp_in_minutes": "How many minutes to transition from normal operation to full brake. Protects the compressor.",
-          "experimental_ml_enabled": "Uses historical data to learn your house's thermal inertia automatically.",
-          "pid_kd": "How much PumpSteer reacts to fast temperature changes. Keep at 0.0 unless you tune it intentionally."
-        },
-        "description": "Choose one indoor and one outdoor sensor and electricity price sensors. These inputs affect heat control. Additional sensors are optional."
-      },
-      "heat_sensors": {
-        "title": "Advanced sensors",
-        "data": {
-          "thermal_heat_activity_entity": "Verified heat delivery to the home (optional)",
-          "thermal_supply_temp_entity": "Radiator supply temperature (optional)",
-          "thermal_supply_threshold": "Supply temperature indicator threshold",
-          "thermal_detection_method": "Heating detection method",
-          "thermal_heating_mode_entity": "Verified radiator heating mode (optional)",
-          "thermal_heating_mode_inverted": "Radiator mode is off"
-        },
-        "data_description": {
-          "thermal_heat_activity_entity": "A binary sensor whose on means measured heat delivery to the home and off means none. Compressor status or hot-water mode alone is insufficient. Report times do not establish physical measurement time.",
-          "thermal_supply_temp_entity": "Choose a radiator-circuit sensor. It can be observed passively without a radiator mode signal. Temperature does not prove heat delivery.",
-          "thermal_supply_threshold": "Set for your heating system. An unsuitable threshold can misclassify heat.",
-          "thermal_detection_method": "Automatic uses qualified signals and reports uncertainty. Manual retains the supply threshold.",
-          "thermal_heating_mode_entity": "Verified radiator mode is required for the manual supply indicator, but not for passive temperature observation.",
-          "thermal_heating_mode_inverted": "Enable only when off means radiator mode. Unknown or stale status suspends learning."
-        },
-        "description": "Optional monitoring. Automatic uses available indications; Manual uses the selected supply sensor and threshold; Verified requires a reliable binary heat signal. Compressor and electrical power do not prove radiator heat. These choices do not enable control."
-      },
-      "ohmigo_settings": {
-        "title": "Ohmigo and safety",
-        "data": {
-          "ohmigo_relay_entity": "Ohmigo Active/Bypass relay (optional)"
-        },
-        "data_description": {
-          "ohmigo_relay_entity": "Optional switch entity for the Ohmigo Active/Bypass relay. When configured, PumpSteer exposes a separate Relay Guard switch that can recover an unexpected OFF state while Ohmigo Push is ON."
-        },
-        "description": "Ohmigo Push sends the temperature output to the device. The relay is the physical output; Relay Guard supervises safe recovery. These choices affect actual control."
-      },
-      "heat_details": {
-        "title": "Additional heating sensors",
-        "description": "Optional for deeper passive analysis. Compressor operation or electricity consumption does not prove radiator heat. Leave fields empty if sensors are unavailable.",
-        "data": {
-          "thermal_hot_water_mode_entity": "Verified hot-water mode (optional)",
-          "thermal_compressor_entity": "Compressor status (optional)",
-          "thermal_return_temp_entity": "Return temperature (optional)",
-          "thermal_external_heat_entity": "Verified external heater activity (optional)"
-        },
-        "data_description": {
-          "thermal_hot_water_mode_entity": "On means verified hot-water operation. Heat learning pauses when on or unknown; unknown periods are not classified.",
-          "thermal_compressor_entity": "Compressor status alone does not prove radiator heating.",
-          "thermal_return_temp_entity": "Used only together with other qualified signals.",
-          "thermal_external_heat_entity": "Leave empty without a reliable signal. On must mean the external heater is actually active, not the heat pump compressor or a thermostat request. Requires a documented verified source observation time in the control timestamp attribute (default measurement_time), at most five minutes old. HA report time or MQTT republication is insufficient. Active or unknown selected signals pause adaptive use and require new checks; temperature monitoring works without this sensor."
-        }
-      },
-      "heat_pump_telemetry": {
-        "title": "Passive heat pump diagnostics",
-        "description": "All sensors are optional. These selections provide diagnostics and optional fault alerts. Active control effects require separate activation under Extended or Advanced. Choose compressor, supply, return and hot-water sensors on the other sensor pages.",
-        "data": {
-          "thermal_balance_entity": "Internal heat balance",
-          "thermal_balance_kind": "Heat balance type",
-          "thermal_supply_target_entity": "Supply temperature target",
-          "thermal_brine_pump_entity": "Brine pump",
-          "thermal_circulation_pump_entity": "Heating circulation pump",
-          "thermal_brine_in_entity": "Brine inlet",
-          "thermal_brine_out_entity": "Brine outlet",
-          "thermal_aux_heat_entity": "Auxiliary electric heat",
-          "thermal_alarm_entity": "Active heat pump fault",
-          "thermal_alarm_numeric_normal": "Normal value for numeric fault",
-          "thermal_alarm_numeric_verified": "I verified the numeric fault meaning"
-        },
-        "data_description": {
-          "thermal_balance_entity": "Select a numeric sensor if available. No scale or sign convention is assumed.",
-          "thermal_balance_kind": "Choose degree minutes or integral only when the meaning is verified; otherwise choose raw value. No start threshold is assumed.",
-          "thermal_supply_target_entity": "The heat pump supply temperature target, not a room temperature or alarm threshold.",
-          "thermal_brine_pump_entity": "Binary brine pump status. This alone does not prove heat delivery.",
-          "thermal_circulation_pump_entity": "Binary heating circulation pump status. This alone does not prove heat delivery.",
-          "thermal_brine_in_entity": "Temperature sensor for incoming brine.",
-          "thermal_brine_out_entity": "Temperature sensor for outgoing brine.",
-          "thermal_aux_heat_entity": "Binary signal for active auxiliary electric heat.",
-          "thermal_alarm_entity": "Choose a binary or numeric fault signal. A numeric signal stays inactive until you verify its normal value and that every other finite value means an active fault. Notifications use the regular recipient or a persistent HA notification.",
-          "thermal_alarm_numeric_normal": "For a numeric sensor only: enter the verified normal value. Use 0 only if your heat pump documentation confirms it. Empty means an unknown fault state.",
-          "thermal_alarm_numeric_verified": "For a numeric sensor only: confirm that the chosen value is normal and every other finite value means an active fault. A changed sensor or normal value requires confirmation again."
-        }
-      },
-      "extended_control": {
-        "title": "Extended control",
-        "description": "Base applies when the limiter is off. It needs verified compressor, radiator-mode, hot-water-mode and auxiliary-heat signals. Compressor and radiator mode must be on, hot water off; a selected brine pump must also be on. Every participating signal needs a verified observation timestamp no older than five minutes. A single changeover-valve signal can serve both modes when radiator mode is verified inverted. Old values are not used; the output returns toward Base using the existing ramp times. A changed verified source or timestamp setting requires confirmation again.",
-        "data": {
-          "control_aux_preheat_limit": "Limit extra preheating during auxiliary heat",
-          "control_signals_verified": "I have verified signal meanings and observation times",
-          "control_measurement_time_attribute": "Verified observation timestamp attribute"
-        },
-        "data_description": {
-          "control_aux_preheat_limit": "Off by default. Removes only the extra preheat boost when auxiliary heat is verified active for radiator heating. Does not change the pump’s auxiliary or emergency heating and does not guarantee energy savings.",
-          "control_signals_verified": "Confirm only after verifying signal meanings and observation times. The time must be a physical measurement time or the receipt time of a new measurement message whose link to that specific value is verified by the source documentation. Receipt time is not physical measurement time. HA last_reported, MQTT republication and online status are not sufficient by themselves. Applies to both limiters.",
-          "control_measurement_time_attribute": "The same attribute is read from every participating sensor. Its value must be a verified observation time as a timezone-aware ISO timestamp or Unix seconds. Without reliable source evidence the intervention cannot activate; do not copy HA report time into another attribute."
-        }
-      },
-      "advanced_control": {
-        "title": "Advanced control – heat balance",
-        "description": "Off by default. Can release at most half of price braking during a verified heat deficit. Requires fresh, verifiably timestamped heat-balance, radiator-mode and hot-water-mode signals, but not compressor operation or a brine pump. One changeover-valve signal can serve both modes if radiator mode is verified inverted. Normalization: deficit = raw value × scale + offset. Positive values must mean a larger deficit. Verify decoding, sign, unit and limits; a register name or isolated degree-minute values are insufficient. Without evidence, leave it off; raw values and trends remain available. A changed source, timestamp setting or balance calibration requires confirmation again.",
-        "data": {
-          "control_balance_brake_limit": "Limit price braking using verified heat balance",
-          "control_balance_verified": "I have verified normalization and deficit limits",
-          "control_balance_scale": "Verified scale factor including sign",
-          "control_balance_offset": "Verified offset",
-          "control_balance_deficit_threshold": "Deficit where brake release begins",
-          "control_balance_deficit_full": "Deficit for maximum brake limitation"
-        },
-        "data_description": {
-          "control_balance_brake_limit": "Changes only existing price braking, not PI or the heat pump’s own controller. A deficit does not prove current heat delivery. Old data is not used; the output returns toward Base using the existing ramp times.",
-          "control_balance_verified": "Confirm only with verified evidence for your sensor and heat pump. No decoding or universal sign convention is assumed automatically.",
-          "control_balance_scale": "No guessed default. Must be finite and nonzero; may be negative according to the verified sign convention.",
-          "control_balance_offset": "Enter explicitly even if the verified offset is zero. Uses the same unit as the normalized deficit.",
-          "control_balance_deficit_threshold": "A verified positive limit in normalized units. Braking is unchanged at and below this limit.",
-          "control_balance_deficit_full": "Must exceed the first limit. Between the limits braking is released gradually; at and above this limit at most 50 percent is released."
+        "data_description": {},
+        "sections": {
+          "temperature_sources": {
+            "name": "Additional temperature sensors and freshness",
+            "description": "Optional. Weights are normalised automatically. The backup outdoor source is used when the primary is unusable. HA report time does not prove physical measurement time. An overly short age limit may trigger SAFE.",
+            "data": {
+              "indoor_temp_entity_2": "Indoor sensor 2 (optional)",
+              "indoor_temp_entity_3": "Indoor sensor 3 (optional)",
+              "indoor_temp_weight_1": "Weight for the primary indoor sensor (from basic settings)",
+              "indoor_temp_weight_2": "Indoor sensor 2 weight",
+              "indoor_temp_weight_3": "Indoor sensor 3 weight",
+              "outdoor_temp_entity_2": "Backup outdoor sensor (optional)",
+              "outdoor_temperature_report_max_age_minutes": "Maximum outdoor temperature report age (minutes)",
+              "temperature_report_max_age_minutes": "Maximum indoor temperature report age (minutes)"
+            },
+            "data_description": {
+              "outdoor_temperature_report_max_age_minutes": "Default 120 minutes, based on observed reporting gaps. Adjust for your outdoor sensors. HA report time does not prove physical measurement time.",
+              "temperature_report_max_age_minutes": "The default is 360 minutes, based on observed reporting intervals. Adjust it to your sensors’ observed intervals. HA report time does not establish physical measurement time."
+            }
+          },
+          "outputs": {
+            "name": "Outputs – Ohmigo and Generic Output",
+            "description": "Keep working connections unchanged. Ohmigo and Generic Output are independently configured. The relay selection is used by Relay Guard.",
+            "data": {
+              "modbus_interval_minutes": "Generic output push interval",
+              "modbus_payload_template": "Generic output payload template",
+              "modbus_service": "Generic output service",
+              "ohmigo_entity": "Ohmigo setpoint entity (optional)",
+              "ohmigo_interval_minutes": "Ohmigo push interval",
+              "ohmigo_relay_entity": "Ohmigo Active/Bypass relay (optional)"
+            },
+            "data_description": {
+              "modbus_interval_minutes": "Minimum time between Generic Output System service calls.",
+              "modbus_payload_template": "YAML payload template for the service call. The template can use the fake_temp variable.",
+              "modbus_service": "Home Assistant service to call, for example modbus.write_register, mqtt.publish or input_number.set_value.",
+              "ohmigo_entity": "PumpSteer will push the fake outdoor temperature to this number entity after each update. Leave empty to disable. Toggle without reconfiguring using the 'Ohmigo Push' switch.",
+              "ohmigo_interval_minutes": "Minimum time between pushes to Ohmigo. Default 5 minutes. Changes below 0.2 °C are treated as unchanged, but the current setpoint is resent when the interval is due to keep the Ohmigo watchdog alive.",
+              "ohmigo_relay_entity": "Optional switch entity for the Ohmigo Active/Bypass relay. When configured, PumpSteer exposes a separate Relay Guard switch. The guard only recovers an explicit OFF state while Ohmigo Push is ON; unknown or unavailable states never cause a relay command."
+            }
+          },
+          "notifications": {
+            "name": "Notifications",
+            "description": "Price notifications and zone alerts have separate recipients. An empty zone recipient inherits the shared zone recipient, not the price notification recipient.",
+            "data": {
+              "notification_cooldown_minutes": "Repeat notification cooldown",
+              "notification_level": "Price notification level",
+              "notify_service": "Notification service (optional, e.g. notify.mobile_app_my_phone)",
+              "zone_notify_service": "Notification service (notify.name)"
+            },
+            "data_description": {
+              "notification_cooldown_minutes": "Minimum time between repeated alerts of the same type. Choose 0 for no limit; 60 minutes is recommended. Braking and preheating have independent timers.",
+              "notification_level": "Choose all price alerts, braking only, or none. The existing Notifications switch remains the master on/off control.",
+              "notify_service": "Leave empty to use persistent notifications in the HA sidebar instead."
+            }
+          },
+          "zone_1": {
+            "name": "Additional temperature zone 1",
+            "description": "Monitoring only, even with alerts enabled. The zone does not change a thermostat setpoint or valve opening and does not control central heat production. A cold zone does not affect the shared PI controller.",
+            "data": {
+              "zone_1_alarm_delay_minutes": "Zone 1 – Alarm delay (minutes)",
+              "zone_1_climate": "Zone 1 – Thermostat (optional)",
+              "zone_1_comfort_threshold": "Zone 1 – Comfort minimum",
+              "zone_1_enabled": "Zone 1 – alarm enabled",
+              "zone_1_entity": "Zone 1 – temperature sensor",
+              "zone_1_name": "Zone 1 – name",
+              "zone_1_notify_service": "Zone 1 – Notification service",
+              "zone_1_profile": "Zone 1 – Profile",
+              "zone_1_threshold": "Zone 1 – Maintenance threshold"
+            },
+            "data_description": {
+              "zone_1_alarm_delay_minutes": "Default 15 minutes, configurable from 1 to 240. A low-temperature alert requires at least two separate below-threshold reports spanning the delay. Other alerts have their own evidence requirements.",
+              "zone_1_climate": "Optional and read-only. Room temperature monitoring still works without a thermostat, but thermostat diagnostics and heat-shortage analysis are limited. Its setpoint is not the zone alarm threshold.",
+              "zone_1_comfort_threshold": "Temperature threshold for Comfort. Default 18 °C. Used only when this profile is selected.",
+              "zone_1_enabled": "Off by default. When enabled, the zone can alert on low temperature, a forecast, suspected heat shortage and sensor faults. Temperature remains monitored with alerts off.",
+              "zone_1_entity": "Choose a room temperature sensor in °C. A sensor near a radiator can read differently from the room.",
+              "zone_1_name": "The name appears in diagnostics and zone notifications.",
+              "zone_1_notify_service": "Optional override. Empty uses the shared zone recipient; if that is also empty no push is sent.",
+              "zone_1_profile": "Choose manually which of the two zone temperature thresholds is used.",
+              "zone_1_threshold": "Temperature threshold for Maintenance heat. Default 5 °C. Used only when this profile is selected."
+            }
+          },
+          "zone_2": {
+            "name": "Additional temperature zone 2",
+            "description": "Monitoring only, even with alerts enabled. The zone does not change a thermostat setpoint or valve opening and does not control central heat production. A cold zone does not affect the shared PI controller.",
+            "data": {
+              "zone_2_alarm_delay_minutes": "Zone 2 – Alarm delay (minutes)",
+              "zone_2_climate": "Zone 2 – Thermostat (optional)",
+              "zone_2_comfort_threshold": "Zone 2 – Comfort minimum",
+              "zone_2_enabled": "Zone 2 – alarm enabled",
+              "zone_2_entity": "Zone 2 – temperature sensor",
+              "zone_2_name": "Zone 2 – name",
+              "zone_2_notify_service": "Zone 2 – Notification service",
+              "zone_2_profile": "Zone 2 – Profile",
+              "zone_2_threshold": "Zone 2 – Maintenance threshold"
+            },
+            "data_description": {
+              "zone_2_alarm_delay_minutes": "Default 15 minutes, configurable from 1 to 240. A low-temperature alert requires at least two separate below-threshold reports spanning the delay. Other alerts have their own evidence requirements.",
+              "zone_2_climate": "Optional and read-only. Room temperature monitoring still works without a thermostat, but thermostat diagnostics and heat-shortage analysis are limited. Its setpoint is not the zone alarm threshold.",
+              "zone_2_comfort_threshold": "Temperature threshold for Comfort. Default 18 °C. Used only when this profile is selected.",
+              "zone_2_enabled": "Off by default. When enabled, the zone can alert on low temperature, a forecast, suspected heat shortage and sensor faults. Temperature remains monitored with alerts off.",
+              "zone_2_entity": "Choose a room temperature sensor in °C. A sensor near a radiator can read differently from the room.",
+              "zone_2_name": "The name appears in diagnostics and zone notifications.",
+              "zone_2_notify_service": "Optional override. Empty uses the shared zone recipient; if that is also empty no push is sent.",
+              "zone_2_profile": "Choose manually which of the two zone temperature thresholds is used.",
+              "zone_2_threshold": "Temperature threshold for Maintenance heat. Default 5 °C. Used only when this profile is selected."
+            }
+          },
+          "zone_3": {
+            "name": "Additional temperature zone 3",
+            "description": "Monitoring only, even with alerts enabled. The zone does not change a thermostat setpoint or valve opening and does not control central heat production. A cold zone does not affect the shared PI controller.",
+            "data": {
+              "zone_3_alarm_delay_minutes": "Zone 3 – Alarm delay (minutes)",
+              "zone_3_climate": "Zone 3 – Thermostat (optional)",
+              "zone_3_comfort_threshold": "Zone 3 – Comfort minimum",
+              "zone_3_enabled": "Zone 3 – alarm enabled",
+              "zone_3_entity": "Zone 3 – temperature sensor",
+              "zone_3_name": "Zone 3 – name",
+              "zone_3_notify_service": "Zone 3 – Notification service",
+              "zone_3_profile": "Zone 3 – Profile",
+              "zone_3_threshold": "Zone 3 – Maintenance threshold"
+            },
+            "data_description": {
+              "zone_3_alarm_delay_minutes": "Default 15 minutes, configurable from 1 to 240. A low-temperature alert requires at least two separate below-threshold reports spanning the delay. Other alerts have their own evidence requirements.",
+              "zone_3_climate": "Optional and read-only. Room temperature monitoring still works without a thermostat, but thermostat diagnostics and heat-shortage analysis are limited. Its setpoint is not the zone alarm threshold.",
+              "zone_3_comfort_threshold": "Temperature threshold for Comfort. Default 18 °C. Used only when this profile is selected.",
+              "zone_3_enabled": "Off by default. When enabled, the zone can alert on low temperature, a forecast, suspected heat shortage and sensor faults. Temperature remains monitored with alerts off.",
+              "zone_3_entity": "Choose a room temperature sensor in °C. A sensor near a radiator can read differently from the room.",
+              "zone_3_name": "The name appears in diagnostics and zone notifications.",
+              "zone_3_notify_service": "Optional override. Empty uses the shared zone recipient; if that is also empty no push is sent.",
+              "zone_3_profile": "Choose manually which of the two zone temperature thresholds is used.",
+              "zone_3_threshold": "Temperature threshold for Maintenance heat. Default 5 °C. Used only when this profile is selected."
+            }
+          },
+          "zone_4": {
+            "name": "Additional temperature zone 4",
+            "description": "Monitoring only, even with alerts enabled. The zone does not change a thermostat setpoint or valve opening and does not control central heat production. A cold zone does not affect the shared PI controller.",
+            "data": {
+              "zone_4_alarm_delay_minutes": "Zone 4 – Alarm delay (minutes)",
+              "zone_4_climate": "Zone 4 – Thermostat (optional)",
+              "zone_4_comfort_threshold": "Zone 4 – Comfort minimum",
+              "zone_4_enabled": "Zone 4 – alarm enabled",
+              "zone_4_entity": "Zone 4 – temperature sensor",
+              "zone_4_name": "Zone 4 – name",
+              "zone_4_notify_service": "Zone 4 – Notification service",
+              "zone_4_profile": "Zone 4 – Profile",
+              "zone_4_threshold": "Zone 4 – Maintenance threshold"
+            },
+            "data_description": {
+              "zone_4_alarm_delay_minutes": "Default 15 minutes, configurable from 1 to 240. A low-temperature alert requires at least two separate below-threshold reports spanning the delay. Other alerts have their own evidence requirements.",
+              "zone_4_climate": "Optional and read-only. Room temperature monitoring still works without a thermostat, but thermostat diagnostics and heat-shortage analysis are limited. Its setpoint is not the zone alarm threshold.",
+              "zone_4_comfort_threshold": "Temperature threshold for Comfort. Default 18 °C. Used only when this profile is selected.",
+              "zone_4_enabled": "Off by default. When enabled, the zone can alert on low temperature, a forecast, suspected heat shortage and sensor faults. Temperature remains monitored with alerts off.",
+              "zone_4_entity": "Choose a room temperature sensor in °C. A sensor near a radiator can read differently from the room.",
+              "zone_4_name": "The name appears in diagnostics and zone notifications.",
+              "zone_4_notify_service": "Optional override. Empty uses the shared zone recipient; if that is also empty no push is sent.",
+              "zone_4_profile": "Choose manually which of the two zone temperature thresholds is used.",
+              "zone_4_threshold": "Temperature threshold for Maintenance heat. Default 5 °C. Used only when this profile is selected."
+            }
+          },
+          "thermal": {
+            "name": "Thermal Intelligence and adaptive braking",
+            "description": "Passive collection and adaptive control are separate features. For a passive trial enable Thermal Intelligence and leave adaptive braking off. Expanding this section does not enable anything.",
+            "data": {
+              "adaptive_braking_enabled": "Adaptive price braking",
+              "external_heat_sources": "Do you sometimes use an additional heat source?",
+              "thermal_intelligence_enabled": "Thermal Intelligence (experimental diagnostics)"
+            },
+            "data_description": {
+              "adaptive_braking_enabled": "Separate permission for legacy adaptive control. Leave off for a passive field trial. Evidence collection does not enable this setting.",
+              "external_heat_sources": "Yes means extra heat may sometimes occur, not that it is on now. Adaptive braking can learn from stable temperature response, rejects clearly disturbed periods and needs later independent checks. Undetected extra heat remains a possible confound; this does not measure heat flow.",
+              "thermal_intelligence_enabled": "Collects observations and evaluates a passive model candidate. Does not by itself permit adaptive control or prove forecast skill."
+            }
+          },
+          "heat_pump_data": {
+            "name": "Heat pump signals and energy metering",
+            "description": "Optional signals for diagnostics and heating-operation evidence. Compressor activity, electrical power and sent commands do not prove delivered space heat. Leave unused fields empty.",
+            "data": {
+              "thermal_alarm_entity": "Active heat pump fault",
+              "thermal_alarm_numeric_normal": "Normal value for numeric fault",
+              "thermal_alarm_numeric_verified": "I verified the numeric fault meaning",
+              "thermal_aux_heat_entity": "Auxiliary electric heat",
+              "thermal_balance_entity": "Internal heat balance",
+              "thermal_balance_kind": "Heat balance type",
+              "thermal_brine_in_entity": "Brine inlet",
+              "thermal_brine_out_entity": "Brine outlet",
+              "thermal_brine_pump_entity": "Brine pump",
+              "thermal_circulation_pump_entity": "Heating circulation pump",
+              "thermal_compressor_entity": "Compressor status (optional)",
+              "thermal_detection_method": "Heating detection method",
+              "thermal_energy_entities": "Cumulative energy meters (optional)",
+              "thermal_external_heat_entity": "Verified external heater activity (optional)",
+              "thermal_heat_activity_entity": "Verified heat delivery to the home (optional)",
+              "thermal_heating_mode_entity": "Verified radiator heating mode (optional)",
+              "thermal_heating_mode_inverted": "Radiator mode is off",
+              "thermal_hot_water_mode_entity": "Verified hot-water mode (optional)",
+              "thermal_power_entity": "Heat-pump electrical power (optional)",
+              "thermal_return_temp_entity": "Return temperature (optional)",
+              "thermal_supply_target_entity": "Supply temperature target",
+              "thermal_supply_temp_entity": "Radiator supply temperature (optional)",
+              "thermal_supply_threshold": "Supply temperature indicator threshold"
+            },
+            "data_description": {
+              "thermal_alarm_entity": "Choose a binary or numeric fault signal. A numeric signal stays inactive until you verify its normal value and that every other finite value means an active fault. Notifications use the regular recipient or a persistent HA notification.",
+              "thermal_alarm_numeric_normal": "For a numeric sensor only: enter the verified normal value. Use 0 only if your heat pump documentation confirms it. Empty means an unknown fault state.",
+              "thermal_alarm_numeric_verified": "For a numeric sensor only: confirm that the chosen value is normal and every other finite value means an active fault. A changed sensor or normal value requires confirmation again.",
+              "thermal_aux_heat_entity": "Binary signal for active auxiliary electric heat.",
+              "thermal_balance_entity": "Select a numeric sensor if available. No scale or sign convention is assumed.",
+              "thermal_balance_kind": "Choose degree minutes or integral only when the meaning is verified; otherwise choose raw value. No start threshold is assumed.",
+              "thermal_brine_in_entity": "Temperature sensor for incoming brine.",
+              "thermal_brine_out_entity": "Temperature sensor for outgoing brine.",
+              "thermal_brine_pump_entity": "Binary brine pump status. This alone does not prove heat delivery.",
+              "thermal_circulation_pump_entity": "Binary heating circulation pump status. This alone does not prove heat delivery.",
+              "thermal_compressor_entity": "Compressor status alone does not prove radiator heating.",
+              "thermal_detection_method": "Automatic uses qualified signals and reports uncertainty. Manual retains the supply threshold.",
+              "thermal_energy_entities": "Select one total meter or independent meters that can be summed. Selected meters take precedence for energy diagnostics. Only complete counter intervals with one unambiguous price are priced. Report gaps above 24 hours are excluded.",
+              "thermal_external_heat_entity": "Leave empty without a reliable signal. On must mean the external heater is actually active, not the heat pump compressor or a thermostat request. Requires a documented verified source observation time in the control timestamp attribute (default measurement_time), at most five minutes old. HA report time or MQTT republication is insufficient. Active or unknown selected signals pause adaptive use and require new checks; temperature monitoring works without this sensor.",
+              "thermal_heat_activity_entity": "A binary sensor whose on means measured heat delivery to the home and off means none. Compressor status or hot-water mode alone is insufficient. Report times do not establish physical measurement time.",
+              "thermal_heating_mode_entity": "Verified radiator mode is required for the manual supply indicator, but not for passive temperature observation.",
+              "thermal_heating_mode_inverted": "Enable only when off means radiator mode. Unknown or stale status suspends learning.",
+              "thermal_hot_water_mode_entity": "On means verified hot-water operation. Heat learning pauses when on or unknown; unknown periods are not classified.",
+              "thermal_power_entity": "Measured electrical input for the equipment being analysed. Energy is estimated from HA reports; it is not delivered heat.",
+              "thermal_return_temp_entity": "Used only together with other qualified signals.",
+              "thermal_supply_target_entity": "The heat pump supply temperature target, not a room temperature or alarm threshold.",
+              "thermal_supply_temp_entity": "Choose a radiator-circuit sensor. It can be observed passively without a radiator mode signal. Temperature does not prove heat delivery.",
+              "thermal_supply_threshold": "Set for your heating system. An unsuitable threshold can misclassify heat."
+            }
+          },
+          "advanced_control": {
+            "name": "Advanced control functions",
+            "description": "These features can affect control. Keep existing choices unless signal meaning and measurement time have been verified. Changing a source or calibration revokes its previous safety verification.",
+            "data": {
+              "control_aux_preheat_limit": "Limit extra preheating during auxiliary heat",
+              "control_balance_brake_limit": "Limit price braking using verified heat balance",
+              "control_balance_deficit_full": "Deficit for maximum brake limitation",
+              "control_balance_deficit_threshold": "Deficit where brake release begins",
+              "control_balance_offset": "Verified offset",
+              "control_balance_scale": "Verified scale factor including sign",
+              "control_balance_verified": "I have verified normalization and deficit limits",
+              "control_measurement_time_attribute": "Verified observation timestamp attribute",
+              "control_signals_verified": "I have verified signal meanings and observation times"
+            },
+            "data_description": {
+              "control_aux_preheat_limit": "Off by default. Removes only the extra preheat boost when auxiliary heat is verified active for radiator heating. Does not change the pump’s auxiliary or emergency heating and does not guarantee energy savings.",
+              "control_balance_brake_limit": "Changes only existing price braking, not PI or the heat pump’s own controller. A deficit does not prove current heat delivery. Old data is not used; the output returns toward Base using the existing ramp times.",
+              "control_balance_deficit_full": "Must exceed the first limit. Between the limits braking is released gradually; at and above this limit at most 50 percent is released.",
+              "control_balance_deficit_threshold": "A verified positive limit in normalized units. Braking is unchanged at and below this limit.",
+              "control_balance_offset": "Enter explicitly even if the verified offset is zero. Uses the same unit as the normalized deficit.",
+              "control_balance_scale": "No guessed default. Must be finite and nonzero; may be negative according to the verified sign convention.",
+              "control_balance_verified": "Confirm only with verified evidence for your sensor and heat pump. No decoding or universal sign convention is assumed automatically.",
+              "control_measurement_time_attribute": "The same attribute is read from every participating sensor. Its value must be a verified observation time as a timezone-aware ISO timestamp or Unix seconds. Without reliable source evidence the intervention cannot activate; do not copy HA report time into another attribute.",
+              "control_signals_verified": "Confirm only after verifying signal meanings and observation times. The time must be a physical measurement time or the receipt time of a new measurement message whose link to that specific value is verified by the source documentation. Receipt time is not physical measurement time. HA last_reported, MQTT republication and online status are not sufficient by themselves. Applies to both limiters."
+            }
+          }
         }
       }
     },
@@ -409,8 +290,6 @@
       "required": "This field is required",
       "entity_not_found": "Entity not found",
       "entity_unavailable": "Entity unavailable",
-      "invalid_range": "Min brake strength cannot be higher than max brake strength",
-      "unknown": "An unknown error occurred",
       "invalid_notification_setting": "Invalid notification setting",
       "invalid_detection_method": "Invalid heating detection method.",
       "heat_signal_alias": "The heat signal must be a separate radiator heat indicator.",
@@ -465,6 +344,21 @@
         "raw": "Raw value (unknown meaning)",
         "degree_minutes": "Degree minutes (verified)",
         "integral": "Integral (verified)"
+      }
+    },
+    "notification_level": {
+      "options": {
+        "all": "All price notifications",
+        "braking_only": "Braking only",
+        "off": "No price notifications"
+      }
+    },
+    "notification_cooldown": {
+      "options": {
+        "0": "No repeat limit",
+        "30": "30 minutes",
+        "60": "60 minutes",
+        "120": "120 minutes"
       }
     }
   }

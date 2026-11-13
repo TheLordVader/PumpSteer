@@ -251,14 +251,24 @@ def Schema(val):
     return val
 
 
-def Required(name, default=None):
-    return name
+class _Marker(str):
+    def __new__(cls, name, default=None, description=None):
+        marker = super().__new__(cls, name)
+        marker.schema = name
+        marker.default = lambda: default
+        marker.description = description
+        return marker
 
 
-def Optional(name, default=None):  # FIX: saknades tidigare
-    return name
+def Required(name, default=None, description=None):
+    return _Marker(name, default, description)
 
 
+def Optional(name, default=None, description=None):
+    return _Marker(name, default, description)
+
+
+vol.UNDEFINED = object()
 vol.Schema = Schema
 vol.Required = Required
 vol.Optional = Optional
@@ -362,3 +372,16 @@ def async_dispatcher_send(hass, signal, *args):
 dispatcher_mod.async_dispatcher_connect = async_dispatcher_connect
 dispatcher_mod.async_dispatcher_send = async_dispatcher_send
 sys.modules["homeassistant.helpers.dispatcher"] = dispatcher_mod
+
+# Native data-entry sections expose a nested schema and presentation options.
+data_entry_flow = types.ModuleType("homeassistant.data_entry_flow")
+
+
+class section:
+    def __init__(self, schema, options=None):
+        self.schema = schema
+        self.options = options or {}
+
+
+data_entry_flow.section = section
+sys.modules["homeassistant.data_entry_flow"] = data_entry_flow
