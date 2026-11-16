@@ -100,3 +100,20 @@ def test_missing_cycles_cannot_bridge_a_two_hour_forecast(request):
     _report(states, clock, unit_of_measurement='°C')
     asyncio.run(sensor._do_update())
     assert not sensor._plan_audit.fixed_records
+
+
+def test_sparse_actual_change_scores_without_polling_creating_outcomes(request):
+    sensor, states, clock = _start(request.getfixturevalue("control"))
+    issued = clock[0]
+    for minute in range(5, 41, 5):
+        clock[0] = issued + timedelta(minutes=minute)
+        if minute == 40:
+            states["sensor.indoor"].state = "20.8"
+        _report(states, clock, unit_of_measurement="°C")
+        asyncio.run(sensor._do_update())
+        assert len(sensor._plan_audit.fixed_records) == int(minute == 40)
+    row = sensor._plan_audit.fixed_records[0]
+    assert row["elapsed_minutes"] == 40
+    assert row["observed"] == clock[0].isoformat()
+    assert row["predictions"] == [21]
+    assert row["actual"] == 20.8

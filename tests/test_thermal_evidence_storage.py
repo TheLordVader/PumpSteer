@@ -42,3 +42,23 @@ def test_other_audit_updates_cannot_rewrite_full_thermal_store_every_minute(requ
         asyncio.run(controller._save_pilot_store())
         clock[0] += timedelta(minutes=1)
     assert len(saved) <= 3
+
+
+def test_shared_audit_diagnostics_checkpoint_without_extra_thermal_writes(request):
+    controller, states, clock = request.getfixturevalue("control")
+    saved = []
+    controller._pilot_store = SimpleNamespace(
+        async_delay_save=lambda callback, delay: saved.append(callback()))
+    controller._thermal_intelligence.record_output({
+        "at": clock[0].isoformat(), "transport": "ohmigo",
+        "status": "service_completed_unverified", "requested": -5,
+    })
+    for minute in range(11):
+        assert controller._plan_audit.issue_shared(
+            clock[0], 21, 5, None, ("inside", "outside"), revision="persistence",
+            context_id="segment", command=None, mode="normal")
+        controller._plan_audit.cancel_shared("context_interrupted", clock[0])
+        asyncio.run(controller._save_pilot_store())
+        clock[0] += timedelta(minutes=1)
+    assert len(saved) == 3
+    assert saved[-1]["plan_audit"]["shared_audit"]["counts"]["issued"] == 11

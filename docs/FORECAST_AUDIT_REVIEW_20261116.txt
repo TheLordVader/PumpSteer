@@ -1,0 +1,66 @@
+ForecastAudit: bounded local correction, 2026-11-16
+
+Base: d31be5d666a9d1b35aec4a48dca2f84ecc5d51f0.
+Branch: fix/forecast-audit-outcomes-20261116.
+Scope: shared passive ForecastAudit and its existing sensor/Store adapter only.
+No new model, input collection, training, qualification rule, configuration,
+actuator behavior, dependency, entity or external evidence ledger.
+
+Confirmed failures
+- Sparse accepted temperature changes miss the nominal 30/60/120 +5min windows.
+- Early cancellation leaves an unused 125min blackout, despite one-pending limit.
+- No bounded history explains actual issuances, cancellations and missing outcomes.
+
+Correction
+- Keep the existing frozen curves and maximum 125min lifetime. Evaluate at the
+  actual later HA report timestamp, never at an interpolated nominal endpoint.
+- Retain nominal 30/60/120 labels as minimum horizons; publish actual elapsed
+  minutes/range explicitly. A late endpoint consumes only the greatest eligible
+  horizon. Lower skipped horizons are unavailable, never extra successes/failures.
+- Compare all frozen curves, including persistence, on the identical actual row.
+  Summaries remain separated by model revision and nominal horizon. Reference-only
+  rows are marked reference_only. Pairs do not imply independent episodes.
+- Cancellation releases the obsolete blackout. At most one issuance remains open;
+  a strictly newer source-report timestamp is required even across source changes.
+- Existing source, mode, context, command, clock, gap and SAFE interruptions still
+  invalidate the unfinished curve. Keepalive does not create an outcome.
+- Retain at most32 diagnostic events and64KiB of their JSON, fixed-key saturating
+  counters, at most96 outcome rows, frozen curve/revision/source provenance.
+  Reuse existing HA Store and5min whole-file checkpoint cadence; flush on unload.
+- Restore revalidates saved curves/outcomes, drops pending work, records its loss
+  and prevents reissuing its old source report. Legacy fixed_v1 stays unchanged.
+
+Verification
+- New failure tests exercised against d31be5d before the green candidate check.
+- Coverage: actual37.5/40/70/123min endpoints; no duplicate endpoint as multiple
+  horizon scores; cancellation/new report; source A->B->A; timezone equivalence;
+  stale/missing/future/reordered input and context boundaries; restart and corrupt
+  saved outcomes; bounded diagnostics; audit-only5min Store checkpoints.
+- Existing controller/passivity fault-injection and complete regression suite run.
+- Ruff comparison against the base has no newly introduced findings. Existing
+  lint debt is not mass-formatted.
+- Local synthetic metadata stress only:1000 issuance/evaluation/cancellation
+  cycles,96 retained outcomes,32 events under64KiB. This is an overhead/retention
+  check, not thermal training evidence or a measured HA production-load result.
+- Private retrospective replay uses only archived accepted observations and model
+  checkpoints captured before issuance. It creates counterfactual audit-path
+  results, not recovered historical issued forecasts or forward validation.
+  Private data/scripts/results stay outside the Git worktree.
+
+Limits and next gate
+- Endpoint selection remains conditional on accepted numeric changes and valid
+  continuity. Unchanged polling does not become new physical measurement evidence.
+  Results are not representative of all operating time or all temperature reports.
+- HA receipt time is not proven physical sampling time. Requested command remains
+  an empirical coordinate, not verified delivered heat. External heat may confound
+  a real trial and must be documented without inventing precise intervals.
+- Longer horizons can still be unavailable when commands/mode/source quality
+  change. No promise of a specified number of valid pairs in a short trial.
+- Nothing here qualifies the RTM model or permits adaptive control.
+- Candidate is suitable for a separately approved short passive verification trial
+  using a version-matched, checked monitor/stop routine. Before start: confirm the
+  installed candidate, TI enabled only for the trial, Adaptive Braking false,
+  multiplier1.0 and all existing passive safety checks. Preserve bounded private
+  snapshots of diagnostics and compare each real RTM/reference pair fairly.
+- The earlier HA Core restart cause remains unproven and is a separate operational
+  uncertainty. A repeat requires investigation; this patch does not claim to fix it.

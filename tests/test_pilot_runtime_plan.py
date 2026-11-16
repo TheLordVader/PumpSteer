@@ -442,6 +442,7 @@ def test_sensor_lifecycle_saves_and_restores_shared_evidence_history(monkeypatch
         sensor_module.dt_util, "now", lambda: at + timedelta(minutes=66)
     )
     asyncio.run(restored.async_added_to_hass())
+    assert restored._plan_audit.fixed_pending is None  # Never resume the old curve.
     when = at + timedelta(minutes=70)
     other["binary_sensor.house_heat"] = SimpleNamespace(
         state="on",
@@ -454,7 +455,8 @@ def test_sensor_lifecycle_saves_and_restores_shared_evidence_history(monkeypatch
     assert all(row in restored_events for row in observations)
     assert any(row["kind"] == "interruption" and row["reason"] == "restart" for row in restored_events)
     assert restored._plan_audit.fixed_records == history["plan_audit"]["fixed_v2"]
-    assert restored._plan_audit.fixed_pending is None
+    # A genuinely new report after restart can issue a new curve immediately.
+    assert restored._plan_audit.fixed_pending["issued"] == when
     assert restored._pilot.house_intervals == 0
     assert not restored._pilot.manager.model.history
     assert not restored._pilot.manager.pump.ready

@@ -1,0 +1,29 @@
+Scope: isolated from d31; ForecastAudit only and its passive sensor adapter.
+No model/training/input/controller/output changes.
+Contract: preserve nominal30/60/120 horizons, evaluate at real elapsed time
+up to original125min lifetime. One actual endpoint consumes only the greatest
+eligible nominal horizon; lower skipped horizons are unavailable, not scores.
+Freeze curve/revision at issue; no future refit data. Preserve context/command/
+source/clock boundaries. Issue at most once per actual accepted source report.
+Release shared cooldown after cancellation/completion; one pending already bounds
+concurrency. Legacy fixed_v1 remains unchanged.
+Bounded diagnostics in existing ForecastAudit/HA Store: fixed-key counters,
+last32 issuance/evaluation/abort events, curve provenance, no pending resume.
+Revalidate persisted completed outcomes with exact curve, actual horizon and
+fresh endpoint; reject duplicated/conflicting records and future evidence.
+1. Red tests for37.5min actual endpoint, early cancellation, no duplicate reports,
+late multi-horizon endpoint, serialization tampering/restart, bounded diagnostics.
+2. Implement shared audit lifecycle and replace passive adapter's blind clears
+with reasoned cancellations; reuse existing checkpoint cadence.
+3. Controller integration and captured-data offline replay (diagnostic only).
+4. Targeted tests + full regression + independent internal review; local commit.
+
+Execution record:
+- Completed targeted red/green checks, controller adapter, bounded Store tests,
+  private chronological archived-checkpoint replay and whole-suite regression.
+- Ruling: source-report high-water is global across identity changes; switching
+  sources must not make an older timestamp into a new issuance. No new cache.
+- Ruling: after restore, drop old pending work but allow a new curve from a truly
+  new report. Updated the old lifecycle assertion that depended on the blackout.
+- Internal reviewer found the source-switch edge; regression added and corrected.
+- Technical replay is explicitly counterfactual, never forward validation.
