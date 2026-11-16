@@ -1741,7 +1741,7 @@ class PumpSteerSensor(RestoreEntity):
         runtime = self._thermal_intelligence
         observation = runtime.latest_observation
         if observation is None or observation.get("segment") != runtime.context_id:
-            self._plan_audit.fixed_pending = None
+            self._plan_audit.cancel_shared("observation_segment_unavailable", now)
             return
         reported = datetime.fromisoformat(observation["indoor_reported_at"])
         command = runtime.current_command
@@ -2665,7 +2665,7 @@ class PumpSteerSensor(RestoreEntity):
             elif indoor is not None:
                 self._thermal_model.reset_temp_history(now, indoor)
             self._plan_audit.cancel_plans("temperature_source_changed")
-            self._plan_audit.fixed_pending = None
+            self._plan_audit.cancel_shared("temperature_source_changed", now)
             if self._pilot is not None:
                 self._pilot.reset_interval()
         self._temperature_identity_previous = identity
@@ -2700,7 +2700,7 @@ class PumpSteerSensor(RestoreEntity):
         if cfg.get("thermal_intelligence_enabled") is True:
             try:
                 if indoor is None or outdoor is None:
-                    self._plan_audit.fixed_pending = None
+                    self._plan_audit.cancel_shared("temperature_unavailable", now)
                 else:
                     self._plan_audit.observe_fixed(
                         now,
@@ -2709,7 +2709,7 @@ class PumpSteerSensor(RestoreEntity):
                     )
                 await self._save_pilot_store()
             except Exception:
-                self._plan_audit.fixed_pending = None
+                self._plan_audit.cancel_shared("fixed_audit_error", now)
                 _LOGGER.debug("Passive fixed-horizon audit unavailable", exc_info=True)
         self._input_temperatures = {
             "indoor_temperature": indoor,
@@ -4050,7 +4050,7 @@ class PumpSteerSensor(RestoreEntity):
             try:
                 self._update_shared_thermal_audit(now, cfg)
             except Exception:
-                self._plan_audit.fixed_pending = None
+                self._plan_audit.cancel_shared("shared_audit_error", now)
                 _LOGGER.debug("Shared thermal audit unavailable", exc_info=True)
             try:
                 self._maybe_schedule_thermal_fit(now)
@@ -4496,7 +4496,7 @@ class PumpSteerSensor(RestoreEntity):
         plan_last = (
             plan_data["records"][-1]["observed"] if plan_data["records"] else None
         )
-        thermal_signature = self._thermal_intelligence.store_signature
+        thermal_signature = (self._thermal_intelligence.store_signature, self._plan_audit._shared_sequence)
         store_now = dt_util.now()
         thermal_last_at = getattr(self, "_thermal_store_last_at", None)
         thermal_due = thermal_available and (

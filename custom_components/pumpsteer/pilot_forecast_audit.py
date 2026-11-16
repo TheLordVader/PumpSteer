@@ -5,9 +5,12 @@ The issued forecast is a function of elapsed time, assuming unchanged measured
 heat indicator and outside temperature. HA report time is not physical time.
 """
 
-from datetime import timedelta
+import json
 import math
-from .thermal_model import _K_MIN, _K_MAX
+from copy import deepcopy
+from datetime import timedelta
+
+from .thermal_model import _K_MAX, _K_MIN
 
 
 def _plan_context(value):
@@ -119,6 +122,11 @@ class ForecastAudit:
         self.fixed_pending = None
         self.fixed_records = []
         self.fixed_next = None
+        self._shared_counts = dict.fromkeys(("issued", "evaluated", "cancelled", "expired", "unavailable_horizons", "rejected"), 0)
+        self._shared_events = []
+        self._shared_sequence = 0
+        self._shared_last_issued = None
+        self._shared_rejected = None
         self.pending = None
         self.records = []
         # Passive plan residuals are separate from model-validation evidence.
@@ -262,7 +270,64 @@ class ForecastAudit:
                 "assumption": "constant_outdoor_net_response_under_actual_control",
             }
         result["shared_by_revision"] = self.shared_summary(identity)
+        result["shared_diagnostics"] = self.shared_diagnostics()
         return result
+
+    def _shared_event(self, kind, at, *, reason=None, **fields):
+        """Bounded audit provenance, independent of model qualification."""
+        self._shared_sequence = min(self._shared_sequence + 1, 2**63 - 1)
+        if kind in self._shared_counts:
+            self._shared_counts[kind] = min(self._shared_counts[kind] + 1, 2**63 - 1)
+        self._shared_events.append(
+            {
+                "sequence": self._shared_sequence,
+                "kind": kind,
+                "at": at.isoformat() if at is not None else None,
+                "reason": reason,
+                **deepcopy(fields),
+            }
+        )
+        self._shared_events = self._shared_events[-32:]
+        while len(json.dumps(self._shared_events)) > 65536:
+            self._shared_events.pop(0)
+
+
+    def shared_diagnostics(self):
+        return {
+            "version": 1,
+            "sequence": self._shared_sequence,
+            "counts": dict(self._shared_counts),
+            "events": deepcopy(self._shared_events),
+            "last_issued": deepcopy(self._shared_last_issued),
+            "pending_horizons": list(self.fixed_pending["predictions"])
+            if self.fixed_pending
+            and self.fixed_pending.get("kind") == "shared_command_response"
+            else [],
+            "endpoint_basis": "accepted_numeric_changes_only",
+            "coverage": "conditional_on_accepted_changes_and_continuity",
+            "count_semantics": "forecast_outcome_pairs_not_independent_episodes",
+            "physical_measurement_time": "unknown",
+        }
+
+
+    def cancel_shared(self, reason, at=None):
+        """Close a passive issuance without inventing an outcome or a cooldown."""
+        p = self.fixed_pending
+        if p is not None and p.get("kind") == "shared_command_response":
+            count = len(p["predictions"])
+            self._shared_counts["unavailable_horizons"] = min(
+                self._shared_counts["unavailable_horizons"] + count, 2**63 - 1
+            )
+            self._shared_event(
+                "expired" if reason == "no_endpoint_before_expiry" else "cancelled",
+                at or p["last"],
+                reason=reason,
+                issued=p["issued"].isoformat(),
+                revision=p["revision"],
+                horizons=list(p["predictions"]),
+            )
+            self.fixed_next = None
+        self.fixed_pending = None
 
     def issue_shared(
         self, at, indoor, outdoor, k, identity, *, revision, context_id,
@@ -281,7 +346,6 @@ class ForecastAudit:
         numeric = lambda x: isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
         if (
             at is None or reported is None or self.fixed_pending is not None
-            or (self.fixed_next is not None and at < self.fixed_next)
             or not 0 <= (at - reported).total_seconds() <= 300
             or not all(numeric(x) and -100 <= x <= 100 for x in (indoor, outdoor))
             or (command is None and candidate is not None)
@@ -291,6 +355,14 @@ class ForecastAudit:
             or not all(isinstance(x, str) and len(x) <= 2048 for x in identity)
             or (k is not None and (not numeric(k) or not _K_MIN < k < _K_MAX))
         ):
+            key = (reported, revision, context_id)
+            if self.fixed_pending is None and key != self._shared_rejected:
+                self._shared_rejected = key
+                self._shared_event("rejected", at, reason="issuance_inputs_unavailable")
+            return False
+        last = self._shared_last_issued
+        # A source switch cannot turn an older report into new evidence.
+        if last and reported <= _timestamp(last["source_reported"]):
             return False
         curves = []
         if k is not None:
@@ -316,7 +388,10 @@ class ForecastAudit:
             "mode": mode, "initial": indoor, "outdoor": outdoor,
             "curves": curves, "predictions": {h: None for h in (30, 60, 120)},
         }
-        self.fixed_next = at + timedelta(minutes=125)
+        self._shared_last_issued = {"identity": list(identity), "source_reported": reported.isoformat()}
+        self._shared_event("issued", at, issued=at.isoformat(), source_reported=reported.isoformat(),
+                           revision=revision, context_id=context_id, identity=list(identity), mode=mode,
+                           command=command, initial=indoor, outdoor=outdoor, curves=curves)
         return True
 
     def observe_shared(self, now, indoor, identity, *, command, mode, context_id):
@@ -328,16 +403,32 @@ class ForecastAudit:
         p = self.fixed_pending
         if p is None or p.get("kind") != "shared_command_response":
             return False
-        if (now is None or now < p["last"] or not isinstance(identity, (tuple, list)) or tuple(identity) != p["identity"]
-            or command != p["command"] or mode != p["mode"] or context_id != p["context_id"]):
-            self.fixed_pending = None
+        reason = None
+        if now is None or now < p["last"]:
+            reason = "clock_invalid_or_reordered"
+        elif not isinstance(identity, (tuple, list)) or tuple(identity) != p["identity"]:
+            reason = "source_changed"
+        elif mode != p["mode"]:
+            reason = "mode_changed"
+        elif context_id != p["context_id"]:
+            reason = "context_interrupted"
+        elif command != p["command"]:
+            reason = "command_changed"
+        if reason:
+            self.cancel_shared(reason, now)
             return False
         p["last"] = now
         reading = PilotPassive._report(indoor, now, temperature=True, max_age=None)
+        expiry = p["issued"] + timedelta(minutes=125)
         scored = False
-        for h in list(p["predictions"]):
-            due = p["issued"] + timedelta(minutes=h)
-            if reading and due <= reading[0] <= due + timedelta(minutes=5):
+        if reading and reading[0] > p.get("last_observed", p["issued"]):
+            eligible = [h for h in p["predictions"]
+                        if p["issued"] + timedelta(minutes=h) <= reading[0] <= expiry]
+            if eligible:
+                h = max(eligible)  # One actual endpoint is never independent evidence twice.
+                skipped = [n for n in eligible if n < h]
+                self._shared_counts["unavailable_horizons"] = min(
+                    self._shared_counts["unavailable_horizons"] + len(skipped), 2**63 - 1)
                 elapsed = (reading[0] - p["issued"]).total_seconds() / 3600
                 predictions = []
                 for curve in p["curves"]:
@@ -351,17 +442,25 @@ class ForecastAudit:
                 self.fixed_records.append({
                     **{key: p[key] for key in ("kind", "source_reported", "revision", "context_id", "command", "mode", "initial", "outdoor")},
                     "issued": p["issued"].isoformat(), "observed": reading[0].isoformat(),
-                    "horizon": h, "identity": list(identity), "curves": [dict(c) for c in p["curves"]],
+                    "horizon": h, "elapsed_minutes": elapsed * 60, "identity": list(identity),
+                    "curves": [dict(c) for c in p["curves"]],
                     "model_order": [c["name"] for c in p["curves"]], "predictions": predictions,
                     "actual": reading[1], "physical_measurement_time": "unknown", "passive_only": True,
                 })
                 self.fixed_records = self.fixed_records[-96:]
-                p["predictions"].pop(h)
+                for n in eligible:
+                    p["predictions"].pop(n)
+                p["last_observed"] = reading[0]
+                self._shared_event("evaluated", now, issued=p["issued"].isoformat(),
+                                   revision=p["revision"], observed=reading[0].isoformat(),
+                                   nominal_horizon=h, elapsed_minutes=elapsed * 60,
+                                   skipped_horizons=skipped)
                 scored = True
-            elif now > due + timedelta(minutes=5):
-                p["predictions"].pop(h)
         if not p["predictions"]:
             self.fixed_pending = None
+            self.fixed_next = None
+        elif now > expiry:
+            self.cancel_shared("no_endpoint_before_expiry", now)
         return scored
 
     def shared_summary(self, identity=None):
@@ -382,7 +481,9 @@ class ForecastAudit:
                 horizons[horizon] = {"count": len(items), "model_order": order, "mae": mae,
                     "persistence_mae": mae[-1],
                     "skill": [1 - error / mae[-1] for error in mae] if mae[-1] >= 0.02 else None,
-                    "status": "monitoring_passive" if len(orders) == 1 else "inconsistent_revision",
+                    "status": "reference_only" if order == ["persistence"] else "monitoring_passive" if len(orders) == 1 else "inconsistent_revision",
+                    "nominal_minimum_minutes": int(horizon),
+                    "elapsed_minutes_range": [min(r["elapsed_minutes"] for r in items), max(r["elapsed_minutes"] for r in items)],
                     "passive_only": True, "physical_measurement_time": "unknown",
                     "live_endpoint_basis": "accepted_numeric_changes_only",
                     "assumption": "constant_outdoor_and_empirical_command_coordinate"}
@@ -703,7 +804,7 @@ class ForecastAudit:
         self.plan_last_reason = reason
 
     def cancel_plans(self, reason):
-        self.fixed_pending = None
+        self.cancel_shared(reason)
         for plan in self.plan_pending:
             self._discard_plan(plan, reason)
         self.plan_pending = []
@@ -874,6 +975,7 @@ class ForecastAudit:
 
     def export_plan(self):
         return {
+            "shared_audit": self.shared_diagnostics(),
             "fixed_v1": [r for r in self.fixed_records if r.get("kind") != "shared_command_response"],
             "fixed_v2": [r for r in self.fixed_records if r.get("kind") == "shared_command_response"],
             "records": list(self.plan_records),
@@ -893,8 +995,49 @@ class ForecastAudit:
         self.plan_records = []
         self._plan_last_report = None
         now = _timestamp(now)
+        self._shared_counts = dict.fromkeys(self._shared_counts, 0)
+        self._shared_events = []
+        self._shared_sequence = 0
+        self._shared_last_issued = None
+        self._shared_rejected = None
         if not isinstance(payload, dict) or now is None:
             return
+        diag = payload.get("shared_audit")
+        if isinstance(diag, dict) and diag.get("version") == 1:
+            counts, events, sequence = diag.get("counts"), diag.get("events"), diag.get("sequence")
+            def counter(value):
+                return isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 2**63 - 1
+            valid = (isinstance(counts, dict) and counts.keys() == self._shared_counts.keys()
+                     and all(counter(v) for v in counts.values()) and counter(sequence)
+                     and isinstance(events, list) and len(events) <= 32)
+            if valid:
+                try:
+                    valid = len(json.dumps(events)) <= 65536
+                except (TypeError, ValueError):
+                    valid = False
+            last_sequence = -1
+            for event in events if valid else []:
+                at = _timestamp(event.get("at")) if isinstance(event, dict) else None
+                if (not isinstance(event, dict) or event.get("kind") not in self._shared_counts
+                    or not counter(event.get("sequence")) or not last_sequence < event["sequence"] <= sequence
+                    or (at is None and event.get("kind") != "rejected") or (at is not None and at > now)):
+                    valid = False
+                    break
+                last_sequence = event["sequence"]
+            if valid:
+                self._shared_counts = dict(counts)
+                self._shared_events = deepcopy(events)
+                self._shared_sequence = sequence
+                last = diag.get("last_issued")
+                if (isinstance(last, dict) and isinstance(last.get("identity"), list)
+                    and len(last["identity"]) == 2 and all(isinstance(v, str) and len(v) <= 2048 for v in last["identity"])
+                    and (at := _timestamp(last.get("source_reported"))) is not None and at <= now):
+                    self._shared_last_issued = deepcopy(last)
+                pending = diag.get("pending_horizons")
+                if (isinstance(pending, list) and pending and len(pending) <= 3
+                    and all(type(h) is int and h in (30, 60, 120) for h in pending) and len(set(pending)) == len(pending)):
+                    self._shared_counts["unavailable_horizons"] = min(self._shared_counts["unavailable_horizons"] + len(pending), 2**63 - 1)
+                    self._shared_event("cancelled", now, reason="restart_pending_not_resumed", horizons=pending)
         shared = payload.get("fixed_v2", [])
         if isinstance(shared, list) and len(shared) <= 96:
             candidates, conflicts = {}, set()
@@ -905,7 +1048,10 @@ class ForecastAudit:
                 h = row.get("horizon")
                 curves, predictions = row.get("curves"), row.get("predictions")
                 if (issued is None or observed is None or observed > now or h not in (30, 60, 120)
-                    or not issued + timedelta(minutes=h) <= observed <= issued + timedelta(minutes=h + 5)
+                    or not issued + timedelta(minutes=h) <= observed <= issued + timedelta(minutes=125 if "elapsed_minutes" in row else h + 5)
+                    or ("elapsed_minutes" in row and (isinstance(row["elapsed_minutes"], bool)
+                        or not isinstance(row["elapsed_minutes"], (int, float))
+                        or abs(row["elapsed_minutes"] - (observed - issued).total_seconds() / 60) > 1e-9))
                     or not isinstance(curves, list) or not 1 <= len(curves) <= 4
                     or not all(isinstance(c, dict) for c in curves)
                     or not isinstance(predictions, list) or len(predictions) != len(curves)
@@ -946,7 +1092,16 @@ class ForecastAudit:
                     del candidates[key]
                 else:
                     candidates[key] = expected
-            self.fixed_records = sorted(candidates.values(), key=lambda r: r["issued"])
+            rows = list(candidates.values())
+            overlapping = set()
+            for i, row in enumerate(rows):
+                for other in rows[i + 1:]:
+                    if row["issued"] != other["issued"] and (
+                        _timestamp(row["issued"]) < _timestamp(other["observed"])
+                        and _timestamp(other["issued"]) < _timestamp(row["observed"])
+                    ):
+                        overlapping.update((row["issued"], other["issued"]))
+            self.fixed_records = sorted((r for r in rows if r["issued"] not in overlapping), key=lambda r: r["issued"])
         fixed = payload.get("fixed_v1", [])
         if isinstance(fixed, list) and len(fixed) <= 96:
             seen = set()
