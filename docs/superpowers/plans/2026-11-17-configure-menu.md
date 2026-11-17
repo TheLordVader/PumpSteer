@@ -1,6 +1,6 @@
 # Four-page Configure Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Implement the approved four-page native Configure menu without changing settings semantics or control behavior.
 
@@ -38,15 +38,15 @@ storage remains flat. Existing validation scopes remain independent of the UI.
 methods delegate to `_async_step_page(page, user_input)`. `async_step_init` only
 shows the menu. `_PAGE_SECTIONS` owns fields; `_FORM_SECTIONS` assigns them once.
 
-- [ ] Add failing tests for menu, field coverage, no-write navigation, page saves,
+- [x] Add failing tests for menu, field coverage, no-write navigation, page saves,
   hidden recipient, explicit clearing, source verification, visible errors and
   telemetry-free TI. Run and observe feature failures.
-- [ ] Implement only page routing/scoping; retain `_fields`, `_validate_entities`
+- [x] Implement only page routing/scoping; retain `_fields`, `_validate_entities`
   and `_revoke_changed_verification` bodies. Adapt existing tests to real pages;
   cross-page assertions save sequentially, not through a retired all-page route.
-- [ ] Translate all page/section keys and shorten nonessential explanations.
+- [x] Translate all page/section keys and shorten nonessential explanations.
   Verify every field is translated on its single owning page.
-- [ ] Run all options/configure regressions; expect no failures. Commit feature.
+- [x] Run all options/configure regressions; expect no failures. Commit feature.
 
 ### Task 2: Native HA navigation and completion evidence
 
@@ -56,11 +56,11 @@ probe if needed; complete `docs/CONFIGURE_MENU_20261117.md`.
 **Interfaces:** Actual Core 2026.11.1 flow manager drives the four menu steps;
 native schema serialization/validation submits all currently displayed fields.
 
-- [ ] Add native checks of menu routing, cancelled/reopened flows, sequential
+- [x] Add native checks of menu routing, cancelled/reopened flows, sequential
   page saves, no-op and clearing, 94 fields and cross-page verification.
-- [ ] Run native tests without starting HA, calling services or writing production.
+- [x] Run native tests without starting HA, calling services or writing production.
   Expect PASS with actual HA Core 2026.11.1.
-- [ ] Run full regression, lint changed files, compare runtime files and validator
+- [x] Run full regression, lint changed files, compare runtime files and validator
   ASTs with base; expect green suite and no runtime differences.
-- [ ] Obtain one fresh read-only whole-branch review; address important findings
+- [x] Obtain one fresh read-only whole-branch review; address important findings
   with reproducing tests. Record test counts, limitations and final local commit.

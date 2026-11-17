@@ -2,6 +2,8 @@
 
 import asyncio
 import copy
+import json
+from pathlib import Path
 
 import pytest
 from test_configure_form import _frontend_values
@@ -177,3 +179,46 @@ def test_zone_recipient_can_be_intentionally_cleared_without_losing_prices(flow)
     del values["zone_notifications"]["zone_notify_service"]
     saved = visit(flow, "diagnostics", values)
     assert saved["data"] == {**flow.config_entry.options, "zone_notify_service": ""}
+
+
+def test_old_control_dialog_cannot_restore_verification_after_other_flow_source_change(
+    flow,
+):
+    flow.config_entry.options.update(
+        control_signals_verified=True,
+        thermal_compressor_entity="binary_sensor.old",
+    )
+    other = copy.copy(flow)
+    control = visit(flow, "control")
+    stale = _frontend_values(control["data_schema"])
+    diagnostics = visit(other, "diagnostics")
+    changed = _frontend_values(diagnostics["data_schema"])
+    changed["heat_pump_data"]["thermal_compressor_entity"] = "binary_sensor.new"
+    flow.config_entry.options = visit(other, "diagnostics", changed)["data"]
+    assert flow.config_entry.options["control_signals_verified"] is False
+
+    rejected = visit(flow, "control", stale)
+    assert rejected["type"] == "form"
+    assert rejected["errors"] == {"base": "configuration_changed"}
+    refreshed = _frontend_values(rejected["data_schema"])
+    assert refreshed["advanced_control"]["control_signals_verified"] is False
+    unchanged = visit(flow, "control", refreshed)
+    assert unchanged["data"] == flow.config_entry.options
+    assert unchanged["data"]["control_signals_verified"] is False
+
+
+@pytest.mark.parametrize(
+    "filename,word",
+    [
+        ("strings.json", "adaptive"),
+        ("translations/en.json", "adaptive"),
+        ("translations/sv.json", "adaptiv"),
+        ("translations/se.json", "adaptiv"),
+    ],
+)
+def test_external_heat_help_explains_its_existing_adaptive_effect(filename, word):
+    texts = json.loads((Path("custom_components/pumpsteer") / filename).read_text())
+    description = texts["options"]["step"]["thermal"]["sections"]["thermal"][
+        "data_description"
+    ]["external_heat_sources"]
+    assert word in description.lower()

@@ -1,3 +1,4 @@
+import copy
 import logging
 import re
 
@@ -268,6 +269,15 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
         displayed = {key.schema: _suggested_value(key) for key in fields}
         errors = {}
         draft = dict(current)
+        if (
+            user_input is not None
+            and hasattr(self, "_shown_configuration")
+            and self._shown_configuration != current
+        ):
+            # A stale page must not re-confirm a source changed in another flow.
+            # Refresh from saved values; none of the stale draft is committed.
+            errors["base"] = "configuration_changed"
+            user_input = None
         if user_input is not None:
             try:
                 submitted = {
@@ -413,6 +423,7 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
                     and not (name in errors or keys.intersection(errors))
                 },
             )
+        self._shown_configuration = copy.deepcopy(current)
         return self.async_show_form(
             step_id=page, data_schema=vol.Schema(schema), errors=form_errors
         )

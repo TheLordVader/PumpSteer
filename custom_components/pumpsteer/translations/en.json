@@ -100,17 +100,17 @@
       },
       "thermal": {
         "title": "Thermal Intelligence",
-        "description": "Optional passive observation. Internal heat-pump telemetry is not required.",
+        "description": "Passive TI needs no internal heat-pump telemetry. The external heat setting also applies to adaptive braking.",
         "sections": {
           "thermal": {
             "name": "Passive Thermal Intelligence",
-            "description": "Collects observations and evaluates forecasts without changing control.",
+            "description": "TI collection is passive. The possible external heat setting is shared with legacy adaptive learning.",
             "data": {
               "external_heat_sources": "Do you sometimes use an additional heat source?",
               "thermal_intelligence_enabled": "Thermal Intelligence (experimental diagnostics)"
             },
             "data_description": {
-              "external_heat_sources": "Indicates that external heat may occur, not that it is active now. Delivered heat is not measured.",
+              "external_heat_sources": "Indicates that external heat may occur, not that it is active now. Changing this resets legacy adaptive learning and may affect braking when adaptive control is enabled. Delivered heat is not measured.",
               "thermal_intelligence_enabled": "Collects observations and evaluates a passive model candidate. Does not by itself permit adaptive control or prove forecast skill."
             }
           }
@@ -337,7 +337,8 @@
       "control_signals_required": "Select the required operation sensors and verify their meanings and observation timestamp attribute. A shared changeover valve requires verified inversion of the radiator mode.",
       "control_balance_required": "Select a heat balance sensor and verify normalization. Scale must be nonzero, offset explicit, and 0 < first limit < maximum limit.",
       "invalid_numeric_alarm": "Enter a valid numeric normal value before confirming its meaning.",
-      "external_heat_alias": "External heat needs its own activity signal, not the heat pump compressor, auxiliary heat or operating-mode signal."
+      "external_heat_alias": "External heat needs its own activity signal, not the heat pump compressor, auxiliary heat or operating-mode signal.",
+      "configuration_changed": "Settings changed in another dialog. Your changes were not saved. Current values are now shown; review them before saving again."
     }
   },
   "entity": {

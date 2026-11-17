@@ -49,6 +49,5 @@ def test_english_options_and_swedish_alias_are_synchronized():
             "translations/se.json",
         )
     ]
-    for page in ("zone_1", "zone_2", "zone_3", "zone_4"):
-        assert texts[0][page] == texts[1][page]
-        assert texts[2][page] == texts[3][page]
+    assert texts[0] == texts[1]
+    assert texts[2] == texts[3]

@@ -14,7 +14,9 @@ Use native menus, selectors and expandable sections. The single sections on the
 TI and control pages open expanded. Basic and diagnostic detail sections remain
 collapsed. There is no nested menu or section, custom frontend or UI enable flag.
 Opening a page does not enable a feature. Basic operation and passive TI require
-no manufacturer-specific integration or internal heat-pump telemetry.
+no manufacturer-specific integration or internal heat-pump telemetry. The existing
+external-heat setting is shared with legacy adaptive learning; changing it can
+reset that learning and affect braking if adaptive control is already in use.
 
 Each field has one editing location. Storage remains flat; entity IDs, selectors,
 defaults, `options` precedence, unknown stored keys and implicit defaults survive.
@@ -24,8 +26,12 @@ Validation and source/calibration verification rules remain unchanged.
 
 Save finishes the selected page and the flow. To edit another category, reopen
 Configure. Cancel/back does not save edits. There is no multi-page pending draft.
-Errors retain the page draft; an error concerning another page is presented as
-an actionable visible error rather than a nonexistent field.
+Validation errors retain the page draft; an error concerning another page is
+presented as an actionable visible error rather than a nonexistent field. If
+another dialog changes configuration while the page is open, saving is refused:
+the page refreshes from current saved values and explicitly says the old draft
+was not saved. Review and submit again. This conservative conflict check also
+applies to unrelated concurrent configuration changes; it avoids stale consent.
 
 Labels use generic roles such as space-heating mode, DHW mode, compressor,
 supply/return and electrical power/energy. Neither manufacturer identity nor
@@ -36,10 +42,10 @@ Keep concise safety explanations; remove repeated general instructions.
 
 - Menu and page tests were run against the original single-form version and failed
   before implementation. The native manager probe likewise fails on `89cdc7a`.
-- **1,689 tests passed** in the Python 3.14 / HA Core 2026.11.1 environment
-  (42.90 seconds); also 1,689 passed in the existing Python 3.13 test environment.
+- **1,694 tests passed** in the Python 3.14 / HA Core 2026.11.1 environment
+  (40.08 seconds); before the final review fixes, 1,689 also passed in the existing Python 3.13 test environment.
   The ordinary unit suite uses the project's HA stubs. Native checks are separate.
-- **138 focused options/UI tests passed**, covering page ownership, no-op saves,
+- **143 focused options/UI tests passed**, covering page ownership, no-op saves,
   independent flags, intentional clearing, retained drafts and visible errors.
 - The actual **HA Core 2026.11.1 OptionsFlowManager** passes menu selection,
   cancellation, re-opening, unchanged saves on all pages and sequential page saves.
@@ -50,6 +56,11 @@ Keep concise safety explanations; remove repeated general instructions.
 - All three safety-verification families remain unchanged on no-op and are revoked
   on the same source/calibration changes as before. Cross-page validation errors
   appear as visible form errors and do not write partial options.
+- An independent read-only review found that an old control dialog could restore
+  verification revoked by a source change in another open flow. A reproducing
+  unit test and actual two-flow native test failed first; the transient conflict
+  guard now prevents this. No new stored state or duplicated verification logic.
+  The shared external-heat option's effect is also explicitly explained.
 - Basic operation/passive TI configuration has no required internal heat-pump
   signal. Selecting a diagnostic source does not grant control permission.
 - `_fields`, `_validate_entities` and `_revoke_changed_verification` are

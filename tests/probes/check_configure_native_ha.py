@@ -312,6 +312,29 @@ async def main():
             print(
                 "PASS: three verification families preserved/revoked correctly; cross-page errors visible"
             )
+
+            entry.options = copy.deepcopy(trusted)
+            control = await open_page("control")
+            stale = initial_data(serialized(control))
+            diagnostics = await open_page("diagnostics")
+            changed = initial_data(serialized(diagnostics))
+            changed["heat_pump_data"]["thermal_compressor_entity"] = (
+                "binary_sensor.example_compressor2"
+            )
+            assert (await save(diagnostics, changed))["type"] == "create_entry"
+            assert entry.options["control_signals_verified"] is False
+            before = copy.deepcopy(entry.options)
+            rejected = await save(control, stale)
+            assert rejected["type"] == "form"
+            assert rejected["errors"] == {"base": "configuration_changed"}
+            assert entry.options == before
+            fresh = initial_data(serialized(rejected))
+            assert fresh["advanced_control"]["control_signals_verified"] is False
+            assert (await save(rejected, fresh))["type"] == "create_entry"
+            assert entry.options == before
+            print(
+                "PASS: two concurrent native flows cannot restore revoked source verification"
+            )
         assert calls.await_count == 0
         assert not list(Path(directory).rglob(".storage/*"))
         print(

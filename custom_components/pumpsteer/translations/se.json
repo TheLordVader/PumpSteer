@@ -104,17 +104,17 @@
       },
       "thermal": {
         "title": "Thermal Intelligence",
-        "description": "Valfri passiv insamling. Intern värmepumpstelemetri krävs inte.",
+        "description": "Passiv TI behöver inte intern värmepumpstelemetri. Valet om extra värmekällor gäller även adaptiv bromsning.",
         "sections": {
           "thermal": {
             "name": "Passiv Thermal Intelligence",
-            "description": "Samlar observationer och utvärderar prognoser utan att ändra styrningen.",
+            "description": "TI-insamlingen är passiv. Uppgiften om möjliga extra värmekällor delas med den äldre adaptiva inlärningen.",
             "data": {
               "external_heat_sources": "Extra värmekällor kan förekomma",
               "thermal_intelligence_enabled": "Samla termisk evidens passivt"
             },
             "data_description": {
-              "external_heat_sources": "Anger att extra värme kan förekomma, inte att den är på nu. Tillförd värme mäts inte.",
+              "external_heat_sources": "Anger att extra värme kan förekomma, inte att den är på nu. Ändring återställer den äldre adaptiva inlärningen och kan påverka bromsningen om adaptiv styrning används. Tillförd värme mäts inte.",
               "thermal_intelligence_enabled": "Samlar observationer och utvärderar en passiv modellkandidat. Ger inte i sig tillstånd till adaptiv styrning och bevisar inte prognosnytta."
             }
           }
@@ -341,7 +341,8 @@
       "control_signals_required": "Välj nödvändiga driftgivare och verifiera deras betydelse samt attributet för observationstid. En gemensam växelventil kräver verifierad invertering av radiatorläget.",
       "control_balance_required": "Välj värmebalansgivare och verifiera normalisering. Skalan måste vara skild från noll, offset angiven och 0 < första gränsen < maximalgränsen.",
       "invalid_numeric_alarm": "Ange ett giltigt numeriskt normalvärde innan du bekräftar tolkningen.",
-      "external_heat_alias": "Extra värmekälla måste ha en egen driftsignal, inte värmepumpens kompressor-, tillskotts- eller värmelägessignal."
+      "external_heat_alias": "Extra värmekälla måste ha en egen driftsignal, inte värmepumpens kompressor-, tillskotts- eller värmelägessignal.",
+      "configuration_changed": "Inställningarna har ändrats i en annan dialog. Dina ändringar sparades inte. Aktuella värden visas nu; kontrollera dem innan du sparar igen."
     }
   },
   "entity": {
