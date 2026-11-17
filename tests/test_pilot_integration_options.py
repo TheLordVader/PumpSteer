@@ -107,7 +107,7 @@ def test_safe_and_recovery_never_turn_on_assistance(monkeypatch):
 def test_both_settings_have_english_and_swedish_text():
     root = Path(__file__).parents[1] / "custom_components/pumpsteer"
     for name in ("strings.json", "translations/en.json", "translations/sv.json"):
-        section = json.loads((root / name).read_text())["options"]["step"]["init"][
+        section = json.loads((root / name).read_text())["options"]["step"]["thermal"][
             "sections"
         ]["thermal"]
         for key in ("thermal_intelligence_enabled", "external_heat_sources"):

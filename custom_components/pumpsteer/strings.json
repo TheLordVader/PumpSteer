@@ -20,16 +20,23 @@
   "options": {
     "step": {
       "init": {
-        "title": "PumpSteer – configure",
-        "description": "Select temperature and price sources. Expand only the sections you need. Existing values are retained in collapsed sections; changes apply only when you save.",
-        "data": {
-          "indoor_temp_entity": "Indoor temperature sensor",
-          "real_outdoor_entity": "Outdoor temperature sensor",
-          "electricity_price_entity": "Electricity price today",
-          "price_tomorrow_entity": "Electricity price tomorrow",
-          "weather_entity": "Weather forecast (optional)"
+        "title": "Configure",
+        "menu_options": {
+          "basic": "Basic settings",
+          "thermal": "Thermal Intelligence",
+          "diagnostics": "Diagnostics and energy",
+          "control": "Advanced control"
         },
-        "data_description": {},
+        "menu_option_descriptions": {
+          "basic": "Temperature sources, electricity prices, outputs and notifications.",
+          "thermal": "Optional passive collection without changing control.",
+          "diagnostics": "Optional signals and extra temperature zones. Control permissions are verified separately under Advanced control.",
+          "control": "Separate functions that may affect control. Sources are selected under Diagnostics and energy."
+        }
+      },
+      "basic": {
+        "title": "Basic settings",
+        "description": "Temperature sources, electricity prices, outputs and notifications.",
         "sections": {
           "temperature_sources": {
             "name": "Additional temperature sensors and freshness",
@@ -71,22 +78,116 @@
           },
           "notifications": {
             "name": "Notifications",
-            "description": "Price notifications and zone alerts have separate recipients. An empty zone recipient inherits the shared zone recipient, not the price notification recipient.",
+            "description": "Optional price notifications.",
             "data": {
               "notification_cooldown_minutes": "Repeat notification cooldown",
               "notification_level": "Price notification level",
-              "notify_service": "Notification service (optional, e.g. notify.mobile_app_my_phone)",
-              "zone_notify_service": "Notification service (notify.name)"
+              "notify_service": "Notification service (optional, e.g. notify.mobile_app_my_phone)"
             },
             "data_description": {
               "notification_cooldown_minutes": "Minimum time between repeated alerts of the same type. Choose 0 for no limit; 60 minutes is recommended. Braking and preheating have independent timers.",
               "notification_level": "Choose all price alerts, braking only, or none. The existing Notifications switch remains the master on/off control.",
               "notify_service": "Leave empty to use persistent notifications in the HA sidebar instead."
             }
+          }
+        },
+        "data": {
+          "indoor_temp_entity": "Indoor temperature sensor",
+          "real_outdoor_entity": "Outdoor temperature sensor",
+          "electricity_price_entity": "Electricity price today",
+          "price_tomorrow_entity": "Electricity price tomorrow",
+          "weather_entity": "Weather forecast (optional)"
+        }
+      },
+      "thermal": {
+        "title": "Thermal Intelligence",
+        "description": "Optional passive observation. Internal heat-pump telemetry is not required.",
+        "sections": {
+          "thermal": {
+            "name": "Passive Thermal Intelligence",
+            "description": "Collects observations and evaluates forecasts without changing control.",
+            "data": {
+              "external_heat_sources": "Do you sometimes use an additional heat source?",
+              "thermal_intelligence_enabled": "Thermal Intelligence (experimental diagnostics)"
+            },
+            "data_description": {
+              "external_heat_sources": "Indicates that external heat may occur, not that it is active now. Delivered heat is not measured.",
+              "thermal_intelligence_enabled": "Collects observations and evaluates a passive model candidate. Does not by itself permit adaptive control or prove forecast skill."
+            }
+          }
+        }
+      },
+      "diagnostics": {
+        "title": "Diagnostics and energy",
+        "description": "Optional signals and extra temperature zones. Control permissions are verified separately under Advanced control.",
+        "sections": {
+          "heat_pump_data": {
+            "name": "Heat pump signals and energy metering",
+            "description": "Optional signals for diagnostics and heating-operation evidence. Compressor activity, electrical power and sent commands do not prove delivered space heat. Leave unused fields empty.",
+            "data": {
+              "thermal_alarm_entity": "Active heat pump fault",
+              "thermal_alarm_numeric_normal": "Normal value for numeric fault",
+              "thermal_alarm_numeric_verified": "I verified the numeric fault meaning",
+              "thermal_aux_heat_entity": "Auxiliary electric heat",
+              "thermal_balance_entity": "Internal heat balance",
+              "thermal_balance_kind": "Heat balance type",
+              "thermal_brine_in_entity": "Brine inlet",
+              "thermal_brine_out_entity": "Brine outlet",
+              "thermal_brine_pump_entity": "Brine pump",
+              "thermal_circulation_pump_entity": "Space-heating circulation (optional)",
+              "thermal_compressor_entity": "Compressor status (optional)",
+              "thermal_detection_method": "Heating detection method",
+              "thermal_energy_entities": "Cumulative energy meters (optional)",
+              "thermal_external_heat_entity": "Verified external heater activity (optional)",
+              "thermal_heat_activity_entity": "Verified heat delivery to the home (optional)",
+              "thermal_heating_mode_entity": "Verified space-heating mode (optional)",
+              "thermal_heating_mode_inverted": "Space-heating mode means off",
+              "thermal_hot_water_mode_entity": "Verified hot-water mode (optional)",
+              "thermal_power_entity": "Heat-pump electrical power (optional)",
+              "thermal_return_temp_entity": "Return temperature (optional)",
+              "thermal_supply_target_entity": "Supply temperature target",
+              "thermal_supply_temp_entity": "Space-heating supply temperature (optional)",
+              "thermal_supply_threshold": "Supply temperature indicator threshold"
+            },
+            "data_description": {
+              "thermal_alarm_entity": "Choose a binary or numeric fault signal. A numeric signal stays inactive until you verify its normal value and that every other finite value means an active fault. Notifications use the regular recipient or a persistent HA notification.",
+              "thermal_alarm_numeric_normal": "For a numeric sensor only: enter the verified normal value. Use 0 only if your heat pump documentation confirms it. Empty means an unknown fault state.",
+              "thermal_alarm_numeric_verified": "For a numeric sensor only: confirm that the chosen value is normal and every other finite value means an active fault. A changed sensor or normal value requires confirmation again.",
+              "thermal_aux_heat_entity": "Binary signal for active auxiliary electric heat.",
+              "thermal_balance_entity": "Select a numeric sensor if available. No scale or sign convention is assumed.",
+              "thermal_balance_kind": "Choose degree minutes or integral only when the meaning is verified; otherwise choose raw value. No start threshold is assumed.",
+              "thermal_brine_in_entity": "Temperature sensor for incoming brine.",
+              "thermal_brine_out_entity": "Temperature sensor for outgoing brine.",
+              "thermal_brine_pump_entity": "Binary brine pump status. This alone does not prove heat delivery.",
+              "thermal_circulation_pump_entity": "Binary heating circulation pump status. This alone does not prove heat delivery.",
+              "thermal_compressor_entity": "Compressor status alone does not prove space heating.",
+              "thermal_detection_method": "Automatic uses qualified signals and reports uncertainty. Manual retains the supply threshold.",
+              "thermal_energy_entities": "Select one total meter or independent meters that can be summed. Selected meters take precedence for energy diagnostics. Only complete counter intervals with one unambiguous price are priced. Report gaps above 24 hours are excluded.",
+              "thermal_external_heat_entity": "Leave empty without a reliable signal. On must mean the external heater is actually active, not the heat pump compressor or a thermostat request. Requires a documented verified source observation time in the control timestamp attribute (default measurement_time), at most five minutes old. HA report time or MQTT republication is insufficient. Active or unknown selected signals pause adaptive use and require new checks; temperature monitoring works without this sensor.",
+              "thermal_heat_activity_entity": "A binary sensor whose on means measured heat delivery to the home and off means none. Compressor status or hot-water mode alone is insufficient. Report times do not establish physical measurement time.",
+              "thermal_heating_mode_entity": "Verified space-heating mode is required for the manual supply indicator, but not for passive temperature observation.",
+              "thermal_heating_mode_inverted": "Enable only when off means space-heating mode. Unknown or stale status suspends learning.",
+              "thermal_hot_water_mode_entity": "On means verified hot-water operation. Heat learning pauses when on or unknown; unknown periods are not classified.",
+              "thermal_power_entity": "Measured electrical input for the equipment being analysed. Energy is estimated from HA reports; it is not delivered heat.",
+              "thermal_return_temp_entity": "Used only together with other qualified signals.",
+              "thermal_supply_target_entity": "The heat pump supply temperature target, not a room temperature or alarm threshold.",
+              "thermal_supply_temp_entity": "Choose a radiator-circuit sensor. It can be observed passively without a space-heating mode signal. Temperature does not prove heat delivery.",
+              "thermal_supply_threshold": "Set for your heating system. An unsuitable threshold can misclassify heat."
+            }
+          },
+          "zone_notifications": {
+            "name": "Zone notifications",
+            "description": "Shared zone alarm recipient. Price notifications have a separate recipient.",
+            "data": {
+              "zone_notify_service": "Notification service (notify.name)"
+            },
+            "data_description": {
+              "zone_notify_service": "Optional. Each zone may override this recipient. No push is sent when both are empty."
+            }
           },
           "zone_1": {
             "name": "Additional temperature zone 1",
-            "description": "Monitoring only, even with alerts enabled. The zone does not change a thermostat setpoint or valve opening and does not control central heat production. A cold zone does not affect the shared PI controller.",
+            "description": "Temperature monitoring and optional alarms only. Does not change heating control.",
             "data": {
               "zone_1_alarm_delay_minutes": "Zone 1 – Alarm delay (minutes)",
               "zone_1_climate": "Zone 1 – Thermostat (optional)",
@@ -112,7 +213,7 @@
           },
           "zone_2": {
             "name": "Additional temperature zone 2",
-            "description": "Monitoring only, even with alerts enabled. The zone does not change a thermostat setpoint or valve opening and does not control central heat production. A cold zone does not affect the shared PI controller.",
+            "description": "Temperature monitoring and optional alarms only. Does not change heating control.",
             "data": {
               "zone_2_alarm_delay_minutes": "Zone 2 – Alarm delay (minutes)",
               "zone_2_climate": "Zone 2 – Thermostat (optional)",
@@ -138,7 +239,7 @@
           },
           "zone_3": {
             "name": "Additional temperature zone 3",
-            "description": "Monitoring only, even with alerts enabled. The zone does not change a thermostat setpoint or valve opening and does not control central heat production. A cold zone does not affect the shared PI controller.",
+            "description": "Temperature monitoring and optional alarms only. Does not change heating control.",
             "data": {
               "zone_3_alarm_delay_minutes": "Zone 3 – Alarm delay (minutes)",
               "zone_3_climate": "Zone 3 – Thermostat (optional)",
@@ -164,7 +265,7 @@
           },
           "zone_4": {
             "name": "Additional temperature zone 4",
-            "description": "Monitoring only, even with alerts enabled. The zone does not change a thermostat setpoint or valve opening and does not control central heat production. A cold zone does not affect the shared PI controller.",
+            "description": "Temperature monitoring and optional alarms only. Does not change heating control.",
             "data": {
               "zone_4_alarm_delay_minutes": "Zone 4 – Alarm delay (minutes)",
               "zone_4_climate": "Zone 4 – Thermostat (optional)",
@@ -187,75 +288,13 @@
               "zone_4_profile": "Choose manually which of the two zone temperature thresholds is used.",
               "zone_4_threshold": "Temperature threshold for Maintenance heat. Default 5 °C. Used only when this profile is selected."
             }
-          },
-          "thermal": {
-            "name": "Thermal Intelligence and adaptive braking",
-            "description": "Passive collection and adaptive control are separate features. For a passive trial enable Thermal Intelligence and leave adaptive braking off. Expanding this section does not enable anything.",
-            "data": {
-              "adaptive_braking_enabled": "Adaptive price braking",
-              "external_heat_sources": "Do you sometimes use an additional heat source?",
-              "thermal_intelligence_enabled": "Thermal Intelligence (experimental diagnostics)"
-            },
-            "data_description": {
-              "adaptive_braking_enabled": "Separate permission for legacy adaptive control. Leave off for a passive field trial. Evidence collection does not enable this setting.",
-              "external_heat_sources": "Yes means extra heat may sometimes occur, not that it is on now. Adaptive braking can learn from stable temperature response, rejects clearly disturbed periods and needs later independent checks. Undetected extra heat remains a possible confound; this does not measure heat flow.",
-              "thermal_intelligence_enabled": "Collects observations and evaluates a passive model candidate. Does not by itself permit adaptive control or prove forecast skill."
-            }
-          },
-          "heat_pump_data": {
-            "name": "Heat pump signals and energy metering",
-            "description": "Optional signals for diagnostics and heating-operation evidence. Compressor activity, electrical power and sent commands do not prove delivered space heat. Leave unused fields empty.",
-            "data": {
-              "thermal_alarm_entity": "Active heat pump fault",
-              "thermal_alarm_numeric_normal": "Normal value for numeric fault",
-              "thermal_alarm_numeric_verified": "I verified the numeric fault meaning",
-              "thermal_aux_heat_entity": "Auxiliary electric heat",
-              "thermal_balance_entity": "Internal heat balance",
-              "thermal_balance_kind": "Heat balance type",
-              "thermal_brine_in_entity": "Brine inlet",
-              "thermal_brine_out_entity": "Brine outlet",
-              "thermal_brine_pump_entity": "Brine pump",
-              "thermal_circulation_pump_entity": "Heating circulation pump",
-              "thermal_compressor_entity": "Compressor status (optional)",
-              "thermal_detection_method": "Heating detection method",
-              "thermal_energy_entities": "Cumulative energy meters (optional)",
-              "thermal_external_heat_entity": "Verified external heater activity (optional)",
-              "thermal_heat_activity_entity": "Verified heat delivery to the home (optional)",
-              "thermal_heating_mode_entity": "Verified radiator heating mode (optional)",
-              "thermal_heating_mode_inverted": "Radiator mode is off",
-              "thermal_hot_water_mode_entity": "Verified hot-water mode (optional)",
-              "thermal_power_entity": "Heat-pump electrical power (optional)",
-              "thermal_return_temp_entity": "Return temperature (optional)",
-              "thermal_supply_target_entity": "Supply temperature target",
-              "thermal_supply_temp_entity": "Radiator supply temperature (optional)",
-              "thermal_supply_threshold": "Supply temperature indicator threshold"
-            },
-            "data_description": {
-              "thermal_alarm_entity": "Choose a binary or numeric fault signal. A numeric signal stays inactive until you verify its normal value and that every other finite value means an active fault. Notifications use the regular recipient or a persistent HA notification.",
-              "thermal_alarm_numeric_normal": "For a numeric sensor only: enter the verified normal value. Use 0 only if your heat pump documentation confirms it. Empty means an unknown fault state.",
-              "thermal_alarm_numeric_verified": "For a numeric sensor only: confirm that the chosen value is normal and every other finite value means an active fault. A changed sensor or normal value requires confirmation again.",
-              "thermal_aux_heat_entity": "Binary signal for active auxiliary electric heat.",
-              "thermal_balance_entity": "Select a numeric sensor if available. No scale or sign convention is assumed.",
-              "thermal_balance_kind": "Choose degree minutes or integral only when the meaning is verified; otherwise choose raw value. No start threshold is assumed.",
-              "thermal_brine_in_entity": "Temperature sensor for incoming brine.",
-              "thermal_brine_out_entity": "Temperature sensor for outgoing brine.",
-              "thermal_brine_pump_entity": "Binary brine pump status. This alone does not prove heat delivery.",
-              "thermal_circulation_pump_entity": "Binary heating circulation pump status. This alone does not prove heat delivery.",
-              "thermal_compressor_entity": "Compressor status alone does not prove radiator heating.",
-              "thermal_detection_method": "Automatic uses qualified signals and reports uncertainty. Manual retains the supply threshold.",
-              "thermal_energy_entities": "Select one total meter or independent meters that can be summed. Selected meters take precedence for energy diagnostics. Only complete counter intervals with one unambiguous price are priced. Report gaps above 24 hours are excluded.",
-              "thermal_external_heat_entity": "Leave empty without a reliable signal. On must mean the external heater is actually active, not the heat pump compressor or a thermostat request. Requires a documented verified source observation time in the control timestamp attribute (default measurement_time), at most five minutes old. HA report time or MQTT republication is insufficient. Active or unknown selected signals pause adaptive use and require new checks; temperature monitoring works without this sensor.",
-              "thermal_heat_activity_entity": "A binary sensor whose on means measured heat delivery to the home and off means none. Compressor status or hot-water mode alone is insufficient. Report times do not establish physical measurement time.",
-              "thermal_heating_mode_entity": "Verified radiator mode is required for the manual supply indicator, but not for passive temperature observation.",
-              "thermal_heating_mode_inverted": "Enable only when off means radiator mode. Unknown or stale status suspends learning.",
-              "thermal_hot_water_mode_entity": "On means verified hot-water operation. Heat learning pauses when on or unknown; unknown periods are not classified.",
-              "thermal_power_entity": "Measured electrical input for the equipment being analysed. Energy is estimated from HA reports; it is not delivered heat.",
-              "thermal_return_temp_entity": "Used only together with other qualified signals.",
-              "thermal_supply_target_entity": "The heat pump supply temperature target, not a room temperature or alarm threshold.",
-              "thermal_supply_temp_entity": "Choose a radiator-circuit sensor. It can be observed passively without a radiator mode signal. Temperature does not prove heat delivery.",
-              "thermal_supply_threshold": "Set for your heating system. An unsuitable threshold can misclassify heat."
-            }
-          },
+          }
+        }
+      },
+      "control": {
+        "title": "Advanced control",
+        "description": "Separate functions that may affect control. Sources are selected under Diagnostics and energy.",
+        "sections": {
           "advanced_control": {
             "name": "Advanced control functions",
             "description": "These features can affect control. Keep existing choices unless signal meaning and measurement time have been verified. Changing a source or calibration revokes its previous safety verification.",
@@ -268,10 +307,11 @@
               "control_balance_scale": "Verified scale factor including sign",
               "control_balance_verified": "I have verified normalization and deficit limits",
               "control_measurement_time_attribute": "Verified observation timestamp attribute",
-              "control_signals_verified": "I have verified signal meanings and observation times"
+              "control_signals_verified": "I have verified signal meanings and observation times",
+              "adaptive_braking_enabled": "Adaptive price braking"
             },
             "data_description": {
-              "control_aux_preheat_limit": "Off by default. Removes only the extra preheat boost when auxiliary heat is verified active for radiator heating. Does not change the pump’s auxiliary or emergency heating and does not guarantee energy savings.",
+              "control_aux_preheat_limit": "Off by default. Removes only the extra preheat boost when auxiliary heat is verified active for space heating. Does not change the pump’s auxiliary or emergency heating and does not guarantee energy savings.",
               "control_balance_brake_limit": "Changes only existing price braking, not PI or the heat pump’s own controller. A deficit does not prove current heat delivery. Old data is not used; the output returns toward Base using the existing ramp times.",
               "control_balance_deficit_full": "Must exceed the first limit. Between the limits braking is released gradually; at and above this limit at most 50 percent is released.",
               "control_balance_deficit_threshold": "A verified positive limit in normalized units. Braking is unchanged at and below this limit.",
@@ -279,7 +319,8 @@
               "control_balance_scale": "No guessed default. Must be finite and nonzero; may be negative according to the verified sign convention.",
               "control_balance_verified": "Confirm only with verified evidence for your sensor and heat pump. No decoding or universal sign convention is assumed automatically.",
               "control_measurement_time_attribute": "The same attribute is read from every participating sensor. Its value must be a verified observation time as a timezone-aware ISO timestamp or Unix seconds. Without reliable source evidence the intervention cannot activate; do not copy HA report time into another attribute.",
-              "control_signals_verified": "Confirm only after verifying signal meanings and observation times. The time must be a physical measurement time or the receipt time of a new measurement message whose link to that specific value is verified by the source documentation. Receipt time is not physical measurement time. HA last_reported, MQTT republication and online status are not sufficient by themselves. Applies to both limiters."
+              "control_signals_verified": "Confirm only after verifying signal meanings and observation times. The time must be a physical measurement time or the receipt time of a new measurement message whose link to that specific value is verified by the source documentation. Receipt time is not physical measurement time. HA last_reported, MQTT republication and online status are not sufficient by themselves. Applies to both limiters.",
+              "adaptive_braking_enabled": "Separate permission for legacy adaptive control. Leave off for a passive field trial. Evidence collection does not enable this setting."
             }
           }
         }

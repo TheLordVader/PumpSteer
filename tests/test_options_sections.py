@@ -207,7 +207,11 @@ def test_section_translations_cover_all_fields_and_zone_help():
     import json
     from pathlib import Path
 
-    from custom_components.pumpsteer.options_flow import _BASIC_FIELDS, _FORM_SECTIONS
+    from custom_components.pumpsteer.options_flow import (
+        _BASIC_FIELDS,
+        _FORM_SECTIONS,
+        _PAGE_SECTIONS,
+    )
 
     for path in [
         Path("custom_components/pumpsteer/strings.json"),
@@ -217,16 +221,20 @@ def test_section_translations_cover_all_fields_and_zone_help():
         ],
     ]:
         steps = json.loads(path.read_text())["options"]["step"]
-        assert set(steps) == {"init"}
-        form = steps["init"]
-        assert set(form["data"]) == _BASIC_FIELDS
-        assert set(form["sections"]) == set(_FORM_SECTIONS)
-        for name, keys in _FORM_SECTIONS.items():
-            section = form["sections"][name]
-            assert set(section["data"]) == keys
-            assert section["name"] and section["description"]
+        assert set(steps) == {"init", *_PAGE_SECTIONS}
+        assert set(steps["init"]["menu_options"]) == set(_PAGE_SECTIONS)
+        for page, sections in _PAGE_SECTIONS.items():
+            form = steps[page]
+            assert set(form.get("data", {})) == (
+                _BASIC_FIELDS if page == "basic" else set()
+            )
+            assert set(form["sections"]) == set(sections)
+            for name in sections:
+                section = form["sections"][name]
+                assert set(section["data"]) == _FORM_SECTIONS[name]
+                assert section["name"] and section["description"]
         for i in range(1, 5):
-            assert form["sections"][f"zone_{i}"]["data_description"][
+            assert steps["diagnostics"]["sections"][f"zone_{i}"]["data_description"][
                 f"zone_{i}_notify_service"
             ]
 
@@ -733,7 +741,7 @@ def test_control_section_has_translated_safety_explanations():
         translations = json.loads(
             (Path("custom_components/pumpsteer") / filename).read_text()
         )
-        section = translations["options"]["step"]["init"]["sections"][
+        section = translations["options"]["step"]["control"]["sections"][
             "advanced_control"
         ]
         assert section["description"]

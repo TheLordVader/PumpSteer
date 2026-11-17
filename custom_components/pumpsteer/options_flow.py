@@ -201,16 +201,34 @@ _REQUIRED_FIELDS = _BASIC_FIELDS - {"weather_entity"}
 _FORM_SECTIONS = {
     "temperature_sources": _GROUPS["temperature_sources"] | _GROUPS["report_age"],
     "outputs": _GROUPS["ohmigo_settings"] | _GROUPS["generic_output"],
-    "notifications": _GROUPS["notifications"] | _GROUPS["zone_notifications"],
+    "notifications": _GROUPS["notifications"],
+    "zone_notifications": _GROUPS["zone_notifications"],
     **{f"zone_{i}": _GROUPS[f"zone_{i}"] for i in range(1, 5)},
-    "thermal": _GROUPS["thermal"],
+    "thermal": _GROUPS["thermal"] - {"adaptive_braking_enabled"},
     "heat_pump_data": (
         _GROUPS["heat_sensors"]
         | _GROUPS["heat_details"]
         | _GROUPS["heat_pump_telemetry"]
         | _GROUPS["energy"]
     ),
-    "advanced_control": _GROUPS["extended_control"] | _GROUPS["advanced_control"],
+    "advanced_control": (
+        _GROUPS["extended_control"]
+        | _GROUPS["advanced_control"]
+        | {"adaptive_braking_enabled"}
+    ),
+}
+_PAGE_SECTIONS = {
+    "basic": ("temperature_sources", "outputs", "notifications"),
+    "thermal": ("thermal",),
+    "diagnostics": (
+        "heat_pump_data",
+        "zone_notifications",
+        "zone_1",
+        "zone_2",
+        "zone_3",
+        "zone_4",
+    ),
+    "control": ("advanced_control",),
 }
 
 
@@ -225,7 +243,25 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
     """Handle options flow for PumpSteer."""
 
     async def async_step_init(self, user_input=None):
-        """Configure in one form; section names never enter stored options."""
+        """Choose one independent settings page; navigation never writes options."""
+        return self.async_show_menu(step_id="init", menu_options=list(_PAGE_SECTIONS))
+
+    async def async_step_basic(self, user_input=None):
+        return await self._async_step_page("basic", user_input)
+
+    async def async_step_thermal(self, user_input=None):
+        return await self._async_step_page("thermal", user_input)
+
+    async def async_step_diagnostics(self, user_input=None):
+        return await self._async_step_page("diagnostics", user_input)
+
+    async def async_step_control(self, user_input=None):
+        return await self._async_step_page("control", user_input)
+
+    async def _async_step_page(self, page, user_input):
+        """Save only displayed fields, retaining the complete existing configuration."""
+        sections = {name: _FORM_SECTIONS[name] for name in _PAGE_SECTIONS[page]}
+        top_fields = _BASIC_FIELDS if page == "basic" else set()
         entry = self.config_entry
         current = {**entry.data, **entry.options}
         fields = self._fields(current)
@@ -235,11 +271,9 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
         if user_input is not None:
             try:
                 submitted = {
-                    key: value
-                    for key, value in user_input.items()
-                    if key in _BASIC_FIELDS
+                    key: value for key, value in user_input.items() if key in top_fields
                 }
-                for name, keys in _FORM_SECTIONS.items():
+                for name, keys in sections.items():
                     if name not in user_input:
                         continue  # An omitted section cannot clear anything.
                     values = user_input[name]
@@ -255,7 +289,8 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
                                 [] if key == "thermal_energy_entities" else ""
                             )
                 if (
-                    _REQUIRED_FIELDS <= user_input.keys()
+                    page == "basic"
+                    and _REQUIRED_FIELDS <= user_input.keys()
                     and "weather_entity" not in user_input
                     and current.get("weather_entity")
                 ):
@@ -352,16 +387,20 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
                 value for key, value in suggested_fields.items() if key.schema == name
             )
             for name in _BASIC_ORDER
+            if name in top_fields
         }
         form_errors = {}
         for key, error in errors.items():
             section = next(
-                (name for name, keys in _FORM_SECTIONS.items() if key in keys), None
+                (name for name, keys in sections.items() if key in keys), None
             )
             # Native HA displays section errors above the expanded section;
             # arbitrary nested field paths are not rendered by ha-form.
-            form_errors.setdefault(section or key, error)
-        for name, keys in _FORM_SECTIONS.items():
+            target = section or (
+                key if key in top_fields or key in sections or key == "base" else "base"
+            )
+            form_errors.setdefault(target, error)
+        for name, keys in sections.items():
             section_fields = {
                 key: value
                 for key, value in suggested_fields.items()
@@ -369,10 +408,13 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
             }
             schema[vol.Optional(name)] = data_entry_flow.section(
                 vol.Schema(section_fields),
-                {"collapsed": not (name in errors or keys.intersection(errors))},
+                {
+                    "collapsed": len(sections) > 1
+                    and not (name in errors or keys.intersection(errors))
+                },
             )
         return self.async_show_form(
-            step_id="init", data_schema=vol.Schema(schema), errors=form_errors
+            step_id=page, data_schema=vol.Schema(schema), errors=form_errors
         )
 
     @staticmethod

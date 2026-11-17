@@ -1,4 +1,4 @@
-"""One Configure submission must preserve options and their provenance."""
+"""Each Configure page preserves options and their provenance."""
 
 import asyncio
 from types import SimpleNamespace
@@ -43,8 +43,8 @@ def flow(monkeypatch):
     return instance
 
 
-def test_configure_opens_one_form_with_five_basic_fields(flow):
-    result = asyncio.run(flow.async_step_init())
+def test_basic_page_opens_with_five_basic_fields(flow):
+    result = asyncio.run(flow.async_step_basic())
     assert result["type"] == "form"
     schema = result["data_schema"]
     assert list(schema)[:5] == [
@@ -56,12 +56,12 @@ def test_configure_opens_one_form_with_five_basic_fields(flow):
     ]
     assert "temperature_sources" in schema
     assert "outputs" in schema
-    assert "thermal" in schema
+    assert "thermal" not in schema
 
 
 def test_omitted_sections_keep_all_values_and_data_precedence(flow):
     original = dict(flow.config_entry.options)
-    result = asyncio.run(flow.async_step_init(dict(flow.config_entry.data)))
+    result = asyncio.run(flow.async_step_basic(dict(flow.config_entry.data)))
     assert result["type"] == "create_entry"
     assert result["data"] == original
     assert "indoor_temp_entity" not in result["data"]
@@ -70,7 +70,7 @@ def test_omitted_sections_keep_all_values_and_data_precedence(flow):
 def test_one_thermal_edit_keeps_sources_outputs_and_unknown_options(flow):
     original = dict(flow.config_entry.options)
     result = asyncio.run(
-        flow.async_step_init(
+        flow.async_step_thermal(
             {
                 "thermal": {
                     "thermal_intelligence_enabled": True,
@@ -87,7 +87,7 @@ def test_one_thermal_edit_keeps_sources_outputs_and_unknown_options(flow):
 def test_explicit_clear_overrides_data_without_clearing_omitted_sections(flow):
     flow.config_entry.data["thermal_power_entity"] = "sensor.old_power"
     result = asyncio.run(
-        flow.async_step_init(
+        flow.async_step_diagnostics(
             {
                 "heat_pump_data": {
                     "thermal_power_entity": "",
@@ -103,7 +103,7 @@ def test_explicit_clear_overrides_data_without_clearing_omitted_sections(flow):
 
 def test_error_retains_edits_in_other_sections_and_expands_error_section(flow):
     result = asyncio.run(
-        flow.async_step_init(
+        flow.async_step_basic(
             {
                 "temperature_sources": {"indoor_temp_entity_2": "sensor.room"},
                 "notifications": {"notify_service": "notify.new"},
@@ -116,7 +116,7 @@ def test_error_retains_edits_in_other_sections_and_expands_error_section(flow):
     assert section.options["collapsed"] is False
     # A corrected retry must not require re-entering another section's edit.
     corrected = asyncio.run(
-        flow.async_step_init(
+        flow.async_step_basic(
             {
                 "temperature_sources": {"indoor_temp_entity_2": "sensor.other"},
                 "notifications": {"notify_service": "notify.new"},
@@ -145,9 +145,9 @@ def test_unchanged_full_frontend_submission_does_not_materialize_defaults(flow):
     original_options = dict(flow.config_entry.options)
     flow.config_entry.options["notification_cooldown_minutes"] = 60
     original_options["notification_cooldown_minutes"] = 60
-    opened = asyncio.run(flow.async_step_init())
+    opened = asyncio.run(flow.async_step_basic())
     submitted = _frontend_values(opened["data_schema"])
-    saved = asyncio.run(flow.async_step_init(submitted))
+    saved = asyncio.run(flow.async_step_basic(submitted))
     assert saved["type"] == "create_entry"
     assert saved["data"] == original_options
     assert flow.config_entry.data == original_data
@@ -156,10 +156,10 @@ def test_unchanged_full_frontend_submission_does_not_materialize_defaults(flow):
 
 
 def test_clearing_optional_selector_in_full_form_preserves_its_neighbours(flow):
-    opened = asyncio.run(flow.async_step_init())
+    opened = asyncio.run(flow.async_step_basic())
     submitted = _frontend_values(opened["data_schema"])
     del submitted["temperature_sources"]["indoor_temp_entity_2"]
-    saved = asyncio.run(flow.async_step_init(submitted))
+    saved = asyncio.run(flow.async_step_basic(submitted))
     assert saved["type"] == "create_entry"
     assert saved["data"]["indoor_temp_entity_2"] == ""
     assert saved["data"]["indoor_temp_weight_1"] == 70
@@ -169,7 +169,7 @@ def test_clearing_optional_selector_in_full_form_preserves_its_neighbours(flow):
 
 def test_validation_retry_displays_all_edits_including_cleared_values(flow):
     result = asyncio.run(
-        flow.async_step_init(
+        flow.async_step_basic(
             {
                 "temperature_sources": {"indoor_temp_entity_2": "sensor.room"},
                 "notifications": {"notify_service": "notify.new"},
@@ -182,7 +182,7 @@ def test_validation_retry_displays_all_edits_including_cleared_values(flow):
     assert retry["notifications"]["notify_service"] == "notify.new"
     assert "ohmigo_entity" not in retry["outputs"]
     retry["temperature_sources"]["indoor_temp_entity_2"] = "sensor.corrected"
-    saved = asyncio.run(flow.async_step_init(retry))
+    saved = asyncio.run(flow.async_step_basic(retry))
     assert saved["type"] == "create_entry"
     assert saved["data"]["notify_service"] == "notify.new"
     assert saved["data"]["ohmigo_entity"] == ""
@@ -190,7 +190,7 @@ def test_validation_retry_displays_all_edits_including_cleared_values(flow):
 
 @pytest.mark.parametrize("value", ["", None])
 def test_explicit_empty_optional_entity_is_saved_as_disabled(flow, value):
-    result = asyncio.run(flow.async_step_init({"outputs": {"ohmigo_entity": value}}))
+    result = asyncio.run(flow.async_step_basic({"outputs": {"ohmigo_entity": value}}))
     assert result["type"] == "create_entry"
     assert result["data"]["ohmigo_entity"] == ""
     assert result["data"]["modbus_payload_template"] == ""
@@ -198,7 +198,7 @@ def test_explicit_empty_optional_entity_is_saved_as_disabled(flow, value):
 
 def test_unknown_input_cannot_write_arbitrary_options(flow):
     saved = asyncio.run(
-        flow.async_step_init(
+        flow.async_step_thermal(
             {
                 "not_a_section": {"indoor_temp_entity": "sensor.fake"},
                 "thermal": {"unknown_setting": True},
@@ -211,41 +211,41 @@ def test_unknown_input_cannot_write_arbitrary_options(flow):
 def test_select_suggests_string_but_preserves_stored_integer_on_noop(flow):
     # HA's select validator requires a string even for legacy numeric storage.
     flow.config_entry.options["notification_cooldown_minutes"] = 60
-    form = asyncio.run(flow.async_step_init())
+    form = asyncio.run(flow.async_step_basic())
     submitted = _frontend_values(form["data_schema"])
     assert submitted["notifications"]["notification_cooldown_minutes"] == "60"
-    saved = asyncio.run(flow.async_step_init(submitted))
+    saved = asyncio.run(flow.async_step_basic(submitted))
     assert saved["data"]["notification_cooldown_minutes"] == 60
 
 
 def test_first_heat_signal_cannot_turn_displayed_automatic_into_verified(flow):
-    form = asyncio.run(flow.async_step_init())
+    form = asyncio.run(flow.async_step_diagnostics())
     submitted = _frontend_values(form["data_schema"])
     assert submitted["heat_pump_data"]["thermal_detection_method"] == "automatic"
     submitted["heat_pump_data"].update(
         thermal_heat_activity_entity="binary_sensor.shared",
         thermal_compressor_entity="binary_sensor.shared",
     )
-    result = asyncio.run(flow.async_step_init(submitted))
+    result = asyncio.run(flow.async_step_diagnostics(submitted))
     assert result["type"] == "form"
     assert result["errors"]["heat_pump_data"] == "heat_signal_alias"
 
 
 def test_first_supply_signal_keeps_the_detection_method_shown_in_the_form(flow):
-    form = asyncio.run(flow.async_step_init())
+    form = asyncio.run(flow.async_step_diagnostics())
     submitted = _frontend_values(form["data_schema"])
     submitted["heat_pump_data"].update(
         thermal_supply_temp_entity="sensor.supply",
         thermal_heating_mode_entity="binary_sensor.heating",
     )
-    result = asyncio.run(flow.async_step_init(submitted))
+    result = asyncio.run(flow.async_step_diagnostics(submitted))
     assert result["type"] == "create_entry"
     assert result["data"]["thermal_detection_method"] == "automatic"
 
 
 def test_errors_target_visible_native_form_elements(flow):
     result = asyncio.run(
-        flow.async_step_init(
+        flow.async_step_basic(
             {
                 "temperature_sources": {"indoor_temp_entity_2": "sensor.room"},
             }
