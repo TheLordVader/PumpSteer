@@ -32,6 +32,45 @@ supply/return and electrical power/energy. Neither manufacturer identity nor
 entity names imply physical heat delivery, polarity or a physical timestamp.
 Keep concise safety explanations; remove repeated general instructions.
 
-Verification results will be recorded here before completion. Existing isolated
-tests use HA stubs; actual Core 2026.11.1 flow/selector/schema checks run separately
-without starting Home Assistant or contacting production.
+## Verified behavior
+
+- Menu and page tests were run against the original single-form version and failed
+  before implementation. The native manager probe likewise fails on `89cdc7a`.
+- **1,689 tests passed** in the Python 3.14 / HA Core 2026.11.1 environment
+  (42.90 seconds); also 1,689 passed in the existing Python 3.13 test environment.
+  The ordinary unit suite uses the project's HA stubs. Native checks are separate.
+- **138 focused options/UI tests passed**, covering page ownership, no-op saves,
+  independent flags, intentional clearing, retained drafts and visible errors.
+- The actual **HA Core 2026.11.1 OptionsFlowManager** passes menu selection,
+  cancellation, re-opening, unchanged saves on all pages and sequential page saves.
+  Native selectors/schema serialization submit all 94 existing fields exactly once.
+- Ohmigo, relay, Generic Output, energy selection and zone-recipient clearing do
+  not change fields on another page. No-op saves preserve integer/select display
+  conversions, implicit defaults, unknown options and `data`/`options` ownership.
+- All three safety-verification families remain unchanged on no-op and are revoked
+  on the same source/calibration changes as before. Cross-page validation errors
+  appear as visible form errors and do not write partial options.
+- Basic operation/passive TI configuration has no required internal heat-pump
+  signal. Selecting a diagnostic source does not grant control permission.
+- `_fields`, `_validate_entities` and `_revoke_changed_verification` are
+  AST-identical to `89cdc7a`. Only OptionsFlow routing/scoping and UI translations
+  changed under `custom_components`; control, outputs, entities, Store and manifest
+  remain byte-identical. No stored-key migration or new dependencies.
+
+Run the full unit regression using the project's existing test dependencies:
+
+```sh
+python -m pytest -q
+```
+
+Run the native probe in the isolated HA Core 2026.11.1 Python environment:
+
+```sh
+python tests/probes/check_configure_native_ha.py
+```
+
+The native probe instantiates HA objects but never starts HA, loads output
+platforms, calls services, reloads an integration or writes Store. Only integration
+loader lookup and config-entry persistence are synthetic boundaries. This checks
+the actual backend navigation/schema contract; it is not a browser screenshot or
+a production test. Production installation and first-load checks require separate GO.
