@@ -43,7 +43,7 @@ Keep concise safety explanations; remove repeated general instructions.
 - Menu and page tests were run against the original single-form version and failed
   before implementation. The native manager probe likewise fails on `89cdc7a`.
 - **1,694 tests passed** in the Python 3.14 / HA Core 2026.11.1 environment
-  (40.08 seconds); before the final review fixes, 1,689 also passed in the existing Python 3.13 test environment.
+  (40.63 seconds); before the final review fixes, 1,689 also passed in the existing Python 3.13 test environment.
   The ordinary unit suite uses the project's HA stubs. Native checks are separate.
 - **143 focused options/UI tests passed**, covering page ownership, no-op saves,
   independent flags, intentional clearing, retained drafts and visible errors.

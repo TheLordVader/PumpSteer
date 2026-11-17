@@ -31,7 +31,7 @@
         },
         "menu_option_descriptions": {
           "basic": "Temperaturgivare, elpriser, styrutgångar och notiser.",
-          "thermal": "Valfri, passiv insamling utan ändrad styrning.",
+          "thermal": "Valfri insamling och prognosutvärdering.",
           "diagnostics": "Valfria signaler och extra temperaturzoner. Styrbehörigheter verifieras separat under Avancerad styrning.",
           "control": "Separata funktioner som kan påverka styrningen. Källor väljs under Diagnostik och energi."
         }
