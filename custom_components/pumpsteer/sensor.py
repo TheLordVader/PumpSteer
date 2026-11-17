@@ -1814,51 +1814,49 @@ class PumpSteerSensor(RestoreEntity):
     def _thermal_cycle(self, at, indoor, outdoor, fake_temp, mode, extra, cfg):
         """Capture a bounded source snapshot without affecting the control result."""
         import hashlib
-        indoor_state = self._temperature_state(cfg, "indoor_temp_entity")
-        indoor_attrs = getattr(indoor_state, "attributes", {}) or {}
-        used = indoor_attrs.get("source_temperatures_used")
-        weights = indoor_attrs.get("source_weights")
-        if isinstance(used, dict):
-            source_ids = list(used)
-        else:
-            source_ids = [
-                cfg.get(key)
-                for key in (
-                    "indoor_temp_entity",
-                    "indoor_temp_entity_2",
-                    "indoor_temp_entity_3",
-                )
-                if cfg.get(key)
-            ]
-        configured_indices = {
-            cfg.get(key): index
-            for index, key in enumerate(
-                (
-                    "indoor_temp_entity",
-                    "indoor_temp_entity_2",
-                    "indoor_temp_entity_3",
-                ),
-                start=1,
+
+        # Availability changes the Base aggregate, not the identity of the
+        # thermometer RTM was fitted to. Keep missing components explicit so
+        # existing TI quality/segment gates pause learning without losing history.
+        source_ids = [
+            cfg.get(key)
+            for key in (
+                "indoor_temp_entity", "indoor_temp_entity_2", "indoor_temp_entity_3"
             )
-            if cfg.get(key)
-        }
+        ]
+        multisource = any(source_ids[1:])
+        specs = [
+            (entity, safe_float(cfg.get(f"indoor_temp_weight_{index}", 1.0)))
+            for index, entity in enumerate(source_ids, start=1)
+        ]
+        if not multisource:
+            # A user-supplied aggregate is a different contract: its declared
+            # underlying provenance must still invalidate a changed thermometer.
+            inside = self._temperature_state(cfg, "indoor_temp_entity")
+            attrs = getattr(inside, "attributes", {}) or {}
+            used = attrs.get("source_temperatures_used")
+            weights = attrs.get("source_weights")
+            if isinstance(used, dict):
+                specs = [
+                    (entity, safe_float(weights.get(entity))
+                     if isinstance(weights, dict) else specs[0][1])
+                    for entity in used
+                ]
+        cutoff = self._temperature_cutoff(cfg)
         sources = []
-        for entity in source_ids:
-            if not isinstance(entity, str):
+        seen = set()
+        for entity, weight in specs:
+            if not isinstance(entity, str) or not entity or entity in seen:
+                continue
+            seen.add(entity)
+            if multisource and (weight is None or weight <= 0):
                 continue
             state = self.hass.states.get(entity)
-            if isinstance(weights, dict):
-                weight = safe_float(weights.get(entity))
-            else:
-                configured_weight = safe_float(
-                    cfg.get(f"indoor_temp_weight_{configured_indices.get(entity, 1)}", 1.0)
-                )
-                weight = configured_weight
             sources.append(
                 {
                     "entity": entity,
                     "weight": weight,
-                    "value": safe_float(getattr(state, "state", None)),
+                    "value": get_temperature(self.hass, entity, cutoff),
                     "reported_at": getattr(state, "last_reported", None),
                 }
             )

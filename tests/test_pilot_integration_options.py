@@ -2061,7 +2061,7 @@ def test_status_sensor_translations_survive_upstream_integration():
         assert "outdoor_temperature" in sensor
 
 
-def test_shared_chain_uses_control_weighted_temperature_and_resets_on_source_loss(
+def test_shared_chain_preserves_model_and_pauses_on_temporary_source_loss(
     monkeypatch,
 ):
     from datetime import datetime, timedelta, timezone
@@ -2105,6 +2105,7 @@ def test_shared_chain_uses_control_weighted_temperature_and_resets_on_source_los
     assert attrs["indoor_temperature"] == 20.5
     assert attrs["temperature_sources"]["indoor_coverage"] == "reduced"
     assert captured == []
-    assert runtime.latest_observation["indoor_c"] == 20.5
-    assert runtime.model is not previous_model
+    assert runtime.latest_observation["indoor_c"] == 22.0
+    assert runtime.model is previous_model
+    assert runtime._interruptions[-1]["reason"] == "required_temperature_missing_or_stale"
     assert sensor._pilot is None or sensor._pilot.manager.model.history == []

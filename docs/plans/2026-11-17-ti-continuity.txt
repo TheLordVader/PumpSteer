@@ -1,0 +1,14 @@
+Authorized scope: base19e642f, isolated fix/ti-source-continuity-20261117.
+1. Red tests: same restored model survives temporary3->1->3 Base availability;
+   TI still rejects unavailable/restored/foreign-unit/stale/missing-time sources.
+2. Change _thermal_cycle: stable configured source list/weights, same
+   qualification helpers, explicit missing values. True configuration changes
+   retain current reset behavior. No model/Store/control changes. Review found
+   a live held command survived temperature interruptions; clear command and
+   active capture in existing _interrupt, with red/green live-command tests.
+3. Private copy of existing operator: deadline wait within last cron interval,
+   bounded runtime verification, original request preserved; fake-clock tests.
+4. Existing real archives: verify retained model/grid with corrected adapter.
+   Review current HeatOperation/telemetry and forecast loss; no new signals/model.
+5. Targeted tests, full regression, internal review, local commit only.
+Private scripts/data remain outside Git; old live operator/package untouched.

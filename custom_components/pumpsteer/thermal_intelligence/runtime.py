@@ -530,6 +530,9 @@ class ThermalIntelligence:
 
     def _interrupt(self, reason: str, at: datetime | None = None) -> None:
         at = at or datetime.now(UTC)
+        # A boundary retains completed evidence, never held command continuity.
+        self._last_command = None
+        self._active_cycle = None
         if reason != self._last_interruption:
             self._count("interruptions", at)
             if reason == "restart":
