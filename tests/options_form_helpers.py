@@ -1,4 +1,4 @@
-"""Submit existing validation fixtures through their real native Configure page.
+"""Submit existing validation fixtures through their real native Configure form.
 
 The old fixtures cover smaller field groups than the new visual sections. Include
 existing values from the rest of that visual section, just as HA does, so a fixture
@@ -10,7 +10,6 @@ from custom_components.pumpsteer.options_flow import (
     _CLEARABLE,
     _FORM_SECTIONS,
     _GROUPS,
-    _PAGE_SECTIONS,
 )
 
 
@@ -21,11 +20,7 @@ async def submit_group(flow, group, values=None):
     section = next(
         (name for name, owned in _FORM_SECTIONS.items() if keys <= owned), None
     )
-    page = next(
-        (page for page, sections in _PAGE_SECTIONS.items() if section in sections),
-        "basic",
-    )
-    step = getattr(flow, f"async_step_{page}")
+    step = flow.async_step_init
     if values is None:
         result = await step()
         if section:

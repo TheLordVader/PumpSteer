@@ -1,4 +1,4 @@
-"""Native HA 2026.11.1 menu/OptionsFlow/schema probe, entirely synthetic.
+"""Native HA 2026.11.1 OptionsFlow/schema probe, entirely synthetic.
 
 No HA start, services, integration reload or Store writes. Only entry persistence
 and the integration-loader boundary are faked; routing/validation are actual HA.
@@ -26,7 +26,6 @@ ROOT = Path(
 sys.path.insert(0, str(ROOT))
 from custom_components.pumpsteer.config_flow import PumpSteerConfigFlow
 
-PAGES = ("basic", "thermal", "diagnostics", "control")
 DATA = {
     "indoor_temp_entity": "sensor.example_indoor",
     "real_outdoor_entity": "sensor.example_outdoor",
@@ -117,14 +116,9 @@ async def main():
         ):
             hass.states.async_set(entity, "20")
 
-        async def open_page(page):
-            menu = await manager.async_init(entry.entry_id)
-            assert menu["type"] == "menu", menu
-            assert list(menu["menu_options"]) == list(PAGES)
-            form = await manager.async_configure(
-                menu["flow_id"], {"next_step_id": page}
-            )
-            assert form["type"] == "form" and form["step_id"] == page
+        async def open_form():
+            form = await manager.async_init(entry.entry_id)
+            assert form["type"] == "form" and form["step_id"] == "init"
             return form
 
         async def save(form, payload):
@@ -134,45 +128,40 @@ async def main():
             patch.object(config_entries, "_async_get_flow_handler", handler),
             patch.object(type(hass.services), "async_call", calls),
         ):
-            fields = []
-            for page in PAGES:
-                form = await open_page(page)
-                for field in serialized(form):
-                    fields.extend(
-                        child["name"] for child in field["schema"]
-                    ) if field.get("type") == "expandable" else fields.append(
-                        field["name"]
-                    )
-                manager.async_abort(form["flow_id"])
+            form = await open_form()
+            schema = serialized(form)
+            assert [field["name"] for field in schema[:5]] == list(DATA)
+            assert all(
+                field["type"] == "expandable" and field["expanded"] is False
+                for field in schema[5:]
+            )
+            fields = [field["name"] for field in schema[:5]] + [
+                child["name"] for section in schema[5:] for child in section["schema"]
+            ]
             assert len(fields) == len(set(fields)) == 94
+            manager.async_abort(form["flow_id"])
             assert entry.options == OPTIONS and not updates
-            print(
-                "PASS: actual OptionsFlowManager navigation/cancel; all 94 fields exactly once"
-            )
+            print("PASS: actual OptionsFlowManager opens one form with all 94 fields")
 
-            for page in PAGES:
-                form = await open_page(page)
-                assert (await save(form, initial_data(serialized(form))))[
-                    "type"
-                ] == "create_entry"
-                assert entry.options == OPTIONS
-            assert not updates and entry.data == DATA
-            print(
-                "PASS: all unchanged native page saves preserve values, types and implicit defaults"
-            )
+            form = await open_form()
+            assert (await save(form, initial_data(serialized(form))))[
+                "type"
+            ] == "create_entry"
+            assert entry.options == OPTIONS and not updates and entry.data == DATA
+            print("PASS: unchanged save preserves values, types and implicit defaults")
 
             expected = copy.deepcopy(OPTIONS)
-            for page, section, key, value in (
-                ("basic", "notifications", "notify_service", "notify.example_prices"),
-                ("thermal", "thermal", "thermal_intelligence_enabled", True),
+            for section, key, value in (
+                ("notifications", "notify_service", "notify.example_prices"),
+                ("thermal", "thermal_intelligence_enabled", True),
                 (
-                    "diagnostics",
+
                     "zone_notifications",
                     "zone_notify_service",
                     "notify.other_zones",
                 ),
             ):
-                form = await open_page(page)
+                form = await open_form()
                 payload = initial_data(serialized(form))
                 payload[section][key] = value
                 assert (await save(form, payload))["type"] == "create_entry"
@@ -184,18 +173,18 @@ async def main():
                 for k in entry.options
             )
             print(
-                "PASS: sequential saves retain previous pages; passive TI needs no internal telemetry"
+                "PASS: sequential saves retain previous sections; passive TI needs no internal telemetry"
             )
 
-            for page, section, key in (
-                ("basic", "outputs", "ohmigo_entity"),
-                ("basic", "outputs", "ohmigo_relay_entity"),
-                ("basic", "outputs", "modbus_service"),
-                ("basic", "outputs", "modbus_payload_template"),
-                ("diagnostics", "zone_notifications", "zone_notify_service"),
+            for section, key in (
+                ("outputs", "ohmigo_entity"),
+                ("outputs", "ohmigo_relay_entity"),
+                ("outputs", "modbus_service"),
+                ("outputs", "modbus_payload_template"),
+                ("zone_notifications", "zone_notify_service"),
             ):
                 entry.options = copy.deepcopy(expected)
-                form = await open_page(page)
+                form = await open_form()
                 payload = initial_data(serialized(form))
                 del payload[section][key]
                 assert (await save(form, payload))["type"] == "create_entry"
@@ -205,17 +194,17 @@ async def main():
                 "thermal_energy_entities": ["sensor.example_energy"],
             }
             hass.states.async_set("sensor.example_energy", "100")
-            form = await open_page("diagnostics")
+            form = await open_form()
             payload = initial_data(serialized(form))
             payload["heat_pump_data"]["thermal_energy_entities"] = []
             assert (await save(form, payload))["type"] == "create_entry"
             assert entry.options == {**expected, "thermal_energy_entities": []}
             print(
-                "PASS: independent Ohmigo/GOS/zone clearing and empty energy list preserve other pages"
+                "PASS: independent Ohmigo/GOS/zone clearing and empty energy list preserve other sections"
             )
 
             entry.options = copy.deepcopy(expected)
-            form = await open_page("basic")
+            form = await open_form()
             payload = initial_data(serialized(form))
             payload["temperature_sources"]["indoor_temp_entity_2"] = DATA[
                 "indoor_temp_entity"
@@ -264,23 +253,23 @@ async def main():
                 if key.endswith("_entity") and isinstance(value, str):
                     hass.states.async_set(value, "20")
             hass.states.async_set("binary_sensor.example_compressor2", "on")
-            for page, section, key, value, flag in (
+            for section, key, value, flag in (
                 (
-                    "diagnostics",
+
                     "heat_pump_data",
                     "thermal_compressor_entity",
                     "binary_sensor.example_compressor2",
                     "control_signals_verified",
                 ),
                 (
-                    "control",
+
                     "advanced_control",
                     "control_balance_scale",
                     -2,
                     "control_balance_verified",
                 ),
                 (
-                    "diagnostics",
+
                     "heat_pump_data",
                     "thermal_alarm_numeric_normal",
                     1,
@@ -288,35 +277,35 @@ async def main():
                 ),
             ):
                 entry.options = copy.deepcopy(trusted)
-                form = await open_page(page)
+                form = await open_form()
                 assert (await save(form, initial_data(serialized(form))))[
                     "type"
                 ] == "create_entry"
                 assert entry.options == trusted
-                form = await open_page(page)
+                form = await open_form()
                 payload = initial_data(serialized(form))
                 payload[section][key] = value
                 assert (await save(form, payload))["type"] == "create_entry"
                 assert entry.options == {**trusted, key: value, flag: False}
             entry.options = copy.deepcopy(trusted)
-            form = await open_page("diagnostics")
+            form = await open_form()
             payload = initial_data(serialized(form))
             del payload["heat_pump_data"]["thermal_heating_mode_entity"]
             rejected = await save(form, payload)
             assert (
                 rejected["type"] == "form"
-                and rejected["errors"]["base"] == "control_signals_required"
+                and rejected["errors"]["advanced_control"] == "control_signals_required"
             )
             assert entry.options == trusted
             manager.async_abort(rejected["flow_id"])
             print(
-                "PASS: three verification families preserved/revoked correctly; cross-page errors visible"
+                "PASS: three verification families preserved/revoked correctly; cross-section errors visible"
             )
 
             entry.options = copy.deepcopy(trusted)
-            control = await open_page("control")
+            control = await open_form()
             stale = initial_data(serialized(control))
-            diagnostics = await open_page("diagnostics")
+            diagnostics = await open_form()
             changed = initial_data(serialized(diagnostics))
             changed["heat_pump_data"]["thermal_compressor_entity"] = (
                 "binary_sensor.example_compressor2"

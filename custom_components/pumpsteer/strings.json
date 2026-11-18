@@ -20,23 +20,13 @@
   "options": {
     "step": {
       "init": {
-        "title": "Configure",
-        "menu_options": {
-          "basic": "Basic settings",
-          "thermal": "Thermal Intelligence",
-          "diagnostics": "Diagnostics and energy",
-          "control": "Advanced control"
+        "data": {
+          "indoor_temp_entity": "Indoor temperature sensor",
+          "real_outdoor_entity": "Outdoor temperature sensor",
+          "electricity_price_entity": "Electricity price today",
+          "price_tomorrow_entity": "Electricity price tomorrow",
+          "weather_entity": "Weather forecast (optional)"
         },
-        "menu_option_descriptions": {
-          "basic": "Temperature sources, electricity prices, outputs and notifications.",
-          "thermal": "Optional observations and forecast evaluation.",
-          "diagnostics": "Optional signals and extra temperature zones. Control permissions are verified separately under Advanced control.",
-          "control": "Separate functions that may affect control. Sources are selected under Diagnostics and energy."
-        }
-      },
-      "basic": {
-        "title": "Basic settings",
-        "description": "Temperature sources, electricity prices, outputs and notifications.",
         "sections": {
           "temperature_sources": {
             "name": "Additional temperature sensors and freshness",
@@ -89,38 +79,7 @@
               "notification_level": "Choose all price alerts, braking only, or none. The existing Notifications switch remains the master on/off control.",
               "notify_service": "Leave empty to use persistent notifications in the HA sidebar instead."
             }
-          }
-        },
-        "data": {
-          "indoor_temp_entity": "Indoor temperature sensor",
-          "real_outdoor_entity": "Outdoor temperature sensor",
-          "electricity_price_entity": "Electricity price today",
-          "price_tomorrow_entity": "Electricity price tomorrow",
-          "weather_entity": "Weather forecast (optional)"
-        }
-      },
-      "thermal": {
-        "title": "Thermal Intelligence",
-        "description": "Passive TI needs no internal heat-pump telemetry. The external heat setting also applies to adaptive braking.",
-        "sections": {
-          "thermal": {
-            "name": "Passive Thermal Intelligence",
-            "description": "TI collection is passive. The possible external heat setting is shared with legacy adaptive learning.",
-            "data": {
-              "external_heat_sources": "Do you sometimes use an additional heat source?",
-              "thermal_intelligence_enabled": "Thermal Intelligence (experimental diagnostics)"
-            },
-            "data_description": {
-              "external_heat_sources": "Indicates that external heat may occur, not that it is active now. Changing this resets legacy adaptive learning and may affect braking when adaptive control is enabled. Delivered heat is not measured.",
-              "thermal_intelligence_enabled": "Collects observations and evaluates a passive model candidate. Does not by itself permit adaptive control or prove forecast skill."
-            }
-          }
-        }
-      },
-      "diagnostics": {
-        "title": "Diagnostics and energy",
-        "description": "Optional signals and extra temperature zones. Control permissions are verified separately under Advanced control.",
-        "sections": {
+          },
           "heat_pump_data": {
             "name": "Heat pump signals and energy metering",
             "description": "Optional signals for diagnostics and heating-operation evidence. Compressor activity, electrical power and sent commands do not prove delivered space heat. Leave unused fields empty.",
@@ -288,13 +247,19 @@
               "zone_4_profile": "Choose manually which of the two zone temperature thresholds is used.",
               "zone_4_threshold": "Temperature threshold for Maintenance heat. Default 5 °C. Used only when this profile is selected."
             }
-          }
-        }
-      },
-      "control": {
-        "title": "Advanced control",
-        "description": "Separate functions that may affect control. Sources are selected under Diagnostics and energy.",
-        "sections": {
+          },
+          "thermal": {
+            "name": "Passive Thermal Intelligence",
+            "description": "TI collection is passive. The possible external heat setting is shared with legacy adaptive learning.",
+            "data": {
+              "external_heat_sources": "Do you sometimes use an additional heat source?",
+              "thermal_intelligence_enabled": "Thermal Intelligence (experimental diagnostics)"
+            },
+            "data_description": {
+              "external_heat_sources": "Indicates that external heat may occur, not that it is active now. Changing this resets legacy adaptive learning and may affect braking when adaptive control is enabled. Delivered heat is not measured.",
+              "thermal_intelligence_enabled": "Collects observations and evaluates a passive model candidate. Does not by itself permit adaptive control or prove forecast skill."
+            }
+          },
           "advanced_control": {
             "name": "Advanced control functions",
             "description": "These features can affect control. Keep existing choices unless signal meaning and measurement time have been verified. Changing a source or calibration revokes its previous safety verification.",

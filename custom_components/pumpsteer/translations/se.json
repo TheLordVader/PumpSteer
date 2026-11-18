@@ -22,23 +22,13 @@
   "options": {
     "step": {
       "init": {
-        "title": "Konfigurera",
-        "menu_options": {
-          "basic": "Grundinställningar",
-          "thermal": "Thermal Intelligence",
-          "diagnostics": "Diagnostik och energi",
-          "control": "Avancerad styrning"
+        "data": {
+          "indoor_temp_entity": "Inomhusgivare",
+          "real_outdoor_entity": "Utomhusgivare",
+          "electricity_price_entity": "Elpris idag",
+          "price_tomorrow_entity": "Elpris imorgon",
+          "weather_entity": "Väderprognos (valfri)"
         },
-        "menu_option_descriptions": {
-          "basic": "Temperaturgivare, elpriser, styrutgångar och notiser.",
-          "thermal": "Valfri insamling och prognosutvärdering.",
-          "diagnostics": "Valfria signaler och extra temperaturzoner. Styrbehörigheter verifieras separat under Avancerad styrning.",
-          "control": "Separata funktioner som kan påverka styrningen. Källor väljs under Diagnostik och energi."
-        }
-      },
-      "basic": {
-        "title": "Grundinställningar",
-        "description": "Temperaturgivare, elpriser, styrutgångar och notiser.",
         "sections": {
           "temperature_sources": {
             "name": "Fler temperaturgivare och givarnas aktualitet",
@@ -92,38 +82,7 @@
               "notification_level": "Välj alla prisnotiser, endast bromsning eller inga. Den befintliga notisbrytaren är fortfarande huvudbrytare.",
               "notify_service": "Lämna tomt för att använda beständiga notifieringar i HA:s sidofält istället."
             }
-          }
-        },
-        "data": {
-          "indoor_temp_entity": "Inomhusgivare",
-          "real_outdoor_entity": "Utomhusgivare",
-          "electricity_price_entity": "Elpris idag",
-          "price_tomorrow_entity": "Elpris imorgon",
-          "weather_entity": "Väderprognos (valfri)"
-        }
-      },
-      "thermal": {
-        "title": "Thermal Intelligence",
-        "description": "Passiv TI behöver inte intern värmepumpstelemetri. Valet om extra värmekällor gäller även adaptiv bromsning.",
-        "sections": {
-          "thermal": {
-            "name": "Passiv Thermal Intelligence",
-            "description": "TI-insamlingen är passiv. Uppgiften om möjliga extra värmekällor delas med den äldre adaptiva inlärningen.",
-            "data": {
-              "external_heat_sources": "Extra värmekällor kan förekomma",
-              "thermal_intelligence_enabled": "Samla termisk evidens passivt"
-            },
-            "data_description": {
-              "external_heat_sources": "Anger att extra värme kan förekomma, inte att den är på nu. Ändring återställer den äldre adaptiva inlärningen och kan påverka bromsningen om adaptiv styrning används. Tillförd värme mäts inte.",
-              "thermal_intelligence_enabled": "Samlar observationer och utvärderar en passiv modellkandidat. Ger inte i sig tillstånd till adaptiv styrning och bevisar inte prognosnytta."
-            }
-          }
-        }
-      },
-      "diagnostics": {
-        "title": "Diagnostik och energi",
-        "description": "Valfria signaler och extra temperaturzoner. Styrbehörigheter verifieras separat under Avancerad styrning.",
-        "sections": {
+          },
           "heat_pump_data": {
             "name": "Värmepumpsdata och energimätning",
             "description": "Valfria signaler för diagnostik och bedömning av värmedrift. Kompressordrift, eleffekt och skickade styrvärden bevisar inte levererad rumsvärme. Lämna oanvända fält tomma.",
@@ -291,13 +250,19 @@
               "zone_4_profile": "Välj manuellt vilken av zonens två temperaturgränser som används.",
               "zone_4_threshold": "Temperaturgräns för profilen Underhållsvärme. Standard är 5 °C. Används endast när profilen är vald."
             }
-          }
-        }
-      },
-      "control": {
-        "title": "Avancerad styrning",
-        "description": "Separata funktioner som kan påverka styrningen. Källor väljs under Diagnostik och energi.",
-        "sections": {
+          },
+          "thermal": {
+            "name": "Passiv Thermal Intelligence",
+            "description": "TI-insamlingen är passiv. Uppgiften om möjliga extra värmekällor delas med den äldre adaptiva inlärningen.",
+            "data": {
+              "external_heat_sources": "Extra värmekällor kan förekomma",
+              "thermal_intelligence_enabled": "Samla termisk evidens passivt"
+            },
+            "data_description": {
+              "external_heat_sources": "Anger att extra värme kan förekomma, inte att den är på nu. Ändring återställer den äldre adaptiva inlärningen och kan påverka bromsningen om adaptiv styrning används. Tillförd värme mäts inte.",
+              "thermal_intelligence_enabled": "Samlar observationer och utvärderar en passiv modellkandidat. Ger inte i sig tillstånd till adaptiv styrning och bevisar inte prognosnytta."
+            }
+          },
           "advanced_control": {
             "name": "Avancerade kontrollfunktioner",
             "description": "Dessa funktioner kan påverka styrningen. Behåll nuvarande val om signalernas betydelse och mättid inte har verifierats. Byte av källa eller kalibrering upphäver tidigare säkerhetsverifiering.",

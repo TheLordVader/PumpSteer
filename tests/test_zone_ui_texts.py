@@ -18,7 +18,7 @@ import pytest
 def test_zone_pages_explain_passive_monitoring_and_alarm_fields(filename):
     root = Path("custom_components/pumpsteer")
     options = json.loads((root / filename).read_text())["options"]["step"][
-        "diagnostics"
+        "init"
     ]["sections"]
     for number in range(1, 5):
         page = options[f"zone_{number}"]
@@ -39,7 +39,7 @@ def test_zone_pages_explain_passive_monitoring_and_alarm_fields(filename):
 def test_english_options_and_swedish_alias_are_synchronized():
     root = Path("custom_components/pumpsteer")
     texts = [
-        json.loads((root / filename).read_text())["options"]["step"]["diagnostics"][
+        json.loads((root / filename).read_text())["options"]["step"]["init"][
             "sections"
         ]
         for filename in (
