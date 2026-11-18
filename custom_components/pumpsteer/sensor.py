@@ -5974,6 +5974,10 @@ class PumpSteerInputTemperatureSensor(SensorEntity):
         self._attr_translation_key = key
         self._attr_unique_id = f"{controller.unique_id}_{key}"
         self._attr_device_info = controller._attr_device_info
+        self._attr_icon = {
+            "indoor_temperature": "mdi:home-thermometer-outline",
+            "outdoor_temperature": "mdi:thermometer",
+        }.get(key)
 
     @property
     def available(self) -> bool:
