@@ -331,7 +331,7 @@ class ForecastAudit:
 
     def issue_shared(
         self, at, indoor, outdoor, k, identity, *, revision, context_id,
-        command, mode, candidate=None, source_reported=None,
+        command, mode, candidate=None, pilot=None, source_reported=None,
     ):
         """Freeze passive curves before an outcome; no model is consulted later.
 
@@ -380,6 +380,15 @@ class ForecastAudit:
                 "name": "empirical_command_response", "loss": candidate["loss_per_hour"],
                 "input": candidate["command_gain_per_hour"] * command + candidate["background_per_hour"],
             })
+        if pilot is not None:
+            keys = ("loss", "gain", "background", "heat")
+            if (curves or not isinstance(pilot, dict)
+                    or not all(numeric(pilot.get(key)) for key in keys)
+                    or not 0 < pilot["loss"] <= 0.25 or not 0 <= pilot["gain"] <= 1.5
+                    or abs(pilot["background"]) > 0.5 or not 0 <= pilot["heat"] <= 1):
+                return False
+            curves.append({"name": "pilot_house", **{key: pilot[key] for key in keys},
+                           "input": pilot["gain"] * pilot["heat"] + pilot["background"]})
         curves.append({"name": "persistence", "rate": 0.0})
         self.fixed_pending = {
             "kind": "shared_command_response", "issued": at, "last": at,
@@ -486,7 +495,9 @@ class ForecastAudit:
                     "elapsed_minutes_range": [min(r["elapsed_minutes"] for r in items), max(r["elapsed_minutes"] for r in items)],
                     "passive_only": True, "physical_measurement_time": "unknown",
                     "live_endpoint_basis": "accepted_numeric_changes_only",
-                    "assumption": "constant_outdoor_and_empirical_command_coordinate"}
+                    "assumption": ("constant_outdoor_and_latest_observed_house_heat_share"
+                                   if "pilot_house" in order
+                                   else "constant_outdoor_and_empirical_command_coordinate")}
         return groups
 
     def issue(
@@ -1060,6 +1071,7 @@ class ForecastAudit:
                     continue
                 order = [c.get("name") for c in curves]
                 if order not in (["persistence"], ["linear", "bounded", "persistence"],
+                                 ["pilot_house", "persistence"],
                                  ["empirical_command_response", "persistence"],
                                  ["linear", "bounded", "empirical_command_response", "persistence"]):
                     continue
@@ -1072,7 +1084,9 @@ class ForecastAudit:
                 if not probe.issue_shared(issued, row.get("initial"), row.get("outdoor"),
                     curves[1].get("loss") if order[0] == "linear" else None, row.get("identity"),
                     revision=row.get("revision"), context_id=row.get("context_id"), command=row.get("command"),
-                    mode=row.get("mode"), candidate=candidate, source_reported=row.get("source_reported")):
+                    mode=row.get("mode"), candidate=candidate,
+                    pilot=curves[0] if order[0] == "pilot_house" else None,
+                    source_reported=row.get("source_reported")):
                     continue
                 if probe.fixed_pending["curves"] != curves or row.get("model_order") != order:
                     continue

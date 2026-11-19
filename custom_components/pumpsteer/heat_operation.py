@@ -72,6 +72,24 @@ class HeatOperation:
         self.fresh_temperatures = set()
         return True
 
+    @staticmethod
+    def learning_report(now, heat, *, compressor=None, radiator=None, water=None, reported_after=None):
+        """Check a selected space-heat source against available context reports."""
+        report = PilotPassive._report(heat, now, reported_after=reported_after)
+        if report is None:
+            return None
+        for source, blocks, mode_source in ((water, 1, True), (radiator, 0, True), (compressor, 0, False)):
+            context = PilotPassive._report(source, now, reported_after=reported_after)
+            if context is None:
+                continue
+            if context[1] == blocks and (mode_source or report[1] == 1):
+                return None
+            if mode_source:
+                changed = _timestamp(getattr(source, "last_changed", None))
+                if changed is not None and changed > report[0]:
+                    return None
+        return report
+
     def observe(
         self,
         now,

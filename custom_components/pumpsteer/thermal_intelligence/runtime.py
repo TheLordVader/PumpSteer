@@ -1,4 +1,4 @@
-"""Passive evidence capture and shadow evaluation for the RTM prototype."""
+"""Passive, chronological evidence and model evaluation."""
 
 from __future__ import annotations
 
@@ -6,9 +6,13 @@ import itertools
 import math
 from collections import deque
 from copy import deepcopy
+from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from ..pilot_passive import PilotPassive
+from ..pilot_vendor.adaptive_model import AdaptiveThermalModel
+from ..pilot_vendor.learning_interval import LearningInterval
 from .rtm_core import ModelConfig, RCThermalModel, Sample
 from .rtm_core.quality import step_temperature
 
@@ -16,6 +20,8 @@ _STATE_VERSION = 2
 _MAX_RECORDS = 2048
 _MAX_GAP_MINUTES = 60.0
 _OUTDOOR_MAX_AGE = timedelta(hours=3)
+_PILOT_HEAT_MAX_AGE = timedelta(minutes=5)
+_PILOT_HISTORY_HOURS = 336
 _COUNTER_LIMIT = 2**63 - 1
 _COUNTER_KEYS = (
     "source_numeric_changes", "source_change_attempts", "source_changes_accepted",
@@ -87,9 +93,18 @@ def classify_regime(mode: str | None, brake_factor: float | None) -> str:
 
 
 class ThermalIntelligence:
-    """One bounded evidence chain; model inputs are empirical service requests."""
+    """One bounded chain for actual observations and empirical service requests."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, pilot_only: bool = False) -> None:
+        self.pilot_only = pilot_only
+        self._pilot_key = None
+        self._pilot_intervals = deque(maxlen=_PILOT_HISTORY_HOURS)
+        self._pilot_inputs = {}
+        self._pilot_anchor = None
+        self._pilot_window = None
+        self._pilot_input_epoch = 0
+        self._pilot_fit = {}
+        self._pilot_attempted_end = None
         self.model = RCThermalModel(ModelConfig(
             step_minutes=15.0, half_life_days=21.0,
             max_dead_time_minutes=180.0, max_gap_minutes=_MAX_GAP_MINUTES,
@@ -146,11 +161,118 @@ class ThermalIntelligence:
 
     def pilot_response_intervals(self, reports, *, through, output_clamp):
         """Replay qualified source reports against this chain's control boundaries."""
-        from ..pilot_passive import PilotPassive
-
         return PilotPassive.response_intervals(
             self._events, reports, through=through, output_clamp=output_clamp
         )
+
+    @property
+    def pilot_context_id(self) -> str:
+        return f"{self.context_id}:{self._pilot_input_epoch}"
+
+    def record_pilot_input(self, at, role, source, report) -> None:
+        """Record an independent report or loss of input in the common chain."""
+        at = _timestamp(at)
+        if not self.pilot_only or self._active_cycle is None or at is None or not source:
+            return
+        source_key = {"heat": "pilot_heat_source", "outdoor": "outdoor_source"}.get(role)
+        if source_key is None or source != self._active_cycle.get(source_key):
+            return
+        age_limit = _PILOT_HEAT_MAX_AGE if role == "heat" else _OUTDOOR_MAX_AGE
+        reported, value = report if report is not None else (None, None)
+        reported, value = _timestamp(reported), _number(value)
+        if (reported is None or not timedelta(0) <= at - reported < age_limit
+                or value is None or (role == "heat" and value not in (0, 1))):
+            reported, value = None, None
+        prior = self._pilot_inputs.get(role)
+        if prior is not None:
+            previous_report = _timestamp(prior["reported_at"])
+            if reported == previous_report and value == prior["value"] and source == prior["entity"]:
+                return
+            change_at = reported if reported is not None and value != prior["value"] else at
+            late = (change_at < at or (self._events and at < _timestamp(self._events[-1]["at"])))
+            if late and self._pilot_intervals and self._pilot_intervals[-1].end > change_at.timestamp():
+                # An actual earlier edge invalidates intervals that used the old
+                # held value. The original reports remain in the evidence chain.
+                while self._pilot_intervals and self._pilot_intervals[-1].end > change_at.timestamp():
+                    self._pilot_intervals.pop()
+                self._pilot_fit = {}
+                self._pilot_attempted_end = None
+                self._fit_generation += 1
+                self._fit_in_progress = False
+            if (reported is None or prior["entity"] != source or not prior["qualified"]
+                    or _timestamp(prior["valid_until"]) < at or late
+                    or (previous_report is not None and reported <= previous_report)):
+                self._pilot_input_epoch += 1
+                self._pilot_anchor = self._pilot_window = None
+                if previous_report is not None and reported is not None and reported <= previous_report:
+                    reported, value = None, None
+        if reported is None and prior is None:
+            return
+        fields = {}
+        if role == "heat":
+            fields = {"semantics": "space_heat_duty", "operation": {
+                "learning_qualified": reported is not None,
+                "mode": "space_heating" if value == 1 else "idle" if value == 0 else "unknown",
+            }}
+        self._pilot_inputs[role] = self._append(
+            "temperature", at, role=f"pilot_{role}", pilot_role=role, entity=source,
+            value=value, reported_at=reported.isoformat() if reported is not None else None,
+            valid_until=(reported + age_limit).isoformat() if reported is not None else None,
+            qualified=reported is not None, physical_time_known=False, **fields,
+        )
+
+    def pilot_inputs_valid(self, now) -> bool:
+        cycle = self._active_cycle or {}
+        return (cycle.get("regime") in {"normal_pi", "braking_stable", "preheating"}
+                and cycle.get("gos_active") is False and bool(cycle.get("pilot_heat_source"))
+                and self._pilot_inputs.keys() >= {"outdoor", "heat"}
+                and all(row["qualified"] and _timestamp(row["at"]) <= now < _timestamp(row["valid_until"])
+                        for row in self._pilot_inputs.values()))
+
+    def collect_pilot_house(self, now):
+        """Close at a distinct observed indoor endpoint, using only prior evidence."""
+        if not self.pilot_only or not self.pilot_inputs_valid(now):
+            return None
+        observation = self.latest_observation
+        if observation is None or observation["segment"] != self.context_id:
+            return None
+        at = _timestamp(observation["indoor_reported_at"])
+        if at is None or not timedelta(0) <= now - at <= timedelta(minutes=5):
+            return None
+        end = (at, observation["indoor_c"])
+        start = self._pilot_anchor
+        if start is not None and at - start[0] < timedelta(hours=1):
+            return None
+        self._pilot_anchor = end
+        self._pilot_window = None
+        if start is None:
+            return None
+        inputs = [dict(row, role=row["pilot_role"], source=row["entity"]) for row in self._events
+                  if row["segment"] == self.context_id and "pilot_role" in row]
+        if not inputs:
+            return None
+        # Segment identity establishes context even when its original event
+        # has rotated out. A retained report before the start is still needed.
+        context = {"kind": "context", "at": inputs[0]["at"], "gos_active": False,
+                   "regime": self._active_cycle["regime"]}
+        interval = PilotPassive.house_interval([context], inputs, start=start, end=end)
+        if interval is None:
+            return None
+        self._pilot_window = interval
+        self._pilot_intervals.append(interval)
+        return interval
+
+    def pilot_forecast(self, now):
+        """Freeze recent observed heat share as a scenario for natural Base drift."""
+        candidate = self._pilot_fit.get("candidate")
+        window = self._pilot_window
+        observation = self._latest_observation
+        if (candidate is None or window is None or observation is None
+                or not self.pilot_inputs_valid(now)
+                or window.end != _timestamp(observation["indoor_reported_at"]).timestamp()
+                or self._pilot_fit["fit_end"] > window.end):
+            return None
+        return dict(candidate, heat=window.heat, fit_end=self._pilot_fit["fit_end"])
 
     @property
     def current_command(self) -> dict[str, Any] | None:
@@ -158,6 +280,8 @@ class ThermalIntelligence:
 
     @property
     def status(self) -> str:
+        if self.pilot_only:
+            return "candidate_unvalidated" if self._pilot_fit.get("candidate") else self._status
         if self._status == "candidate_insufficient_excitation":
             return self._status
         return "candidate_unvalidated" if self.model.parameters() else self._status
@@ -201,6 +325,12 @@ class ThermalIntelligence:
         """True when a refit is worthwhile and no fit is currently in progress."""
         if self._fit_in_progress:
             return False
+        if self.pilot_only:
+            return (self._pilot_key is not None and bool(self._pilot_intervals)
+                    and self._pilot_intervals[-1].end != self._pilot_attempted_end
+                    and self._pilot_intervals[-1].end <= now.timestamp()
+                    and sum(row.hours for row in self._pilot_intervals
+                            if row.end > now.timestamp() - _PILOT_HISTORY_HOURS * 3600) >= 24)
         return self.model.fit_due(now)
 
     def prepare_fit_job(self, now: datetime) -> tuple[int, dict[str, Any]] | None:
@@ -209,6 +339,11 @@ class ThermalIntelligence:
             return None
         self._fit_generation += 1
         self._count("fit_attempts", now)
+        if self.pilot_only:
+            self._fit_in_progress = True
+            self._pilot_attempted_end = self._pilot_intervals[-1].end
+            cutoff = now.timestamp() - _PILOT_HISTORY_HOURS * 3600
+            return self._fit_generation, {"pilot_house": tuple(row for row in self._pilot_intervals if row.end > cutoff)}
         if hasattr(self.model, "record_fit_attempt"):
             self.model.record_fit_attempt(self.model._grid, now.timestamp())
         self._fit_in_progress = True
@@ -224,6 +359,16 @@ class ThermalIntelligence:
     @staticmethod
     def static_fit(snapshot_data: dict[str, Any]) -> dict[str, Any]:
         """Pure CPU-bound fitting function safe for asyncio executor execution."""
+        if "pilot_house" in snapshot_data:
+            rows = snapshot_data["pilot_house"]
+            model = AdaptiveThermalModel()
+            for row in rows:
+                model.add_interval(row)
+            result = {"status": model.status, "fit_end": rows[-1].end}
+            if model.gain_identified and model.status == "learning":
+                result["candidate"] = {"loss": model.heat_loss_coeff, "gain": model.heat_gain_coeff,
+                                       "background": model.background_gain}
+            return result
         return RCThermalModel.fit_snapshot(
             snapshot_data["grid"],
             snapshot_data["config"],
@@ -238,6 +383,9 @@ class ThermalIntelligence:
             return False
         self._fit_in_progress = False
         self._count("fit_results_applied")
+        if self.pilot_only:
+            self._pilot_fit = result
+            return True
         self._fit_summary = result
         status = result.get("status")
         if result.get("fit_ts") is not None:
@@ -274,13 +422,16 @@ class ThermalIntelligence:
 
     def _boundary(self, at: datetime) -> None:
         self._segment += 1
-        if hasattr(self.model, "break_segment"):
-            self.model.break_segment(at)
-        else:
-            self.model._pending.clear()
-            self.model.add_sample(Sample(at, None, None, None, excluded=True))
-        self._fit_generation += 1
-        self._fit_in_progress = False
+        self._pilot_anchor = self._pilot_window = None
+        self._pilot_inputs.clear()
+        if not self.pilot_only:
+            if hasattr(self.model, "break_segment"):
+                self.model.break_segment(at)
+            else:
+                self.model._pending.clear()
+                self.model.add_sample(Sample(at, None, None, None, excluded=True))
+            self._fit_generation += 1
+            self._fit_in_progress = False
 
     def begin_cycle(self, cycle: dict[str, Any], *, use_ohmigo_input: bool) -> None:
         """Capture source changes even without a usable model or output transport."""
@@ -297,7 +448,8 @@ class ThermalIntelligence:
                      for row in sources if isinstance(row.get("entity"), str))),
                      cycle.get("outdoor_source"), cycle.get("command_source"))
         regime = classify_regime(cycle.get("mode"), _number(cycle.get("brake_factor")))
-        context = (signature, cycle.get("mode"), regime, cycle.get("gos_active"), use_ohmigo_input)
+        heat_source = cycle.get("pilot_heat_source") if self.pilot_only else None
+        context = (signature, cycle.get("mode"), regime, cycle.get("gos_active"), use_ohmigo_input, heat_source)
         if context != self._context_signature:
             if self._context_signature:
                 self._last_interruption = None
@@ -314,10 +466,20 @@ class ThermalIntelligence:
             self._captured_values.clear()
             self._last_numeric_values.clear()
             self._observation_values.clear()
-            self.model = RCThermalModel(self.model.config)
-            self._fit_summary.clear()
+            if not self.pilot_only:
+                self.model = RCThermalModel(self.model.config)
+                self._fit_summary.clear()
             self._last_training_at = None
         self._source_signature = signature
+        if heat_source:
+            key = repr((signature[:2], heat_source))
+            if self._pilot_key != key:
+                self._pilot_key = key
+                self._pilot_intervals.clear()
+                self._pilot_fit = {}
+                self._pilot_attempted_end = None
+                self._fit_generation += 1
+                self._fit_in_progress = False
         eligible = regime in {"normal_pi", "braking_stable", "preheating"} and not cycle.get("gos_active")
         indoor = _number(cycle.get("indoor"))
         outdoor = _number(cycle.get("outdoor"))
@@ -380,7 +542,7 @@ class ThermalIntelligence:
             # Invalid times never consume an otherwise usable future observation.
             if accepted and valid_time:
                 self._source_values[key] = (value, reported)
-            if role == "outdoor" and eligible and value is not None and valid_time and ordered:
+            if not self.pilot_only and role == "outdoor" and eligible and value is not None and valid_time and ordered:
                 if self._outdoor_sample_segment != self._segment:
                     # Restore held context after a boundary, without asserting a
                     # new weather observation or extending its source age limit.
@@ -419,7 +581,7 @@ class ThermalIntelligence:
         coordinate = None
         if command_value is not None and command_at is not None and command_at <= indoor_at:
             coordinate = _number(command.get("coordinate"))
-        if eligible and (self._last_training_at is None or indoor_at > self._last_training_at):
+        if not self.pilot_only and eligible and (self._last_training_at is None or indoor_at > self._last_training_at):
             # Independent command/outdoor samples establish held fields in the
             # grid; an indoor report never backdates a newly received command.
             self.model.add_sample(Sample(indoor_at, indoor, None, None))
@@ -476,7 +638,7 @@ class ThermalIntelligence:
                     self._last_command["coordinate"] = coordinate
                     # Confirmations refresh coverage at most once per grid step;
                     # repeated calls cannot create a dense pending-sample log.
-                    if not same or self._last_command_sample_at is None or at - self._last_command_sample_at >= timedelta(minutes=self.model.config.step_minutes):
+                    if not self.pilot_only and (not same or self._last_command_sample_at is None or at - self._last_command_sample_at >= timedelta(minutes=self.model.config.step_minutes)):
                         self.model.add_sample(Sample(at, None, None, coordinate))
                         self._last_command_sample_at = at
         elif transport == "ohmigo" and status in {"dispatch_failed", "skipped", "disabled", "not_configured", "invalid_configuration"}:
@@ -553,15 +715,19 @@ class ThermalIntelligence:
         """Persist one chain; unfinished command and interpolation never resume."""
         model_state = self.model.to_dict()
         model_state["pending"] = []  # Open interpolation intervals never resume.
-        return deepcopy({"version": _STATE_VERSION, "model": model_state,
+        state = {"version": _STATE_VERSION, "model": model_state,
                     "events": list(self._events), "sequence": self._sequence,
                     "samples": self._samples, "status": self._status,
                     "fit_summary": dict(self._fit_summary), "fit_generation": self._fit_generation,
                     "segment": self._segment, "diagnostic_counters": dict(self._counters),
-                    "counter_started_at": self._counter_started_at.isoformat() if self._counter_started_at else None})
+                    "counter_started_at": self._counter_started_at.isoformat() if self._counter_started_at else None}
+        if self._pilot_key is not None:
+            state["pilot_house"] = {"key": self._pilot_key,
+                                    "intervals": [asdict(row) for row in self._pilot_intervals]}
+        return deepcopy(state)
 
     def restore_state(self, data: Any) -> bool:
-        restored = ThermalIntelligence()
+        restored = ThermalIntelligence(pilot_only=self.pilot_only)
         if not restored._restore_state(data):
             return False
         self.__dict__.update(restored.__dict__)
@@ -634,13 +800,40 @@ class ThermalIntelligence:
             self._last_training_at = None
             self._last_interruption = None
             if events:
+                self._restore_pilot_house(data.get("pilot_house"), _timestamp(events[-1]["at"]))
                 self._interrupt("restart", _timestamp(events[-1]["at"]))
         except (KeyError, TypeError, ValueError, OverflowError):
             return False
         return True
 
+    def _restore_pilot_house(self, payload, through) -> None:
+        if not isinstance(payload, dict) or not isinstance(payload.get("key"), str):
+            return
+        values = payload.get("intervals")
+        if not isinstance(values, list) or len(values) > _PILOT_HISTORY_HOURS:
+            return
+        previous = 0.0
+        rows = []
+        for item in values:
+            try:
+                row = LearningInterval(**item)
+                numeric = (row.end, row.hours, row.start_temp, row.end_temp, row.outdoor, row.heat, row.coverage)
+                if (any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) for v in numeric)
+                        or not 1 <= row.hours <= 3 or not 0.95 <= row.coverage <= 1
+                        or not 0 <= row.heat <= 1 or not -50 <= row.outdoor <= 60
+                        or not -10 < row.start_temp < 50 or not -10 < row.end_temp < 50
+                        or row.request is not None or row.end > through.timestamp()
+                        or row.end - row.hours * 3600 < previous - 1e-6):
+                    return
+            except (TypeError, ValueError, OverflowError):
+                return
+            rows.append(row)
+            previous = row.end
+        self._pilot_key = payload["key"]
+        self._pilot_intervals.extend(rows)
+
     def summary(self) -> dict[str, Any]:
-        return {
+        result = {
             "status": self.status,
             "model_status": "candidate_unvalidated" if self.model.parameters() else "insufficient_evidence",
             "model": "adaptive_preheat_rtm_empirical_command_response",
@@ -674,3 +867,24 @@ class ThermalIntelligence:
             "last_interruption": self._last_interruption_event["reason"] if self._last_interruption_event else None,
             "reason": self._fit_summary.get("reason") or "passive_diagnostics_only",
         }
+        if self.pilot_only:
+            available = self._pilot_fit.get("candidate") is not None
+            reason = "verified_space_heat_unavailable"
+            if self._pilot_inputs.get("heat", {}).get("qualified"):
+                reason = self._pilot_fit.get("status") or "waiting_for_house_intervals"
+            result.update(
+                model="heat_pump_pilot_house",
+                model_status="candidate_unvalidated" if available else "insufficient_evidence",
+                samples=len(self._pilot_intervals),
+                pilot_house_intervals=len(self._pilot_intervals),
+                pilot_house_hours=sum(row.hours for row in self._pilot_intervals),
+                fit_parameters_available=available,
+                last_fit_status=self._pilot_fit.get("status"),
+                last_fit_attempt_epoch=self._pilot_attempted_end,
+                excitation_sufficient=available,
+                command_range=None,
+                command_variance=None,
+                forecast_heat_assumption="mean_heat_in_latest_observed_house_interval",
+                reason=reason,
+            )
+        return result

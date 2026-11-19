@@ -328,7 +328,16 @@ class PilotPassive:
         }
 
     @staticmethod
-    def response_intervals(evidence, reports, *, through, output_clamp):
+    def house_interval(evidence, reports, *, start, end):
+        """Use two real indoor endpoints and the covered heat/weather between them."""
+        rows = PilotPassive.response_intervals(
+            evidence, reports, through=end[0], output_clamp=None,
+            indoor_endpoints=(start[0], start[1], end[1]),
+        )
+        return rows[0] if rows else None
+
+    @staticmethod
+    def response_intervals(evidence, reports, *, through, output_clamp, indoor_endpoints=None):
         """Replay one qualified source per role, using only evidence received by `through`.
 
         Both inputs are in capture order. Reports have `role` (outdoor, receiver
@@ -351,8 +360,17 @@ class PilotPassive:
 
         cutoff = _timestamp(through)
         span = _number(output_clamp)
-        if cutoff is None or span is None or span <= 0:
+        house = indoor_endpoints is not None
+        if cutoff is None or (not house and (span is None or span <= 0)):
             return []
+        start = None
+        end = cutoff.timestamp()
+        if house:
+            first_at, first_temp, last_temp = indoor_endpoints
+            first_at = _timestamp(first_at)
+            if first_at is None or not timedelta(hours=1) <= cutoff - first_at <= timedelta(hours=3):
+                return []
+            start = first_at.timestamp()
 
         def ordered(rows, shared):
             previous = None
@@ -366,8 +384,12 @@ class PilotPassive:
                 if not shared or row.get("kind") in {"context", "interruption", "output"}:
                     yield at.timestamp(), shared, row
 
-        roles = {"outdoor", "receiver", "heat"}
-        collector = IntervalCollector(15, require_indoor=False)
+        roles = {"outdoor", "heat"} if house else {"outdoor", "receiver", "heat"}
+        collector = IntervalCollector(60 if house else 15, require_indoor=house)
+        if house:
+            # Close at the observed temperature time, including any overshoot
+            # beyond one hour. A grid edge cannot stand in for that endpoint.
+            collector.seconds = end - start
         intervals = []
         held = {}
         seen: dict[str, _PilotReport] = {}
@@ -380,7 +402,10 @@ class PilotPassive:
             while collector.last < covered_until:
                 # Respect the vendor collector's gap guard within a proven hold.
                 stop = min(covered_until, collector.start + collector.seconds, collector.last + 300)
-                row = collector.observe(stop, *collector.previous)
+                if house and stop == end:
+                    row = collector.observe(stop, last_temp, *collector.previous[1:])
+                else:
+                    row = collector.observe(stop, *collector.previous)
                 if row is not None:
                     intervals.append(row)
             if covered_until < at:
@@ -411,7 +436,10 @@ class PilotPassive:
             held.pop(role, None)
 
         try:
-            timeline = merge(ordered(evidence, True), ordered(reports, False), key=lambda event: event[0])
+            # The start event is a real indoor endpoint. It seeds an interval
+            # only when both independent inputs were already available there.
+            starts = ((start, False, {}),) if house else ()
+            timeline = merge(ordered(evidence, True), ordered(reports, False), starts, key=lambda event: event[0])
             for at, group in groupby(timeline, key=lambda event: event[0]):
                 advance(at)
                 for _, shared, row in group:
@@ -422,7 +450,8 @@ class PilotPassive:
                             held.clear()
                             eligible = (kind == "context" and "reported_capture_at" not in row
                                         and row.get("regime") in {"normal_pi", "braking_stable", "preheating"}
-                                        and row.get("use_ohmigo_input") is True and row.get("gos_active") is False)
+                                        and (house or row.get("use_ohmigo_input") is True)
+                                        and row.get("gos_active") is False)
                         elif (row.get("transport") == "ohmigo" and "receiver" in held
                               and _number(row.get("requested")) != seen["receiver"].value):
                             held.pop("receiver")
@@ -470,10 +499,11 @@ class PilotPassive:
                     seen[role] = _PilotReport(identity, reported, value, physical)
                     held[role] = expiry.timestamp()
 
-                if eligible and roles <= held.keys() and min(held.values()) > at:
+                if (eligible and roles <= held.keys() and min(held.values()) > at
+                        and (not house or at == start or collector.last is not None)):
                     outdoor = seen["outdoor"].value
-                    request = virtual_request(outdoor, seen["receiver"].value, span)
-                    collector.observe(at, None, outdoor, seen["heat"].value, request)
+                    request = None if house else virtual_request(outdoor, seen["receiver"].value, span)
+                    collector.observe(at, first_temp if house else None, outdoor, seen["heat"].value, request)
                 else:
                     collector.reset()
             advance(cutoff.timestamp())

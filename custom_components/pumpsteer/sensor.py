@@ -184,7 +184,9 @@ class PumpSteerSensor(RestoreEntity):
         self._pi = PIController()
         self._pi_precool_paused: bool = False
         self._thermal_model = ThermalModel()
-        self._thermal_intelligence = ThermalIntelligence()
+        self._thermal_intelligence = ThermalIntelligence(pilot_only=True)
+        self._pilot_input_entities = ()
+        self._pilot_input_unsubscribe = None
         self._thermal_store_restored = False
         self._thermal_fit_task: Optional[asyncio.Task] = None
         self._thermal_store_last_at = None
@@ -728,6 +730,7 @@ class PumpSteerSensor(RestoreEntity):
             except Exception:
                 _LOGGER.exception("Passive plan audit cleanup failed")
         self._stop_power_telemetry()
+        self._stop_pilot_input_listener()
         if self._remove_start_listener is not None:
             self._remove_start_listener()
             self._remove_start_listener = None
@@ -741,6 +744,14 @@ class PumpSteerSensor(RestoreEntity):
     ) -> None:
         """Handle updated options."""
         self._config_entry = entry
+        if (
+            self._cfg().get("thermal_intelligence_enabled") is not True
+            and self._pilot_input_unsubscribe is not None
+        ):
+            self._stop_pilot_input_listener()
+            now = dt_util.now()
+            self._thermal_intelligence.suspend("disabled", now)
+            self._plan_audit.cancel_shared("disabled", now)
         control_config = {
             k: v
             for k, v in self._cfg().items()
@@ -1734,8 +1745,102 @@ class PumpSteerSensor(RestoreEntity):
         except Exception:
             _LOGGER.debug("Thermal Intelligence output capture failed", exc_info=True)
 
+    @staticmethod
+    def _pilot_heat_entity(cfg):
+        heat = cfg.get("thermal_heat_activity_entity")
+        if (
+            isinstance(heat, str)
+            and heat.startswith("binary_sensor.")
+            and cfg.get("thermal_detection_method") != "manual"
+            and heat not in {
+                cfg.get("thermal_compressor_entity"),
+                cfg.get("thermal_heating_mode_entity"),
+                cfg.get("thermal_hot_water_mode_entity"),
+                cfg.get("thermal_external_heat_entity"),
+            }
+        ):
+            return heat
+        return None
+
+    def _stop_pilot_input_listener(self) -> None:
+        if self._pilot_input_unsubscribe is not None:
+            self._pilot_input_unsubscribe()
+            self._pilot_input_unsubscribe = None
+        self._pilot_input_entities = ()
+
+    def _listen_to_pilot_inputs(self, cfg) -> None:
+        from homeassistant.helpers.event import async_track_state_change_event
+
+        heat = self._pilot_heat_entity(cfg)
+        entities = tuple(dict.fromkeys(entity for entity in (
+            heat, self._temperature_identity(cfg)[1], cfg.get("thermal_compressor_entity"),
+            cfg.get("thermal_heating_mode_entity"), cfg.get("thermal_hot_water_mode_entity"),
+            cfg.get("thermal_external_heat_entity"),
+        ) if isinstance(entity, str))) if heat else ()
+        if entities == self._pilot_input_entities:
+            return
+        self._stop_pilot_input_listener()
+        if not entities:
+            return
+
+        @callback
+        def changed(event):
+            if self._temperature_unloaded or self._pilot_input_entities != entities:
+                return
+            current = self._cfg()
+            if (
+                current.get("thermal_intelligence_enabled") is not True
+                or self._pilot_heat_entity(current) != heat
+            ):
+                return
+            try:
+                self._capture_pilot_inputs(event.time_fired, current, event)
+            except Exception:
+                _LOGGER.debug("Passive Pilot input capture failed", exc_info=True)
+
+        self._pilot_input_unsubscribe = async_track_state_change_event(self.hass, list(entities), changed)
+        self._pilot_input_entities = entities
+
+    def _capture_pilot_inputs(self, now, cfg, event=None) -> None:
+        from .control_intelligence import external_heat_status
+        from .heat_operation import HeatOperation
+        from .pilot_passive import PilotPassive
+
+        heat = self._pilot_heat_entity(cfg)
+        if heat is None:
+            return
+        outdoor = self._temperature_identity(cfg)[1]
+        entity = event.data.get("entity_id") if event is not None else None
+
+        def get_state(source):
+            if source and source == entity:
+                return event.data.get("new_state")
+            return self.hass.states.get(source) if source else None
+
+        runtime = self._thermal_intelligence
+        cutoff = self._temperature_reported_after
+        if entity is None or entity != outdoor:
+            external = cfg.get("thermal_external_heat_entity")
+            disturbed = external_heat_status(
+                now, cfg, {external: get_state(external)}, measured_after=cutoff
+            ) == "verified_active"
+            report = None if disturbed else HeatOperation.learning_report(
+                now, get_state(heat), compressor=get_state(cfg.get("thermal_compressor_entity")),
+                radiator=self._heating_mode_state(cfg, get_state=get_state),
+                water=get_state(cfg.get("thermal_hot_water_mode_entity")), reported_after=cutoff,
+            )
+            # Use the HA event time or the tick's observation time. The
+            # source's reported_at is preserved separately in the evidence.
+            runtime.record_pilot_input(now, "heat", heat, report)
+        if entity is None or entity == outdoor:
+            state = get_state(outdoor) if entity else self._temperature_state(cfg, "real_outdoor_entity")
+            report = PilotPassive._report(state, now, temperature=True,
+                                          reported_after=cutoff, max_age=None)
+            runtime.record_pilot_input(now, "outdoor", outdoor, report)
+
     def _update_shared_thermal_audit(self, now, cfg):
         """Use the single audit for persistence and a frozen passive candidate."""
+        import hashlib
         from types import SimpleNamespace
 
         runtime = self._thermal_intelligence
@@ -1753,29 +1858,29 @@ class PumpSteerSensor(RestoreEntity):
             attributes={"unit_of_measurement": "°C"},
         )
         audit = self._plan_audit
-        context = str(runtime.context_id)
+        context = runtime.pilot_context_id
         mode = observation["mode"]
-        audit.observe_shared(now, state, identity, command=coordinate,
+        pending = audit.fixed_pending
+        pending_pilot = bool(pending and pending.get("revision", "").startswith("pilot:"))
+        if pending_pilot and not runtime.pilot_inputs_valid(now):
+            audit.cancel_shared("pilot_inputs_unavailable", now)
+        audit.observe_shared(now, state, identity, command=None if pending_pilot else coordinate,
                              mode=mode, context_id=context)
-        params = runtime.model.parameters()
-        candidate = None
+        candidate = runtime.pilot_forecast(now)
         revision = "persistence"
-        if params is not None and coordinate is not None and command is not None:
-            established = datetime.fromisoformat(command["established_at"])
-            if now - established >= timedelta(minutes=params.dead_time_minutes):
-                candidate = {
-                    "loss_per_hour": params.loss_rate_per_h,
-                    "command_gain_per_hour": params.heating_rate_k_per_h,
-                    "background_per_hour": params.gains_k_per_h,
-                }
-                import hashlib
-                revision = "rtm:" + hashlib.sha256(
-                    repr((runtime.model._last_fit_ts, candidate)).encode()
-                ).hexdigest()
+        if candidate is not None:
+            if audit.fixed_pending and audit.fixed_pending.get("revision") == "persistence":
+                if reported <= datetime.fromisoformat(audit.fixed_pending["source_reported"]):
+                    return
+                audit.cancel_shared("pilot_forecast_available", now)
+            coefficients = tuple(candidate[key] for key in ("loss", "gain", "background"))
+            parameter_hash = hashlib.sha256(repr(coefficients).encode()).hexdigest()
+            revision = f"pilot:{candidate['fit_end']}:{parameter_hash}"
+            coordinate = None
         audit.issue_shared(
             now, observation["indoor_c"], observation["outdoor_c"], None, identity,
             revision=revision, context_id=context, command=coordinate, mode=mode,
-            candidate=candidate, source_reported=reported,
+            pilot=candidate, source_reported=reported,
         )
 
     def _maybe_schedule_thermal_fit(self, now: datetime) -> None:
@@ -1881,6 +1986,7 @@ class PumpSteerSensor(RestoreEntity):
             "outdoor": outdoor,
             "outdoor_reported_at": getattr(outdoor_state, "last_reported", None),
             "outdoor_source": identity[1],
+            "pilot_heat_source": self._pilot_heat_entity(cfg),
             "requested_virtual_outdoor": fake_temp,
             "mode": mode,
             "brake_factor": extra.get("brake_factor", 0.0),
@@ -4045,8 +4151,17 @@ class PumpSteerSensor(RestoreEntity):
             expected,
         )
         if cfg.get("thermal_intelligence_enabled") is True:
+            now = dt_util.now()
             try:
-                self._update_shared_thermal_audit(now, cfg)
+                if self._temperature_inputs_match(cfg, expected):
+                    self._listen_to_pilot_inputs(cfg)
+                    self._capture_pilot_inputs(now, cfg)
+                    self._thermal_intelligence.collect_pilot_house(now)
+                    self._update_shared_thermal_audit(now, cfg)
+                else:
+                    reason = "temperature_changed_during_update"
+                    self._thermal_intelligence.suspend(reason, now)
+                    self._plan_audit.cancel_shared(reason, now)
             except Exception:
                 self._plan_audit.cancel_shared("shared_audit_error", now)
                 _LOGGER.debug("Shared thermal audit unavailable", exc_info=True)
@@ -4109,12 +4224,12 @@ class PumpSteerSensor(RestoreEntity):
         self._power_signature = None
         self._power_last_report = None
 
-    def _heating_mode_state(self, cfg):
+    def _heating_mode_state(self, cfg, *, get_state=None):
         """Interpret the configured polarity without changing report timestamps."""
         from types import SimpleNamespace
 
         entity_id = cfg.get("thermal_heating_mode_entity")
-        state = self.hass.states.get(entity_id) if entity_id else None
+        state = (get_state or self.hass.states.get)(entity_id) if entity_id else None
         if cfg.get("thermal_heating_mode_inverted") is not True or getattr(
             state, "state", None
         ) not in ("on", "off"):
