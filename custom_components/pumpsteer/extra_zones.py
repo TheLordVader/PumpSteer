@@ -32,6 +32,18 @@ def _temperature(state, now, max_age=_MAX_AGE):
     return None
 
 
+
+def _aware_time(value):
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+    if isinstance(value, datetime) and value.utcoffset() is not None:
+        return value.astimezone(timezone.utc)
+    return None
+
+
 def _trend(samples):
     """Least squares over continuous reports; expose fit before extrapolating."""
     if len(samples) < 7 or samples[-1][0] - samples[0][0] < timedelta(minutes=30):
@@ -250,6 +262,33 @@ class ExtraZones:
             else zone["events"].get(event, False)
         )
 
+    def _zone_reading(self, zone, state, now):
+        """Use a source temperature timestamp when the input provides one."""
+        value = _temperature(state, now)
+        if value is None:
+            return None, None
+        ha_report = state.last_reported.astimezone(timezone.utc)
+        attrs = state.attributes or {}
+        if not zone["measurement_time_required"] and "measurement_time" not in attrs:
+            return value, ha_report
+
+        measured = _aware_time(attrs.get("measurement_time"))
+        previous = zone["source_measurement"]
+        if (
+            measured is None
+            or not now - _MAX_AGE <= measured <= ha_report
+            or (self._started_at is not None and measured <= self._started_at)
+            or (
+                previous is not None
+                and (
+                    measured < previous[0]
+                    or (measured == previous[0] and value != previous[1])
+                )
+            )
+        ):
+            return None, None
+        return value, measured
+
     def notification_payload(self, alert, now, states):
         """Recheck the observations before an asynchronously queued message."""
         if not self.notification_current(alert):
@@ -258,7 +297,7 @@ class ExtraZones:
         zone = self._zones[alert["slot"]]
         entity, threshold, _, _, climate_entity, _ = zone["signature"]
         state = states.get(entity)
-        value = _temperature(state, now)
+        value, report = self._zone_reading(zone, state, now)
         event = alert["event"]
         if event == "sensor_fault":
             if value is not None:
@@ -267,7 +306,7 @@ class ExtraZones:
             if (
                 value is None
                 or value != alert.get("temperature")
-                or getattr(state, "last_reported", None) != zone["report"]
+                or report != zone["report"]
             ):
                 return None
             if event == "recovery" and (threshold is None or value < threshold + 0.5):
@@ -315,15 +354,17 @@ class ExtraZones:
         if chain is not None and report <= chain[1]:
             return
         previous_value = zone["last_valid_temperature"]
-        if value == previous_value:
-            return
+        if not zone["measurement_time_required"]:
+            # Without source timestamps, a new HA time can be a cache replay.
+            if value == previous_value:
+                return
+            if previous_value is None:
+                zone["last_valid_temperature"] = value
+                return
 
-        # An unchanged MQTT cache value can acquire a new HA timestamp.
-        # Only changed readings count, and the chain must hold for a full
-        # freshness window without a gap longer than that window.
+        # Confirm a full freshness window without a gap. A timestamped source
+        # can establish that continuity even when the temperature stays still.
         zone["last_valid_temperature"] = value
-        if previous_value is None:
-            return
         if chain is None or report - chain[1] > _MAX_AGE:
             zone["sensor_recovery"] = (report, report)
         elif report - chain[0] >= _MAX_AGE:
@@ -401,6 +442,13 @@ class ExtraZones:
                         else any(sent.get(event) is True for event in _EVENTS)
                     )
                 )
+                saved_measurement = saved.get("source_measurement") if same else None
+                prior_source = None
+                if isinstance(saved_measurement, dict):
+                    source_time = _aware_time(saved_measurement.get("at"))
+                    source_value = safe_float(saved_measurement.get("temperature"))
+                    if source_time is not None and source_value is not None:
+                        prior_source = (source_time, source_value)
                 zone = {
                     "signature": signature,
                     "generation": object(),
@@ -426,6 +474,10 @@ class ExtraZones:
                     ),
                     "sensor_recovery": None,
                     "sensor_fault_after": None,
+                    "measurement_time_required": (
+                        same and saved.get("measurement_time_required") is True
+                    ),
+                    "source_measurement": prior_source,
                     "samples": [],
                     "heat_since": None,
                     "climate_report": None,
@@ -451,11 +503,15 @@ class ExtraZones:
                 }
                 self._zones[slot] = zone
             state = states.get(entity)
-            value = _temperature(state, now)
+            attrs = getattr(state, "attributes", {}) or {}
+            if not zone["measurement_time_required"] and "measurement_time" in attrs:
+                zone["measurement_time_required"] = True
+                zone["report"] = None
+                zone["sensor_recovery"] = None
+            value, report = self._zone_reading(zone, state, now)
             valid = value is not None and threshold is not None
-            report = getattr(state, "last_reported", None)
-            if isinstance(report, datetime) and report.utcoffset() is not None:
-                report = report.astimezone(timezone.utc)
+            if valid and zone["measurement_time_required"]:
+                zone["source_measurement"] = (report, value)
             if valid and zone["restored_active"] and self._started_at is not None:
                 if report <= self._started_at:
                     valid = False
@@ -758,14 +814,21 @@ class ExtraZones:
                 if zone["since"]
                 else "normal"
             )
+            ha_report = _aware_time(getattr(state, "last_reported", None))
+            source_measurement = zone["source_measurement"]
             result[str(slot)] = {
                 "name": cfg.get("name") or entity,
                 "entity": entity,
                 "temperature": value if valid else None,
                 "status": status,
-                "last_reported": report.isoformat()
-                if isinstance(report, datetime)
-                else None,
+                "last_reported": ha_report.isoformat() if ha_report is not None else None,
+                "measurement_time_required": zone["measurement_time_required"],
+                "source_measurement": (
+                    {"at": source_measurement[0].isoformat(),
+                     "temperature": source_measurement[1]}
+                    if source_measurement is not None
+                    else None
+                ),
                 "report_fresh": valid,
                 "last_valid_temperature": zone["last_valid_temperature"],
                 "physical_measurement_time": "unknown",

@@ -533,6 +533,19 @@ three-hour horizon or when cooling stops. Estimates are observational linear
 extrapolations, not verified thermal predictions. HA report time does not prove
 physical measurement time.
 
+A zone temperature entity may expose `measurement_time` as an ISO 8601
+timestamp with a time zone. Use the source time of the temperature sample and
+preserve it when forwarding cached values. `last_seen` shows device contact and
+does not qualify as a temperature timestamp. Once this attribute is supplied,
+missing, invalid and expired timestamps make the reading unavailable. A
+replayed sample keeps its original age and cannot advance recovery.
+
+A reported sensor fault stays open until new observations span the existing
+60-minute freshness window without a gap exceeding that window. A timestamped
+source can confirm recovery at a stable temperature. With HA report time alone,
+recovery needs temperature changes. Low-temperature alarms are evaluated
+independently of the fault confirmation.
+
 An optional climate entity is **only read**; it may supply its setpoint,
 `hvac_action` and, when exposed, numeric `pi_heating_demand`, `valve_position`
 or `heating_demand` (percent). A setpoint or heat request alone does not prove
