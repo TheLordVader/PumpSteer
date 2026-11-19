@@ -78,10 +78,11 @@ def test_duplicate_cannot_renew_source_validity():
                                              through=time(900), output_clamp=12) == []
 
 
-def test_ha_republication_cannot_extend_same_physical_measurement():
+@pytest.mark.parametrize("observation_key", ["measured_at", "source_observed_at"])
+def test_ha_republication_cannot_extend_same_physical_measurement(observation_key):
     evidence = runtime()
-    original = report("heat", 0, 1, measured_at=time(-1), valid_until=time(300))
-    duplicate = report("heat", 180, 1, measured_at=time(-1))
+    original = report("heat", 0, 1, valid_until=time(300), **{observation_key: time(-1)})
+    duplicate = report("heat", 180, 1, **{observation_key: time(-1)})
     assert evidence.pilot_response_intervals(sources() + [original, duplicate],
                                              through=time(900), output_clamp=12) == []
 

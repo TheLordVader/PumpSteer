@@ -22,6 +22,7 @@ _MAX_GAP_MINUTES = 60.0
 _OUTDOOR_MAX_AGE = timedelta(hours=3)
 _PILOT_HEAT_MAX_AGE = timedelta(minutes=5)
 _PILOT_HISTORY_HOURS = 336
+_PILOT_SOURCE_TIME_VERSION = 1
 _COUNTER_LIMIT = 2**63 - 1
 _COUNTER_KEYS = (
     "source_numeric_changes", "source_change_attempts", "source_changes_accepted",
@@ -100,6 +101,7 @@ class ThermalIntelligence:
         self._pilot_key = None
         self._pilot_intervals = deque(maxlen=_PILOT_HISTORY_HOURS)
         self._pilot_inputs = {}
+        self._pilot_source_times = {}
         self._pilot_anchor = None
         self._pilot_window = None
         self._pilot_input_epoch = 0
@@ -169,7 +171,7 @@ class ThermalIntelligence:
     def pilot_context_id(self) -> str:
         return f"{self.context_id}:{self._pilot_input_epoch}"
 
-    def record_pilot_input(self, at, role, source, report) -> None:
+    def record_pilot_input(self, at, role, source, report, *, source_time_required=False) -> None:
         """Record an independent report or loss of input in the common chain."""
         at = _timestamp(at)
         if not self.pilot_only or self._active_cycle is None or at is None or not source:
@@ -178,15 +180,36 @@ class ThermalIntelligence:
         if source_key is None or source != self._active_cycle.get(source_key):
             return
         age_limit = _PILOT_HEAT_MAX_AGE if role == "heat" else _OUTDOOR_MAX_AGE
-        reported, value = report if report is not None else (None, None)
-        reported, value = _timestamp(reported), _number(value)
-        if (reported is None or not timedelta(0) <= at - reported < age_limit
-                or value is None or (role == "heat" and value not in (0, 1))):
-            reported, value = None, None
+        reported, value, observed = report if report is not None else (None, None, None)
+        reported = _timestamp(reported)
+        value = _number(value)
+        observed_at = _timestamp(observed)
+        age_origin = observed_at or reported
+        intensity = role == "heat" and source.startswith("sensor.")
+        if (
+            reported is None or reported > at or value is None
+            or (observed is not None and (observed_at is None or observed_at > reported))
+            or not timedelta(0) <= at - age_origin < age_limit
+            or (intensity and (observed_at is None or not 0 <= value <= 1))
+            or (role == "heat" and not intensity and value not in (0, 1))
+        ):
+            reported, value, observed_at = None, None, None
         prior = self._pilot_inputs.get(role)
+        prior_source, prior_observed = self._pilot_source_times.get(role, (None, None))
+        needs_source_time = source_time_required or observed is not None or prior_source == source
+        if reported is not None and needs_source_time and (
+            observed_at is None or (prior_source == source and prior_observed is not None
+                                    and observed_at <= prior_observed)
+        ):
+            if (observed_at == prior_observed and prior is not None and prior["qualified"]
+                    and observed_at is not None and value == prior["value"]):
+                return  # A republication cannot extend this observation's validity.
+            reported, value, observed_at = None, None, None
         if prior is not None:
             previous_report = _timestamp(prior["reported_at"])
-            if reported == previous_report and value == prior["value"] and source == prior["entity"]:
+            if (reported == previous_report and value == prior["value"] and source == prior["entity"]
+                    and observed_at == _timestamp(prior.get("source_observed_at"))
+                    and needs_source_time == prior.get("source_time_required")):
                 return
             change_at = reported if reported is not None and value != prior["value"] else at
             late = (change_at < at or (self._events and at < _timestamp(self._events[-1]["at"])))
@@ -205,19 +228,25 @@ class ThermalIntelligence:
                 self._pilot_input_epoch += 1
                 self._pilot_anchor = self._pilot_window = None
                 if previous_report is not None and reported is not None and reported <= previous_report:
-                    reported, value = None, None
-        if reported is None and prior is None:
+                    reported, value, observed_at = None, None, None
+        if reported is None and prior is None and not source_time_required:
             return
+        if observed_at is not None:
+            self._pilot_source_times[role] = (source, observed_at)
+        elif needs_source_time and source != prior_source:
+            self._pilot_source_times[role] = (source, None)
         fields = {}
         if role == "heat":
-            fields = {"semantics": "space_heat_duty", "operation": {
+            fields = {"semantics": "space_heat_intensity" if intensity else "space_heat_duty", "operation": {
                 "learning_qualified": reported is not None,
-                "mode": "space_heating" if value == 1 else "idle" if value == 0 else "unknown",
+                "mode": "unknown" if value is None else "space_heating" if value > 0 else "idle",
             }}
         self._pilot_inputs[role] = self._append(
             "temperature", at, role=f"pilot_{role}", pilot_role=role, entity=source,
             value=value, reported_at=reported.isoformat() if reported is not None else None,
-            valid_until=(reported + age_limit).isoformat() if reported is not None else None,
+            source_observed_at=observed_at.isoformat() if observed_at is not None else None,
+            source_time_required=needs_source_time,
+            valid_until=(age_origin + age_limit).isoformat() if reported is not None else None,
             qualified=reported is not None, physical_time_known=False, **fields,
         )
 
@@ -449,7 +478,8 @@ class ThermalIntelligence:
                      cycle.get("outdoor_source"), cycle.get("command_source"))
         regime = classify_regime(cycle.get("mode"), _number(cycle.get("brake_factor")))
         heat_source = cycle.get("pilot_heat_source") if self.pilot_only else None
-        context = (signature, cycle.get("mode"), regime, cycle.get("gos_active"), use_ohmigo_input, heat_source)
+        time_contract = cycle.get("pilot_time_contract") if heat_source else None
+        context = (signature, cycle.get("mode"), regime, cycle.get("gos_active"), use_ohmigo_input, heat_source, time_contract)
         if context != self._context_signature:
             if self._context_signature:
                 self._last_interruption = None
@@ -472,7 +502,7 @@ class ThermalIntelligence:
             self._last_training_at = None
         self._source_signature = signature
         if heat_source:
-            key = repr((signature[:2], heat_source))
+            key = repr((signature[:2], heat_source, time_contract))
             if self._pilot_key != key:
                 self._pilot_key = key
                 self._pilot_intervals.clear()
@@ -722,7 +752,7 @@ class ThermalIntelligence:
                     "segment": self._segment, "diagnostic_counters": dict(self._counters),
                     "counter_started_at": self._counter_started_at.isoformat() if self._counter_started_at else None}
         if self._pilot_key is not None:
-            state["pilot_house"] = {"key": self._pilot_key,
+            state["pilot_house"] = {"key": self._pilot_key, "source_time_version": _PILOT_SOURCE_TIME_VERSION,
                                     "intervals": [asdict(row) for row in self._pilot_intervals]}
         return deepcopy(state)
 
@@ -776,6 +806,16 @@ class ThermalIntelligence:
             self._latest_observation = None
             # Reconstruct source values only to suppress identical republishes.
             for row in self._events:
+                role, entity = row.get("pilot_role"), row.get("entity")
+                observed = _timestamp(row.get("source_observed_at"))
+                reported = _timestamp(row.get("reported_at"))
+                if isinstance(role, str) and role in {"heat", "outdoor"} and isinstance(entity, str):
+                    if (row.get("qualified") is True and observed is not None and reported is not None
+                            and observed <= reported <= _timestamp(row["at"])):
+                        self._pilot_source_times[role] = (entity, observed)
+                    elif (row.get("source_time_required") is True
+                          and self._pilot_source_times.get(role, (None, None))[0] != entity):
+                        self._pilot_source_times[role] = (entity, None)
                 if row["kind"] == "temperature" and _number(row.get("value")) is not None:
                     self._last_numeric_values[row["role"] + ":" + row["entity"]] = _number(row["value"])
                 if row["kind"] == "temperature" and row.get("timestamp_valid"):
@@ -807,7 +847,8 @@ class ThermalIntelligence:
         return True
 
     def _restore_pilot_house(self, payload, through) -> None:
-        if not isinstance(payload, dict) or not isinstance(payload.get("key"), str):
+        if (not isinstance(payload, dict) or payload.get("source_time_version") != _PILOT_SOURCE_TIME_VERSION
+                or not isinstance(payload.get("key"), str)):
             return
         values = payload.get("intervals")
         if not isinstance(values, list) or len(values) > _PILOT_HISTORY_HOURS:

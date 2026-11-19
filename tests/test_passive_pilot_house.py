@@ -71,17 +71,131 @@ def _state(value, at, *, unit=None, changed=None):
 def test_verified_space_heat_does_not_need_fresh_supporting_bits():
     at = time(3600)
     verified = _state("on", at)
+    assert HeatOperation.learning_report(at, verified) is None
     stale = _state("off", at - timedelta(minutes=30))
     assert HeatOperation.learning_report(
-        at, verified, compressor=stale, radiator=stale
-    ) == (at, 1)
+        at, verified, compressor=stale, radiator=stale, allow_report_only=True
+    ) == (at, 1, None)
     assert (
-        HeatOperation.learning_report(at, verified, compressor=_state("off", at))
+        HeatOperation.learning_report(
+            at, verified, compressor=_state("off", at), allow_report_only=True
+        )
         is None
     )
-    assert HeatOperation.learning_report(at, verified, water=_state("on", at)) is None
+    assert (
+        HeatOperation.learning_report(
+            at, verified, water=_state("on", at), allow_report_only=True
+        )
+        is None
+    )
     assert HeatOperation.learning_report(at, None, compressor=_state("on", at)) is None
-    assert HeatOperation.learning_report(at, _state("off", at)) == (at, 0)
+    assert HeatOperation.learning_report(
+        at, _state("off", at), allow_report_only=True
+    ) == (at, 0, None)
+
+
+@pytest.mark.parametrize("source_time", [time(0), time(1201), "not-a-date", None])
+def test_fresh_ha_write_cannot_qualify_invalid_source_time(source_time):
+    at = time(1200)
+    heat = _state("on", at)
+    heat.attributes["measurement_time"] = source_time
+    assert HeatOperation.learning_report(at, heat, allow_report_only=True) is None
+
+
+def test_republication_cannot_keep_a_pilot_heat_measurement_alive():
+    from custom_components.pumpsteer.thermal_intelligence.runtime import (
+        ThermalIntelligence,
+    )
+
+    runtime = ThermalIntelligence(pilot_only=True)
+    _start_cycle(runtime, time(10), 20)
+    _inputs(runtime, 10)
+    runtime.record_pilot_input(
+        time(11),
+        "heat",
+        "binary_sensor.space_heat",
+        (time(11), 1, time(1)),
+    )
+    runtime.record_pilot_input(
+        time(250),
+        "heat",
+        "binary_sensor.space_heat",
+        (time(250), 1, time(1)),
+    )
+    assert runtime.pilot_inputs_valid(time(300))
+    assert not runtime.pilot_inputs_valid(time(301))
+    assert (
+        runtime.export_state()["events"][-1]["source_observed_at"]
+        == time(1).isoformat()
+    )
+    runtime.record_pilot_input(
+        time(310), "heat", "binary_sensor.space_heat", (time(310), 1, None)
+    )
+    assert not runtime.pilot_inputs_valid(time(310))
+    restored = ThermalIntelligence(pilot_only=True)
+    assert restored.restore_state(runtime.export_state())
+    _start_cycle(restored, time(320), 20.1)
+    _inputs(restored, 320)
+    assert not restored.pilot_inputs_valid(time(320))
+    restored.record_pilot_input(
+        time(321), "heat", "binary_sensor.space_heat", (time(321), 1, time(320))
+    )
+    assert restored.pilot_inputs_valid(time(321))
+
+
+def test_intensity_requires_a_dated_percentage_of_space_heating():
+    at = time(1200)
+    load = _state("42", at, unit="%")
+    assert HeatOperation.learning_report(at, load, intensity=True) is None
+    load.attributes["measurement_time"] = time(1198).timestamp()
+    report = HeatOperation.learning_report(at, load, intensity=True)
+    assert report.reported_at == at
+    assert report.source_observed_at == time(1198)
+    assert report.value == pytest.approx(0.42)
+    assert (
+        HeatOperation.learning_report(at, load, intensity=True, water=_state("on", at))
+        is None
+    )
+    load.attributes["unit_of_measurement"] = "W"
+    assert HeatOperation.learning_report(at, load, intensity=True) is None
+
+
+def test_dated_heat_report_keeps_both_clocks_and_rejects_a_pre_restart_sample():
+    at, observed = time(1200), time(1198)
+    heat = _state("off", at)
+    heat.attributes["observed"] = observed.isoformat()
+    report = HeatOperation.learning_report(at, heat, timestamp_attribute="observed")
+    assert report == (at, 0, observed)
+    assert (
+        HeatOperation.learning_report(
+            at, heat, timestamp_attribute="observed", reported_after=time(1199)
+        )
+        is None
+    )
+
+
+def test_observed_source_clock_remains_required_after_an_invalid_first_report():
+    from custom_components.pumpsteer.thermal_intelligence.runtime import (
+        ThermalIntelligence,
+    )
+
+    runtime = ThermalIntelligence(pilot_only=True)
+    _start_cycle(runtime, time(10), 20)
+    runtime.record_pilot_input(
+        time(10),
+        "heat",
+        "binary_sensor.space_heat",
+        None,
+        source_time_required=True,
+    )
+    # For example, an initially stale source omits its attribute after reconnect.
+    _inputs(runtime, 15)
+    assert not runtime.pilot_inputs_valid(time(15))
+    restored = ThermalIntelligence(pilot_only=True)
+    assert restored.restore_state(runtime.export_state())
+    _start_cycle(restored, time(20), 20.1)
+    _inputs(restored, 20)
+    assert not restored.pilot_inputs_valid(time(20))
 
 
 def test_shared_audit_freezes_pilot_and_restores_completed_pairs():
@@ -138,8 +252,8 @@ def _start_cycle(runtime, at, temperature, outdoor=5):
 
 def _inputs(runtime, seconds, *, outdoor=5, heat=1):
     at = time(seconds)
-    runtime.record_pilot_input(at, "outdoor", "sensor.outdoor", (at, outdoor))
-    runtime.record_pilot_input(at, "heat", "binary_sensor.space_heat", (at, heat))
+    runtime.record_pilot_input(at, "outdoor", "sensor.outdoor", (at, outdoor, None))
+    runtime.record_pilot_input(at, "heat", "binary_sensor.space_heat", (at, heat, None))
 
 
 def test_runtime_collects_without_serving_new_rc_and_restores_closed_house_intervals():
@@ -171,6 +285,11 @@ def test_runtime_collects_without_serving_new_rc_and_restores_closed_house_inter
     assert restored.summary()["pilot_house_intervals"] == 1
     # Legacy readers can still restore the common history on rollback.
     assert ThermalIntelligence().restore_state(runtime.export_state())
+    legacy = runtime.export_state()
+    legacy["pilot_house"].pop("source_time_version")
+    assert restored.restore_state(legacy)
+    assert restored.summary()["pilot_house_intervals"] == 0
+    assert restored.summary()["evidence_events"] >= len(legacy["events"])
 
 
 def test_continuously_on_heat_does_not_qualify_a_model():
@@ -278,9 +397,11 @@ def test_runtime_fits_pilot_and_scores_a_later_observation_in_the_controller_aud
     assert not runtime.apply_fit_result(token, runtime.static_fit(snapshot))
 
 
-@pytest.mark.parametrize("external_heat", [False, True])
+@pytest.mark.parametrize(
+    "external_heat,intensity", [(False, False), (True, False), (False, True)]
+)
 def test_controller_collects_heat_changes_between_ticks_with_one_sensor(
-    request, monkeypatch, external_heat
+    request, monkeypatch, external_heat, intensity
 ):
     import asyncio
     from importlib import import_module
@@ -288,9 +409,13 @@ def test_controller_collects_heat_changes_between_ticks_with_one_sensor(
     ha_event = import_module("homeassistant.helpers.event")
 
     sensor, states, clock = request.getfixturevalue("control")
+    heat_source = (
+        "sensor.space_heat_percent" if intensity else "binary_sensor.space_heat"
+    )
     sensor._config_entry.options.update(
         thermal_intelligence_enabled=True,
-        thermal_heat_activity_entity="binary_sensor.space_heat",
+        thermal_heat_activity_entity=heat_source,
+        thermal_detection_method="verified",
         adaptive_braking_enabled=False,
         modbus_service="",
     )
@@ -307,11 +432,20 @@ def test_controller_collects_heat_changes_between_ticks_with_one_sensor(
 
     monkeypatch.setattr(ha_event, "async_track_state_change_event", subscribe)
     began = clock[0]
-    heat_source = "binary_sensor.space_heat"
     for entity in ("sensor.indoor", "sensor.outdoor"):
         states[entity].last_reported = began
         states[entity].attributes = {"unit_of_measurement": "°C"}
-    states[heat_source] = _state("off", began)
+
+    def heat_state(active, at):
+        if intensity:
+            state = _state("50" if active else "0", at, unit="%")
+            state.attributes["measurement_time"] = (
+                at - timedelta(seconds=1)
+            ).isoformat()
+            return state
+        return _state("on" if active else "off", at)
+
+    states[heat_source] = heat_state(False, began)
     asyncio.run(sensor._do_update())
     assert heat_source in callbacks
     outputs = len(sensor.hass.services.calls)
@@ -330,8 +464,7 @@ def test_controller_collects_heat_changes_between_ticks_with_one_sensor(
                     },
                 )
             )
-        value = "on" if 10 <= minute < 40 else "off"
-        states[heat_source] = _state(value, clock[0])
+        states[heat_source] = heat_state(10 <= minute < 40, clock[0])
         callbacks[heat_source](
             SimpleNamespace(
                 time_fired=clock[0],
@@ -343,13 +476,14 @@ def test_controller_collects_heat_changes_between_ticks_with_one_sensor(
     states["sensor.indoor"].state = "20.9"
     for entity in ("sensor.indoor", "sensor.outdoor"):
         states[entity].last_reported = clock[0]
-    states[heat_source] = _state("off", clock[0])
+    states[heat_source] = heat_state(False, clock[0])
     asyncio.run(sensor._do_update())
     history = sensor._thermal_intelligence.export_state()["pilot_house"]["intervals"]
     if external_heat:
         assert not history
     else:
-        assert len(history) == 1 and history[0]["heat"] == pytest.approx(0.5)
+        expected_heat = 0.25 if intensity else 0.5
+        assert len(history) == 1 and history[0]["heat"] == pytest.approx(expected_heat)
     assert sensor._thermal_intelligence.model.parameters() is None
     assert sensor._attributes["adaptive_braking"]["multiplier"] == 1
 
@@ -369,7 +503,7 @@ def test_pilot_retracts_completed_interval_when_a_dated_heat_change_arrives_late
     assert runtime.collect_pilot_house(time(3600)) is not None
     previous = runtime.pilot_context_id
     runtime.record_pilot_input(
-        time(3603), "heat", "binary_sensor.space_heat", (time(3570), 0)
+        time(3603), "heat", "binary_sensor.space_heat", (time(3570), 0, None)
     )
     assert runtime.summary()["pilot_house_intervals"] == 0
     assert runtime.pilot_context_id != previous

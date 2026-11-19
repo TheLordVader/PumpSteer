@@ -1748,15 +1748,20 @@ class PumpSteerSensor(RestoreEntity):
     @staticmethod
     def _pilot_heat_entity(cfg):
         heat = cfg.get("thermal_heat_activity_entity")
+        method = cfg.get("thermal_detection_method")
         if (
             isinstance(heat, str)
-            and heat.startswith("binary_sensor.")
-            and cfg.get("thermal_detection_method") != "manual"
+            and (
+                heat.startswith("binary_sensor.")
+                or (heat.startswith("sensor.") and method == "verified")
+            )
+            and method != "manual"
             and heat not in {
                 cfg.get("thermal_compressor_entity"),
                 cfg.get("thermal_heating_mode_entity"),
                 cfg.get("thermal_hot_water_mode_entity"),
                 cfg.get("thermal_external_heat_entity"),
+                cfg.get("thermal_power_entity"),
             }
         ):
             return heat
@@ -1819,24 +1824,37 @@ class PumpSteerSensor(RestoreEntity):
 
         runtime = self._thermal_intelligence
         cutoff = self._temperature_reported_after
+        time_attribute = cfg.get("control_measurement_time_attribute", "measurement_time")
         if entity is None or entity != outdoor:
+            state = get_state(heat)
             external = cfg.get("thermal_external_heat_entity")
             disturbed = external_heat_status(
                 now, cfg, {external: get_state(external)}, measured_after=cutoff
             ) == "verified_active"
             report = None if disturbed else HeatOperation.learning_report(
-                now, get_state(heat), compressor=get_state(cfg.get("thermal_compressor_entity")),
+                now, state, compressor=get_state(cfg.get("thermal_compressor_entity")),
                 radiator=self._heating_mode_state(cfg, get_state=get_state),
                 water=get_state(cfg.get("thermal_hot_water_mode_entity")), reported_after=cutoff,
+                timestamp_attribute=time_attribute,
+                allow_report_only=cfg.get("thermal_detection_method") == "verified",
+                intensity=heat.startswith("sensor."),
             )
             # Use the HA event time or the tick's observation time. The
             # source's reported_at is preserved separately in the evidence.
-            runtime.record_pilot_input(now, "heat", heat, report)
+            runtime.record_pilot_input(
+                now, "heat", heat, report,
+                source_time_required=PilotPassive.source_time_key(state, time_attribute) is not None,
+            )
         if entity is None or entity == outdoor:
             state = get_state(outdoor) if entity else self._temperature_state(cfg, "real_outdoor_entity")
-            report = PilotPassive._report(state, now, temperature=True,
-                                          reported_after=cutoff, max_age=None)
-            runtime.record_pilot_input(now, "outdoor", outdoor, report)
+            report = PilotPassive.input_report(
+                state, now, temperature=True, timestamp_attribute=time_attribute,
+                reported_after=cutoff, max_age=None, allow_report_only=True,
+            )
+            runtime.record_pilot_input(
+                now, "outdoor", outdoor, report,
+                source_time_required=PilotPassive.source_time_key(state, time_attribute) is not None,
+            )
 
     def _update_shared_thermal_audit(self, now, cfg):
         """Use the single audit for persistence and a frozen passive candidate."""
@@ -1987,6 +2005,10 @@ class PumpSteerSensor(RestoreEntity):
             "outdoor_reported_at": getattr(outdoor_state, "last_reported", None),
             "outdoor_source": identity[1],
             "pilot_heat_source": self._pilot_heat_entity(cfg),
+            "pilot_time_contract": (
+                cfg.get("control_measurement_time_attribute", "measurement_time"),
+                cfg.get("thermal_detection_method") == "verified",
+            ),
             "requested_virtual_outdoor": fake_temp,
             "mode": mode,
             "brake_factor": extra.get("brake_factor", 0.0),
@@ -5616,6 +5638,8 @@ class PumpSteerSensor(RestoreEntity):
             if use_supply
             else "binary_heat_indicator"
             if isinstance(source, str) and source.startswith("binary_sensor.")
+            else "space_heat_intensity"
+            if isinstance(source, str) and source.startswith("sensor.") and self._pilot_heat_entity(cfg) == source
             else "unavailable"
         )
         operation = None

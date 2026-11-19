@@ -5,7 +5,7 @@ command and never turns inferred electrical power or compressor status into heat
 """
 
 from collections import deque
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 import math
 from typing import NamedTuple
 
@@ -18,7 +18,13 @@ class _PilotReport(NamedTuple):
     identity: tuple[str, str | None]
     reported_at: datetime
     value: float
-    measured_at: datetime | None
+    source_observed_at: datetime | None
+
+
+class PilotInputReport(NamedTuple):
+    reported_at: datetime
+    value: float
+    source_observed_at: datetime | None
 
 
 class PilotPassive:
@@ -201,6 +207,7 @@ class PilotPassive:
         now,
         *,
         temperature=False,
+        intensity=False,
         reported_after=None,
         max_age=timedelta(minutes=5),
     ):
@@ -249,6 +256,12 @@ class PilotPassive:
                 value = float(state.state)
                 if not math.isfinite(value) or not -50 <= value <= 60:
                     return None
+            elif intensity:
+                if state.attributes.get("unit_of_measurement") != "%":
+                    return None
+                value = float(state.state) / 100
+                if not 0 <= value <= 1:
+                    return None
             else:
                 if state.state not in ("on", "off"):
                     return None
@@ -256,6 +269,55 @@ class PilotPassive:
             return at, value
         except (AttributeError, TypeError, ValueError, OverflowError):
             return None
+
+    @staticmethod
+    def source_time_key(state, timestamp_attribute):
+        attributes = getattr(state, "attributes", {}) or {}
+        if isinstance(timestamp_attribute, str) and timestamp_attribute in attributes:
+            return timestamp_attribute
+        return "measurement_time" if "measurement_time" in attributes else None
+
+    @staticmethod
+    def input_report(
+        state,
+        now,
+        *,
+        timestamp_attribute="measurement_time",
+        allow_report_only=False,
+        reported_after=None,
+        max_age=timedelta(minutes=5),
+        temperature=False,
+        intensity=False,
+    ) -> PilotInputReport | None:
+        """Keep HA receipt and verified source observation time separate."""
+        from .control_intelligence import _timestamp as source_timestamp
+
+        report = PilotPassive._report(
+            state, now, temperature=temperature, intensity=intensity,
+            reported_after=reported_after, max_age=max_age,
+        )
+        if report is None:
+            return None
+        key = PilotPassive.source_time_key(state, timestamp_attribute)
+        if key is None:
+            if allow_report_only and not intensity:
+                return PilotInputReport(*report, None)
+            return None
+        try:
+            source_seconds = source_timestamp(state.attributes[key])
+            if source_seconds is None:
+                return None
+            observed = datetime.fromtimestamp(source_seconds, tz=UTC)
+        except (ValueError, OverflowError, OSError):
+            return None
+        reported, value = report
+        if (
+            observed > reported
+            or (max_age is not None and now - observed >= max_age)
+            or (reported_after is not None and observed <= reported_after)
+        ):
+            return None
+        return PilotInputReport(reported, value, observed)
 
     def validated_house(self, now):
         """Validate a frozen Pilot house fit on later actual interval endpoints."""
@@ -343,8 +405,10 @@ class PilotPassive:
         Both inputs are in capture order. Reports have `role` (outdoor, receiver
         or heat), `source`, `value`, and an explicit `qualified` decision from the
         caller. `at` is capture time, `reported_at` is the source report time,
-        `measured_at` is optional physical time, and `valid_until` is the latest
-        time the source contract can substantiate the held value.
+        `source_observed_at` is optional provenance for a source sample.
+        `measured_at` is the time of an independently dated physical observation.
+        `valid_until` bounds the held value. A known source sample cannot renew
+        coverage through HA republication.
         A heat report needs a contemporaneous HeatOperation decision and a
         qualified duty or normalized intensity signal. The receiver must be
         verified separately from dispatch. `through` bounds the observed run.
@@ -464,11 +528,15 @@ class PilotPassive:
                     identity = (source, row.get("semantics"))
                     reported = _timestamp(row.get("reported_at"))
                     physical = _timestamp(row.get("measured_at"))
+                    source_time = row.get("source_observed_at")
+                    observed = _timestamp(source_time) if source_time is not None else physical
                     expiry = _timestamp(row.get("valid_until"))
                     value = qualified_value(row, role)
                     prior = seen.get(role)
                     if (reported is None or reported.timestamp() > at
-                            or (row.get("measured_at") is not None and (physical is None or physical > reported))):
+                            or (row.get("measured_at") is not None and (physical is None or physical > reported))
+                            or (source_time is not None and (observed is None or observed > reported))
+                            or (row.get("source_time_required") is True and observed is None)):
                         held.pop(role, None)
                         continue
                     effective = (physical or reported).timestamp()
@@ -483,20 +551,21 @@ class PilotPassive:
                         if identity != prior.identity:
                             # A different source or intensity scale requires a separate replay.
                             return []
-                        repeated_measurement = physical is not None and physical == prior.measured_at
+                        repeated_measurement = observed is not None and observed == prior.source_observed_at
                         same_value = value == prior.value
-                        same_report = reported == prior.reported_at and physical == prior.measured_at
+                        same_report = reported == prior.reported_at and observed == prior.source_observed_at
                         if same_value and (same_report or repeated_measurement):
                             continue
                         out_of_order = reported <= prior.reported_at or (
-                            physical is not None and prior.measured_at is not None and physical <= prior.measured_at
+                            prior.source_observed_at is not None
+                            and (observed is None or observed <= prior.source_observed_at)
                         )
                         if out_of_order or (effective < at and not same_value):
                             # Revoke affected windows; a late change is never applied retroactively.
                             revoke(role, effective)
                         if out_of_order:
                             continue
-                    seen[role] = _PilotReport(identity, reported, value, physical)
+                    seen[role] = _PilotReport(identity, reported, value, observed)
                     held[role] = expiry.timestamp()
 
                 if (eligible and roles <= held.keys() and min(held.values()) > at

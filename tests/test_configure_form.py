@@ -249,6 +249,22 @@ def test_first_supply_signal_keeps_the_detection_method_shown_in_the_form(flow):
     assert result["data"]["thermal_detection_method"] == "automatic"
 
 
+def test_verified_modulation_can_use_existing_heat_source_option(flow):
+    result = asyncio.run(
+        flow.async_step_init(
+            {
+                "heat_pump_data": {
+                    "thermal_detection_method": "verified",
+                    "thermal_heat_activity_entity": "sensor.space_heat_percent",
+                }
+            }
+        )
+    )
+    assert result["type"] == "create_entry"
+    assert result["data"]["thermal_heat_activity_entity"] == "sensor.space_heat_percent"
+    assert result["data"]["thermal_detection_method"] == "verified"
+
+
 def test_errors_target_visible_native_form_elements(flow):
     result = asyncio.run(
         flow.async_step_init(

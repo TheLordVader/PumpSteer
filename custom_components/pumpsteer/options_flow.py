@@ -642,7 +642,7 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
                 description={
                     "suggested_value": current_data.get("thermal_heat_activity_entity")
                 },
-            ): selector({"entity": {"domain": "binary_sensor"}}),
+            ): selector({"entity": {"domain": ["binary_sensor", "sensor"]}}),
             vol.Optional(
                 "thermal_power_entity",
                 description={
@@ -1008,6 +1008,7 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
                 user_input.get("thermal_compressor_entity"),
                 user_input.get("thermal_heating_mode_entity"),
                 user_input.get("thermal_hot_water_mode_entity"),
+                user_input.get("thermal_power_entity"),
             }
         ):
             errors["thermal_heat_activity_entity"] = "heat_signal_alias"
@@ -1015,7 +1016,7 @@ class PumpSteerOptionsFlowHandler(config_entries.OptionsFlow):
             errors["thermal_supply_temp_entity"] = "required"
         if heat and (
             not isinstance(heat, str)
-            or not heat.startswith("binary_sensor.")
+            or not heat.startswith(("binary_sensor.", "sensor."))
             or not self._entity_exists(heat)
         ):
             errors["thermal_heat_activity_entity"] = "entity_not_found"

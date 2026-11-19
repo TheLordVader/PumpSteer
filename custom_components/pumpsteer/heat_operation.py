@@ -73,20 +73,30 @@ class HeatOperation:
         return True
 
     @staticmethod
-    def learning_report(now, heat, *, compressor=None, radiator=None, water=None, reported_after=None):
+    def learning_report(
+        now, heat, *, compressor=None, radiator=None, water=None, reported_after=None,
+        timestamp_attribute="measurement_time", allow_report_only=False, intensity=False,
+    ):
         """Check a selected space-heat source against available context reports."""
-        report = PilotPassive._report(heat, now, reported_after=reported_after)
+        report = PilotPassive.input_report(
+            heat, now, reported_after=reported_after, timestamp_attribute=timestamp_attribute,
+            allow_report_only=allow_report_only, intensity=intensity,
+        )
         if report is None:
             return None
+        observed = report.source_observed_at or report.reported_at
         for source, blocks, mode_source in ((water, 1, True), (radiator, 0, True), (compressor, 0, False)):
-            context = PilotPassive._report(source, now, reported_after=reported_after)
+            context = PilotPassive.input_report(
+                source, now, timestamp_attribute=timestamp_attribute,
+                reported_after=reported_after, allow_report_only=True,
+            )
             if context is None:
                 continue
-            if context[1] == blocks and (mode_source or report[1] == 1):
+            if context.value == blocks and (mode_source or report.value > 0):
                 return None
             if mode_source:
                 changed = _timestamp(getattr(source, "last_changed", None))
-                if changed is not None and changed > report[0]:
+                if changed is not None and changed > observed:
                     return None
         return report
 
