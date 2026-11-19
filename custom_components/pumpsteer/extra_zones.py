@@ -291,6 +291,47 @@ class ExtraZones:
             payload.pop("related_events", None)
         return payload
 
+    @staticmethod
+    def _observe_sensor_fault(zone, now, valid, report, value):
+        events = zone["events"]
+        if not valid:
+            zone["sensor_recovery"] = None
+            zone["sensor_fault_after"] = now
+            events["sensor_fault"] = (
+                events["sensor_fault"]
+                or zone["seen"]
+                or now - zone["started"] >= _MAX_AGE
+            )
+            return
+        if not events["sensor_fault"]:
+            zone["last_valid_temperature"] = value
+            return
+        if (
+            zone["sensor_fault_after"] is not None and report <= zone["sensor_fault_after"]
+            or zone["report"] is not None and report <= zone["report"]
+        ):
+            return
+        chain = zone["sensor_recovery"]
+        if chain is not None and report <= chain[1]:
+            return
+        previous_value = zone["last_valid_temperature"]
+        if value == previous_value:
+            return
+
+        # An unchanged MQTT cache value can acquire a new HA timestamp.
+        # Only changed readings count, and the chain must hold for a full
+        # freshness window without a gap longer than that window.
+        zone["last_valid_temperature"] = value
+        if previous_value is None:
+            return
+        if chain is None or report - chain[1] > _MAX_AGE:
+            zone["sensor_recovery"] = (report, report)
+        elif report - chain[0] >= _MAX_AGE:
+            events["sensor_fault"] = False
+            zone["sensor_recovery"] = None
+        else:
+            zone["sensor_recovery"] = (chain[0], report)
+
     def observe(
         self,
         now,
@@ -376,6 +417,15 @@ class ExtraZones:
                     "seen": False,
                     "last": None,
                     "report": None,
+                    "last_valid_temperature": (
+                        safe_float(
+                            saved.get("last_valid_temperature", saved.get("temperature"))
+                        )
+                        if same
+                        else None
+                    ),
+                    "sensor_recovery": None,
+                    "sensor_fault_after": None,
                     "samples": [],
                     "heat_since": None,
                     "climate_report": None,
@@ -519,6 +569,8 @@ class ExtraZones:
                         zone["heat_since"] = now
                 else:
                     zone["heat_since"] = None
+            if enabled:
+                self._observe_sensor_fault(zone, now, valid, report, value)
             zone["last"] = now if valid else None
             zone["report"] = report if valid else None
             samples = zone["samples"]
@@ -559,11 +611,6 @@ class ExtraZones:
                     eta = None
             events = zone["events"]
             if enabled:
-                events["sensor_fault"] = not valid and (
-                    previous["sensor_fault"]
-                    or zone["seen"]
-                    or now - zone["started"] >= _MAX_AGE
-                )
                 if valid:
                     if eta is not None and eta <= 2:
                         events["forecast"] = True
@@ -640,6 +687,8 @@ class ExtraZones:
                     if event != "recovery"
                     else zone["recovery_pending"]
                 )
+                if event == "sensor_fault" and valid:
+                    raised = False
                 if event in ("temperature", "forecast", "heat_shortage") and not valid:
                     raised = False
                 if event == "forecast" and eta is None:
@@ -699,6 +748,8 @@ class ExtraZones:
                 if not valid
                 else "alarm"
                 if events["temperature"]
+                else "sensor_recovering"
+                if events["sensor_fault"]
                 else "heat_shortage"
                 if events["heat_shortage"]
                 else "forecast"
@@ -716,6 +767,7 @@ class ExtraZones:
                 if isinstance(report, datetime)
                 else None,
                 "report_fresh": valid,
+                "last_valid_temperature": zone["last_valid_temperature"],
                 "physical_measurement_time": "unknown",
                 "trend_c_per_hour": trend,
                 "trend_fit": fit,
