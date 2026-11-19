@@ -10,6 +10,7 @@ Changelog:
 """
 
 import datetime as _dt
+from enum import Enum
 import sys
 import types
 
@@ -59,6 +60,11 @@ sys.modules["homeassistant.config_entries"] = config_entries
 core = types.ModuleType("homeassistant.core")
 
 
+class CoreState(Enum):
+    starting = "STARTING"
+    running = "RUNNING"
+
+
 class HomeAssistant:
     pass
 
@@ -69,6 +75,7 @@ def callback(func):
     return func
 
 
+core.CoreState = CoreState
 core.HomeAssistant = HomeAssistant
 core.callback = callback
 sys.modules["homeassistant.core"] = core

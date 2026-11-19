@@ -32,6 +32,18 @@ def _temperature(state, now, max_age=_MAX_AGE):
     return None
 
 
+def _sensor_fault_reason(state):
+    """Only an explicit HA availability or data error establishes a fault."""
+    raw = getattr(state, "state", None)
+    attrs = getattr(state, "attributes", {}) or {}
+    if raw in (None, "unknown") or attrs.get("restored"):
+        return None
+    if raw == "unavailable":
+        return "unavailable"
+    if attrs.get("unit_of_measurement") != "°C" or temperature_from_state(state) is None:
+        return "invalid_temperature"
+    return None
+
 
 def _aware_time(value):
     if isinstance(value, str):
@@ -75,7 +87,11 @@ def zone_notification_message(alert, language="sv"):
             "temperature": "Temperaturlarm",
             "forecast": "Förvarning",
             "heat_shortage": "Misstänkt värmebrist",
-            "sensor_fault": "Givarfel: temperaturdata saknas eller är för gamla",
+            "sensor_fault": (
+                "Givarfel: HA rapporterar temperaturkällan som otillgänglig"
+                if alert.get("sensor_fault_reason") == "unavailable"
+                else "Givarfel: ogiltigt temperaturvärde eller enhet"
+            ),
             "recovery": "Återhämtning: zonens larm har upphört",
         }
         parts = [f"{alert['name']}: {reasons[event]}."]
@@ -141,7 +157,11 @@ def zone_notification_message(alert, language="sv"):
         "temperature": "Low temperature alarm",
         "forecast": "Early warning",
         "heat_shortage": "Possible insufficient heat",
-        "sensor_fault": "Sensor fault: temperature data is missing or stale",
+        "sensor_fault": (
+            "Sensor fault: HA reports the temperature source as unavailable"
+            if alert.get("sensor_fault_reason") == "unavailable"
+            else "Sensor fault: invalid temperature or unit"
+        ),
         "recovery": "Recovery: the zone alarm has cleared",
     }
     parts = [f"{alert['name']}: {reasons[event]}."]
@@ -300,7 +320,8 @@ class ExtraZones:
         value, report = self._zone_reading(zone, state, now)
         event = alert["event"]
         if event == "sensor_fault":
-            if value is not None:
+            reason = _sensor_fault_reason(state)
+            if reason is None:
                 return None
         else:
             if (
@@ -314,6 +335,8 @@ class ExtraZones:
             if event in ("forecast", "heat_shortage") and now - zone["report"] > _GAP:
                 return None
         payload = dict(alert)
+        if event == "sensor_fault":
+            payload["sensor_fault_reason"] = reason
         climate = states.get(climate_entity) if climate_entity else None
         if (
             not _fresh(climate, now, _CLIMATE_GAP)
@@ -331,47 +354,29 @@ class ExtraZones:
         return payload
 
     @staticmethod
-    def _observe_sensor_fault(zone, now, valid, report, value):
+    def _observe_sensor_fault(zone, now, reason, valid, report, value):
         events = zone["events"]
-        if not valid:
-            zone["sensor_recovery"] = None
+        if reason is not None:
+            events["sensor_fault"] = True
             zone["sensor_fault_after"] = now
-            events["sensor_fault"] = (
-                events["sensor_fault"]
-                or zone["seen"]
-                or now - zone["started"] >= _MAX_AGE
-            )
+            zone["sensor_recovery"] = None
             return
-        if not events["sensor_fault"]:
-            zone["last_valid_temperature"] = value
+        if not events["sensor_fault"] or not valid:
             return
-        if (
-            zone["sensor_fault_after"] is not None and report <= zone["sensor_fault_after"]
-            or zone["report"] is not None and report <= zone["report"]
-        ):
+        fault_after = zone["sensor_fault_after"]
+        if fault_after is not None and report <= fault_after:
             return
-        chain = zone["sensor_recovery"]
-        if chain is not None and report <= chain[1]:
-            return
-        previous_value = zone["last_valid_temperature"]
-        if not zone["measurement_time_required"]:
-            # Without source timestamps, a new HA time can be a cache replay.
-            if value == previous_value:
-                return
-            if previous_value is None:
-                zone["last_valid_temperature"] = value
-                return
 
-        # Confirm a full freshness window without a gap. A timestamped source
-        # can establish that continuity even when the temperature stays still.
-        zone["last_valid_temperature"] = value
-        if chain is None or report - chain[1] > _MAX_AGE:
-            zone["sensor_recovery"] = (report, report)
-        elif report - chain[0] >= _MAX_AGE:
+        candidate = zone["sensor_recovery"]
+        if zone["measurement_time_required"] or (
+            candidate is not None and report > candidate[0] and value != candidate[1]
+        ):
             events["sensor_fault"] = False
             zone["sensor_recovery"] = None
-        else:
-            zone["sensor_recovery"] = (chain[0], report)
+        elif candidate is None or report > candidate[0]:
+            # An unchanged HA report only advances the clock for ordering.
+            # A reconnect can replay the first value from cache.
+            zone["sensor_recovery"] = (report, value)
 
     def observe(
         self,
@@ -381,6 +386,8 @@ class ExtraZones:
         outdoor=None,
         outdoor_max_age_minutes=5,
         climate_temperature_unit=None,
+        *,
+        ha_running=True,
     ):
         now = now.astimezone(timezone.utc)
         result, alerts = {}, []
@@ -453,7 +460,6 @@ class ExtraZones:
                     "signature": signature,
                     "generation": object(),
                     "since": None,
-                    "started": now,
                     "restored_active": bool(
                         same
                         and (
@@ -462,16 +468,8 @@ class ExtraZones:
                             or saved.get("recovery_pending")
                         )
                     ),
-                    "seen": False,
                     "last": None,
                     "report": None,
-                    "last_valid_temperature": (
-                        safe_float(
-                            saved.get("last_valid_temperature", saved.get("temperature"))
-                        )
-                        if same
-                        else None
-                    ),
                     "sensor_recovery": None,
                     "sensor_fault_after": None,
                     "measurement_time_required": (
@@ -504,6 +502,9 @@ class ExtraZones:
                 self._zones[slot] = zone
             state = states.get(entity)
             attrs = getattr(state, "attributes", {}) or {}
+            fault_reason = _sensor_fault_reason(state) if ha_running else None
+            if getattr(state, "state", None) in (None, "unknown") or attrs.get("restored"):
+                zone["sensor_recovery"] = None
             if not zone["measurement_time_required"] and "measurement_time" in attrs:
                 zone["measurement_time_required"] = True
                 zone["report"] = None
@@ -592,7 +593,6 @@ class ExtraZones:
                 zone["samples"].clear()
             new_report = valid and report != zone["report"]
             if valid:
-                zone["seen"] = True
                 if new_report and (
                     not zone["samples"]
                     or report - zone["samples"][-1][0] >= timedelta(minutes=1)
@@ -625,8 +625,8 @@ class ExtraZones:
                         zone["heat_since"] = now
                 else:
                     zone["heat_since"] = None
-            if enabled:
-                self._observe_sensor_fault(zone, now, valid, report, value)
+            if enabled and ha_running:
+                self._observe_sensor_fault(zone, now, fault_reason, valid, report, value)
             zone["last"] = now if valid else None
             zone["report"] = report if valid else None
             samples = zone["samples"]
@@ -743,7 +743,7 @@ class ExtraZones:
                     if event != "recovery"
                     else zone["recovery_pending"]
                 )
-                if event == "sensor_fault" and valid:
+                if event == "sensor_fault" and fault_reason is None:
                     raised = False
                 if event in ("temperature", "forecast", "heat_shortage") and not valid:
                     raised = False
@@ -767,6 +767,9 @@ class ExtraZones:
                             "slot": slot,
                             "name": cfg.get("name") or entity,
                             "event": event,
+                            "sensor_fault_reason": (
+                                fault_reason if event == "sensor_fault" else None
+                            ),
                             "temperature": value if valid else None,
                             "threshold": threshold,
                             "estimated_hours": eta,
@@ -801,6 +804,8 @@ class ExtraZones:
                 "disabled"
                 if not enabled
                 else "unavailable"
+                if fault_reason is not None
+                else "uncertain"
                 if not valid
                 else "alarm"
                 if events["temperature"]
@@ -824,13 +829,21 @@ class ExtraZones:
                 "last_reported": ha_report.isoformat() if ha_report is not None else None,
                 "measurement_time_required": zone["measurement_time_required"],
                 "source_measurement": (
-                    {"at": source_measurement[0].isoformat(),
-                     "temperature": source_measurement[1]}
+                    {
+                        "at": source_measurement[0].isoformat(),
+                        "temperature": source_measurement[1],
+                    }
                     if source_measurement is not None
                     else None
                 ),
                 "report_fresh": valid,
-                "last_valid_temperature": zone["last_valid_temperature"],
+                "sensor_status": fault_reason or (
+                    "source_timestamp"
+                    if valid and zone["measurement_time_required"]
+                    else "ha_report"
+                    if valid
+                    else "uncertain"
+                ),
                 "physical_measurement_time": "unknown",
                 "trend_c_per_hour": trend,
                 "trend_fit": fit,

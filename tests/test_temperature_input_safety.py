@@ -5,6 +5,7 @@ from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
+from homeassistant.core import CoreState
 from test_safe_mode_output import setup_sensor  # noqa: F401 -- shared HA boundary
 
 from custom_components.pumpsteer.sensor import MODE_PI, MODE_SAFE
@@ -713,6 +714,27 @@ def test_extra_zone_alert_is_passive_and_not_repeated(control):
         sensor.extra_state_attributes["extra_temperature_zones"]["1"]["status"]
         == "alarm"
     )
+
+
+    states["sensor.garage"].state = "unavailable"
+    for core_state, expected_fault, expected_messages in (
+        (CoreState.starting, False, 1),
+        (CoreState.running, True, 2),
+        (CoreState.running, True, 2),
+    ):
+        sensor.hass.state = core_state
+        _report(states, clock)
+        states["sensor.garage"].last_reported = clock[0]
+        asyncio.run(sensor.async_update())
+        attrs = sensor.extra_state_attributes
+        assert attrs["mode"] == MODE_PI
+        assert attrs["indoor_temperature"] == 21
+        zone = attrs["extra_temperature_zones"]["1"]
+        assert zone["events"]["sensor_fault"] is expected_fault
+        assert zone["events"]["temperature"]
+        sent = [call for call in sensor.hass.services.calls if call[0] == "notify"]
+        assert len(sent) == expected_messages
+        clock[0] += timedelta(minutes=1)
 
 
 def test_zone_only_options_do_not_reset_control_learning(control, monkeypatch):

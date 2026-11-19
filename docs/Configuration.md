@@ -519,32 +519,43 @@ an older pending recovery with no saved delivery evidence is suppressed rather
 than reported as a potentially false recovery; new episodes preserve this
 evidence in HA's existing restore state.
 
-Zone reports older than 60 minutes, future reports, restored values and
-non-Celsius readings cannot establish temperature evidence. Startup allows 60
-minutes for sensors to appear. A low-temperature alarm requires at least two
-distinct low reports spanning the configured delay, with no gap over 35 minutes.
-Trend analysis uses up to two hours of HA reports (at most one actual report
-per minute and 128 samples), with
-at least seven reports spanning 30 minutes and no gap exceeding 35 minutes. Forecast warnings require
-a clear falling linear trend (fit at least 0.8, cooling faster than 0.1 °C/hour)
-a latest reading within 0.3 °C of the fitted trend, and an estimated threshold
-crossing within two hours. They clear above a
-three-hour horizon or when cooling stops. Estimates are observational linear
-extrapolations, not verified thermal predictions. HA report time does not prove
-physical measurement time.
+Zone sensor-fault notifications use the temperature entity's availability in
+Home Assistant. After Home Assistant reaches its running state, an explicit
+`unavailable` state or an unusable temperature value or unit can open one fault
+episode. Missing, unknown, restored or old values indicate uncertain evidence.
+A stable temperature or silence alone cannot establish a sensor fault. For
+offline detection, the source integration must expose unavailability for the
+device, including when a gateway still holds its last value. For MQTT, use
+per-device availability or expiry appropriate to the source's reporting
+contract. A shared bridge status only describes the bridge.
 
 A zone temperature entity may expose `measurement_time` as an ISO 8601
-timestamp with a time zone. Use the source time of the temperature sample and
-preserve it when forwarding cached values. `last_seen` shows device contact and
-does not qualify as a temperature timestamp. Once this attribute is supplied,
-missing, invalid and expired timestamps make the reading unavailable. A
-replayed sample keeps its original age and cannot advance recovery.
+timestamp with a time zone. Preserve the device's sample timestamp when
+forwarding a cached value. Once a source supplies this attribute, missing,
+invalid or expired timestamps make the temperature evidence uncertain.
+`last_seen` can show device contact. `last_reported` shows an HA state write.
+Either can advance without a new physical temperature measurement.
 
-A reported sensor fault stays open until new observations span the existing
-60-minute freshness window without a gap exceeding that window. A timestamped
-source can confirm recovery at a stable temperature. With HA report time alone,
-recovery needs temperature changes. Low-temperature alarms are evaluated
-independently of the fault confirmation.
+A new source-timestamped sample can confirm recovery at an unchanged
+temperature. For entities with HA report time alone, the first qualified
+numeric value after an outage is a baseline for recovery. A later changed
+value confirms that HA is receiving new temperature values. A stable number
+that might have been cached leaves that fault episode open. Delivered episodes
+are retained through restarts, and there is no fixed recovery interval.
+Zone diagnostics expose `sensor_status` to distinguish an explicit fault,
+uncertain evidence, a qualified HA report and a source-timestamped reading.
+
+Low-temperature alarms are evaluated independently. Temperature evidence
+requires a Celsius reading with a qualified timestamp no more than 60 minutes
+old. A low-temperature alarm requires at least two distinct low reports
+spanning the configured delay, with no gap over 35 minutes. Trend analysis
+uses up to two hours of reports, at most one per minute and 128 samples,
+with at least seven reports spanning 30 minutes and no gap exceeding 35
+minutes. Forecast warnings require a falling linear trend with a fit of at
+least 0.8, cooling faster than 0.1 °C/hour, a latest reading within 0.3 °C of
+the fitted trend, and an estimated threshold crossing within two hours. They
+clear above a three-hour horizon or when cooling stops. These forecasts are
+observational linear extrapolations.
 
 An optional climate entity is **only read**; it may supply its setpoint,
 `hvac_action` and, when exposed, numeric `pi_heating_demand`, `valve_position`

@@ -49,8 +49,8 @@ def test_missing_reports_do_not_prove_low_temperature():
     result, alerts = monitor.observe(
         now + timedelta(minutes=61), cfg, {"sensor.garage": state}
     )
-    assert result["1"]["status"] == "unavailable"
-    assert [a["event"] for a in alerts] == ["sensor_fault"]
+    assert result["1"]["status"] == "uncertain"
+    assert not alerts
     assert not result["1"]["alarm_active"]
 
 
@@ -172,17 +172,17 @@ def test_separate_forecast_fault_recovery_and_restart_deduplication():
     result, alerts = resumed.observe(
         state.last_reported + timedelta(minutes=61), cfg, {}
     )
+    assert result["1"]["sensor_status"] == "uncertain" and not alerts
+    state.last_reported += timedelta(minutes=61)
+    state.state = "unavailable"
+    _, alerts = resumed.observe(state.last_reported, cfg, {"sensor.zone": state})
     assert [a["event"] for a in alerts] == ["sensor_fault"]
     resumed.mark_sent(1, "sensor_fault")
-    state.last_reported += timedelta(minutes=62)
+    state.last_reported += timedelta(minutes=1)
     state.state = "8"
     result, alerts = resumed.observe(state.last_reported, cfg, {"sensor.zone": state})
     assert result["1"]["status"] == "sensor_recovering" and not alerts
     state.state = "8.1"
-    state.last_reported += timedelta(minutes=30)
-    result, alerts = resumed.observe(state.last_reported, cfg, {"sensor.zone": state})
-    assert result["1"]["status"] == "sensor_recovering" and not alerts
-    state.state = "8.2"
     state.last_reported += timedelta(minutes=30)
     result, alerts = resumed.observe(state.last_reported, cfg, {"sensor.zone": state})
     assert [a["event"] for a in alerts] == ["recovery"]
@@ -371,7 +371,7 @@ def test_independent_zones_rearm_after_recovery_and_reset_after_source_change():
         ("5", {"unit_of_measurement": "°C"}, 1),
     ],
 )
-def test_unqualified_temperature_is_a_fault_not_temperature_evidence(
+def test_unusable_temperature_distinguishes_explicit_data_error(
     state, attrs, offset
 ):
     now = datetime(2026, 10, 31, tzinfo=timezone.utc)
@@ -384,7 +384,12 @@ def test_unqualified_temperature_is_a_fault_not_temperature_evidence(
         {"sensor.zone": reading},
     )
     assert result["1"]["temperature"] is None
-    assert not alerts
+    if state == "nan" or attrs.get("unit_of_measurement") == "°F":
+        assert result["1"]["sensor_status"] == "invalid_temperature"
+        assert [a["event"] for a in alerts] == ["sensor_fault"]
+    else:
+        assert result["1"]["sensor_status"] == "uncertain"
+        assert not alerts
 
 
 def test_sparse_climate_reports_do_not_prove_continuous_heat_demand():
@@ -476,14 +481,14 @@ def test_sparse_reports_confirm_alarm_without_reusing_old_report(interval):
     assert result["1"]["alarm_active"]
 
 
-def test_startup_grace_then_sensor_fault():
+def test_missing_entity_is_uncertain_even_after_startup():
     start = datetime(2026, 10, 31, tzinfo=timezone.utc)
     monitor = ExtraZones()
     cfg = [{"entity": "sensor.z", "threshold": 5, "enabled": True}]
     assert not monitor.observe(start, cfg, {})[1]
-    assert [
-        a["event"] for a in monitor.observe(start + timedelta(minutes=61), cfg, {})[1]
-    ] == ["sensor_fault"]
+    result, alerts = monitor.observe(start + timedelta(days=1), cfg, {})
+    assert result["1"]["sensor_status"] == "uncertain"
+    assert not alerts
 
 
 def test_forecast_does_not_recover_from_an_old_report_after_gap():
@@ -655,24 +660,20 @@ def test_sensor_fault_is_not_rearmed_by_republish_or_isolated_valid_readings():
         return result["1"], [alert["event"] for alert in alerts]
 
     observe(0, "12.1")
-    assert observe(61)[1] == ["sensor_fault"]
+    assert observe(61, "unavailable")[1] == ["sensor_fault"]
     monitor.mark_sent(1, "sensor_fault")
-    # Gateway contact can advance while the temperature value is cached.
-    state.attributes["last_seen"] = (start + timedelta(minutes=62)).isoformat()
-    assert observe(62, "12.10")[1] == []
-    assert observe(123)[1] == []
-    # Sparse changed values are real observations but do not establish continuity.
-    assert observe(125, "12.2")[1] == []
-    assert observe(180, "12.2")[1] == []
-    assert observe(188, "12.3")[1] == []
-    assert observe(192, "12.7", report_minute=186)[1] == []
-    pending, alerts = observe(194)
-    assert pending["events"]["sensor_fault"] and alerts == []
-    assert observe(200, "12.4")[1] == []
-    assert observe(249, "12.5")[1] == ["recovery"]
+    for minute in (62, 125, 188):
+        # Brief reconnects can replay the last value while contact advances.
+        state.attributes["last_seen"] = (start + timedelta(minutes=minute)).isoformat()
+        assert observe(minute, "12.10")[1] == []
+        assert observe(minute + 1, "unavailable")[1] == []
+    assert observe(200, "12.10")[1] == []
+    assert observe(205, "12.1")[1] == []
+    assert observe(206, "12.7", report_minute=203)[1] == []
+    assert observe(207, "12.5")[1] == ["recovery"]
     monitor.mark_sent(1, "recovery")
-    assert observe(250)[1] == []
-    assert observe(310)[1] == ["sensor_fault"]
+    assert observe(208)[1] == []
+    assert observe(310, "unavailable")[1] == ["sensor_fault"]
 
 
 def test_notified_fault_survives_restart_and_cached_value_without_repeat():
@@ -680,40 +681,31 @@ def test_notified_fault_survives_restart_and_cached_value_without_repeat():
     cfg = [{"entity": "sensor.zone", "threshold": 10, "enabled": True}]
     monitor = ExtraZones()
     state = SimpleNamespace(
-        state="12.1", attributes={"unit_of_measurement": "°C"}, last_reported=start
+        state="unavailable", attributes={"unit_of_measurement": "°C"}, last_reported=start
     )
     states = {"sensor.zone": state}
-    monitor.observe(start, cfg, states)
-    assert monitor.observe(start + timedelta(minutes=61), cfg, states)[1]
+    assert monitor.observe(start, cfg, states)[1]
     monitor.mark_sent(1, "sensor_fault")
-    saved, _ = monitor.observe(start + timedelta(minutes=62), cfg, states)
-    restart = start + timedelta(minutes=63)
-    monitor = ExtraZones(saved, started_at=restart)
-    assert not monitor.observe(restart, cfg, {})[1]
-    state.last_reported = restart + timedelta(minutes=1)
-    result, alerts = monitor.observe(state.last_reported, cfg, states)
-    assert result["1"]["events"]["sensor_fault"]
-    assert result["1"]["notifications_sent"]["sensor_fault"]
-    assert alerts == []
-    state.state = "12.2"
-    state.last_reported += timedelta(minutes=2)
-    assert not monitor.observe(state.last_reported, cfg, states)[1]
-    state.state = "12.3"
-    state.last_reported += timedelta(minutes=30)
+    state.state = "12.1"
+    state.last_reported += timedelta(minutes=1)
     saved, alerts = monitor.observe(state.last_reported, cfg, states)
     assert not alerts
-    restart = state.last_reported + timedelta(minutes=1)
+
+    restart = start + timedelta(minutes=2)
     monitor = ExtraZones(saved, started_at=restart)
-    monitor.observe(restart, cfg, {})
-    # The pre-restart sample can be republished with a new HA timestamp.
-    state.last_reported = restart + timedelta(minutes=1)
-    assert not monitor.observe(state.last_reported, cfg, states)[1]
-    for value, minutes in (("12.4", 25), ("12.5", 35)):
-        state.state = value
-        state.last_reported += timedelta(minutes=minutes)
-        assert not monitor.observe(state.last_reported, cfg, states)[1]
-    state.state = "12.6"
-    state.last_reported += timedelta(minutes=25)
+    assert not monitor.observe(restart, cfg, {})[1]
+    state.state = "unavailable"
+    assert not monitor.observe(restart, cfg, states, ha_running=False)[1]
+    assert not monitor.observe(restart, cfg, states)[1]
+    state.state = "12.1"
+    for minutes in (1, 2):
+        state.last_reported = restart + timedelta(minutes=minutes)
+        result, alerts = monitor.observe(state.last_reported, cfg, states)
+        assert result["1"]["events"]["sensor_fault"]
+        assert result["1"]["notifications_sent"]["sensor_fault"]
+        assert not alerts
+    state.state = "12.2"
+    state.last_reported += timedelta(minutes=1)
     assert [a["event"] for a in monitor.observe(state.last_reported, cfg, states)[1]] == [
         "recovery"
     ]
@@ -727,11 +719,11 @@ def test_low_temperature_alarm_is_independent_of_pending_sensor_recovery():
         state="11", attributes={"unit_of_measurement": "°C"}, last_reported=start
     )
     states = {"sensor.zone": state}
-    monitor.observe(start, cfg, states)
-    assert monitor.observe(start + timedelta(minutes=61), cfg, states)[1]
+    state.state = "unavailable"
+    assert monitor.observe(start, cfg, states)[1]
     monitor.mark_sent(1, "sensor_fault")
     state.state = "9.5"
-    state.last_reported = start + timedelta(minutes=62)
+    state.last_reported = start + timedelta(minutes=1)
     assert not monitor.observe(state.last_reported, cfg, states)[1]
     state.last_reported += timedelta(minutes=15)
     result, alerts = monitor.observe(state.last_reported, cfg, states)
@@ -742,43 +734,36 @@ def test_low_temperature_alarm_is_independent_of_pending_sensor_recovery():
     state.state = "9.4"
     state.last_reported += timedelta(minutes=15)
     result, alerts = monitor.observe(state.last_reported, cfg, states)
-    assert result["1"]["events"]["sensor_fault"]
-    assert result["1"]["alarm_active"] and not alerts
-    state.state = "9.3"
-    state.last_reported += timedelta(minutes=30)
-    result, alerts = monitor.observe(state.last_reported, cfg, states)
     assert not result["1"]["events"]["sensor_fault"]
     assert result["1"]["alarm_active"] and not alerts
 
 
-def test_recovery_without_a_saved_temperature_needs_two_value_changes():
+def test_unknown_or_restored_state_breaks_recovery_candidate():
     start = datetime(2026, 11, 18, 15, 17, tzinfo=timezone.utc)
     cfg = [{"entity": "sensor.zone", "threshold": 10, "enabled": True}]
     monitor = ExtraZones()
-    monitor.observe(start, cfg, {})
-    assert monitor.observe(start + timedelta(minutes=61), cfg, {})[1]
-    monitor.mark_sent(1, "sensor_fault")
-    state = SimpleNamespace(
-        state="12.1",
-        attributes={"unit_of_measurement": "°C"},
-        last_reported=start + timedelta(minutes=62),
-    )
+    state = SimpleNamespace(state="unavailable", attributes={"unit_of_measurement": "°C"})
     states = {"sensor.zone": state}
-    assert not monitor.observe(state.last_reported, cfg, states)[1]
-    # This value appeared without a new report and cannot count.
-    state.state = "12.2"
-    assert not monitor.observe(state.last_reported + timedelta(minutes=1), cfg, states)[1]
-    state.state = "12.3"
-    state.last_reported += timedelta(minutes=8)
-    assert not monitor.observe(state.last_reported, cfg, states)[1]
-    state.state = "12.5"
-    state.last_reported += timedelta(minutes=15)
-    assert not monitor.observe(state.last_reported, cfg, states)[1]
-    state.state = "12.7"
-    state.last_reported += timedelta(minutes=45)
-    assert [a["event"] for a in monitor.observe(state.last_reported, cfg, states)[1]] == [
-        "recovery"
-    ]
+    for minute, value, restored in (
+        (0, "unavailable", False),
+        (1, "12.1", False),
+        (2, "unknown", False),
+        (3, "12.2", False),
+        (4, "12.3", True),
+        (5, "12.4", False),
+        (6, "12.5", False),
+    ):
+        state.state = value
+        state.attributes["restored"] = restored
+        state.last_reported = start + timedelta(minutes=minute)
+        result, alerts = monitor.observe(state.last_reported, cfg, states)
+        if minute == 0:
+            assert [a["event"] for a in alerts] == ["sensor_fault"]
+            monitor.mark_delivered(alerts[0])
+        elif minute < 6:
+            assert result["1"]["events"]["sensor_fault"] and not alerts
+        else:
+            assert [a["event"] for a in alerts] == ["recovery"]
 
 
 def test_stable_temperature_recovers_only_from_advancing_measurement_times():
@@ -800,17 +785,20 @@ def test_stable_temperature_recovers_only_from_advancing_measurement_times():
     # A new HA timestamp cannot make an old source measurement fresh.
     result, alerts = observe(61, 0)
     assert not result["report_fresh"]
+    assert result["sensor_status"] == "uncertain" and not alerts
+    state.state = "unavailable"
+    _, alerts = observe(62, 0)
     assert [a["event"] for a in alerts] == ["sensor_fault"]
     monitor.mark_delivered(alerts[0])
-    for received, measured in ((65, 65), (95, 95), (125, 95)):
-        result, alerts = observe(received, measured)
-        assert result["status"] == "sensor_recovering" and not alerts
-    _, alerts = observe(126, 126)
+    state.state = "12.1"
+    assert not observe(63, 0)[1]
+    result, alerts = observe(65, 65)
+    assert result["sensor_status"] == "source_timestamp"
     assert [a["event"] for a in alerts] == ["recovery"]
     assert monitor.notification_payload(alerts[0], state.last_reported, states)
     monitor.mark_delivered(alerts[0])
-    _, alerts = observe(187, 126)
-    assert [a["event"] for a in alerts] == ["sensor_fault"]
+    result, alerts = observe(126, 65)
+    assert result["sensor_status"] == "uncertain" and not alerts
 
 
 def test_timestamped_recovery_starts_again_after_restart_or_missing_provenance():
@@ -833,29 +821,25 @@ def test_timestamped_recovery_starts_again_after_restart_or_missing_provenance()
         return monitor.observe(state.last_reported, cfg, states)
 
     observe(0, 0)
+    state.state = "unavailable"
     _, alerts = observe(61, 0)
     assert [a["event"] for a in alerts] == ["sensor_fault"]
     monitor.mark_delivered(alerts[0])
-    observe(65, 65)
-    saved, _ = observe(95, 95)
+    saved, _ = observe(95, 0)
     monitor = ExtraZones(saved, started_at=start + timedelta(minutes=100))
+    state.state = "12.1"
     for received, measured in ((101, 95), (102, None), (103, "bad"), (104, 106)):
         data, alerts = observe(received, measured)
         assert not data["1"]["report_fresh"] and not alerts
-    assert not observe(105, 105)[1]
-    assert not observe(135, 135)[1]
-    # A changed value with the same source stamp is contradictory.
-    state.state = "12.3"
-    data, alerts = observe(140, 135)
-    assert not data["1"]["report_fresh"] and not alerts
-    state.state = "12.1"
-    # Backward source times remain invalid after the candidate chain resets.
-    data, alerts = observe(145, 120)
-    assert not data["1"]["report_fresh"] and not alerts
-    for minute in (150, 180):
-        assert not observe(minute, minute)[1]
-    _, alerts = observe(210, 210)
+    _, alerts = observe(105, 105)
     assert [a["event"] for a in alerts] == ["recovery"]
+    monitor.mark_delivered(alerts[0])
+    # Reject contradictory and backward sample times.
+    state.state = "12.3"
+    for received, measured in ((106, 105), (107, 104)):
+        data, alerts = observe(received, measured)
+        assert not data["1"]["report_fresh"] and not alerts
+    assert not observe(108, 108)[1]
 
 
 def test_timestamped_unchanged_low_readings_keep_low_temperature_alarm():
@@ -876,3 +860,69 @@ def test_timestamped_unchanged_low_readings_keep_low_temperature_alarm():
     data, alerts = monitor.observe(state.last_reported, cfg, states)
     assert data["1"]["alarm_active"]
     assert [a["event"] for a in alerts] == ["temperature"]
+
+
+def test_sparse_unchanged_ha_values_have_uncertain_freshness_without_fault():
+    start = datetime(2026, 11, 18, tzinfo=timezone.utc)
+    cfg = [{"entity": "sensor.room", "threshold": 10, "enabled": True}]
+    state = SimpleNamespace(
+        state="12", last_reported=start, attributes={"unit_of_measurement": "°C"}
+    )
+    states = {"sensor.room": state}
+    monitor = ExtraZones()
+    data, alerts = monitor.observe(start, cfg, states)
+    assert data["1"]["sensor_status"] == "ha_report" and not alerts
+    data, alerts = monitor.observe(start + timedelta(hours=12), cfg, states)
+    assert data["1"]["sensor_status"] == "uncertain"
+    assert not data["1"]["report_fresh"] and not alerts
+    for day in (1, 2, 3):
+        state.last_reported = start + timedelta(days=day)
+        assert not monitor.observe(state.last_reported, cfg, states)[1]
+        data, alerts = monitor.observe(state.last_reported + timedelta(hours=3), cfg, states)
+        assert data["1"]["sensor_status"] == "uncertain"
+        assert not any(data["1"]["events"].values()) and not alerts
+
+
+def test_native_unavailability_is_reported_once_without_assuming_startup_failure():
+    start = datetime(2026, 11, 18, tzinfo=timezone.utc)
+    cfg = [{"entity": "sensor.room", "threshold": 10, "enabled": True}]
+    state = SimpleNamespace(
+        state="unavailable", last_reported=start, attributes={"unit_of_measurement": "°C"}
+    )
+    states = {"sensor.room": state}
+    monitor = ExtraZones()
+    assert not monitor.observe(start, cfg, states, ha_running=False)[1]
+    data, alerts = monitor.observe(start, cfg, states, ha_running=True)
+    assert data["1"]["sensor_status"] == "unavailable"
+    assert [a["event"] for a in alerts] == ["sensor_fault"]
+    assert monitor.notification_payload(alerts[0], start, states)["sensor_fault_reason"] == "unavailable"
+    monitor.mark_delivered(alerts[0])
+    state.state = "unknown"
+    data, alerts = monitor.observe(start + timedelta(hours=3), cfg, states)
+    assert data["1"]["sensor_status"] == "uncertain" and not alerts
+    state.state = "unavailable"
+    assert not monitor.observe(start + timedelta(days=1), cfg, states)[1]
+
+
+def test_two_reports_after_unavailability_can_recover_without_a_reporting_schedule():
+    start = datetime(2026, 11, 18, tzinfo=timezone.utc)
+    cfg = [{"entity": "sensor.room", "threshold": 10, "enabled": True}]
+    state = SimpleNamespace(
+        state="unavailable", last_reported=start, attributes={"unit_of_measurement": "°C"}
+    )
+    states = {"sensor.room": state}
+    monitor = ExtraZones()
+    _, alerts = monitor.observe(start, cfg, states)
+    monitor.mark_delivered(alerts[0])
+    # First value may be a cache replay. An unchanged state with new HA time
+    # does not confirm that the sensor started producing new data.
+    for minutes, value in ((1, "12"), (600, "12.0")):
+        state.state = value
+        state.last_reported = start + timedelta(minutes=minutes)
+        data, alerts = monitor.observe(state.last_reported, cfg, states)
+        assert data["1"]["events"]["sensor_fault"] and not alerts
+    assert not monitor.observe(start + timedelta(minutes=690), cfg, states)[1]
+    state.state = "12.2"
+    state.last_reported = start + timedelta(minutes=700)
+    _, alerts = monitor.observe(state.last_reported, cfg, states)
+    assert [a["event"] for a in alerts] == ["recovery"]

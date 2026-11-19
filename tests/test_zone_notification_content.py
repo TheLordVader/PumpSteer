@@ -224,19 +224,20 @@ def test_no_recovery_notice_after_an_undelivered_sensor_fault():
     start = datetime(2026, 11, 1, tzinfo=timezone.utc)
     monitor = ExtraZones()
     cfg = [{"entity": "sensor.room", "threshold": 10, "enabled": True}]
-    _, alerts = monitor.observe(start + timedelta(minutes=61), cfg, {})
-    # Startup grace is counted from the first observation, not construction.
-    assert not alerts
-    now = start + timedelta(minutes=122)
-    _, alerts = monitor.observe(now, cfg, {})
-    assert [alert["event"] for alert in alerts] == ["sensor_fault"]
     sensor = SimpleNamespace(
-        state="11",
+        state="unavailable",
         attributes={"unit_of_measurement": "°C"},
-        last_reported=now + timedelta(minutes=1),
+        last_reported=start,
     )
-    _, recovery = monitor.observe(sensor.last_reported, cfg, {"sensor.room": sensor})
-    assert not any(alert["event"] == "recovery" for alert in recovery)
+    states = {"sensor.room": sensor}
+    _, alerts = monitor.observe(start, cfg, states)
+    assert [alert["event"] for alert in alerts] == ["sensor_fault"]
+    for value in ("11", "11.1"):
+        sensor.state = value
+        sensor.last_reported += timedelta(minutes=1)
+        result, alerts = monitor.observe(sensor.last_reported, cfg, states)
+        assert not any(alert["event"] == "recovery" for alert in alerts)
+    assert not result["1"]["events"]["sensor_fault"]
 
 
 def test_legacy_recovery_without_delivery_evidence_is_not_asserted():

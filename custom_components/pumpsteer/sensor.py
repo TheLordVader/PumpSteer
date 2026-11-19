@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import homeassistant.util.dt as dt_util
 from homeassistant.components.sensor import SensorEntity
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import CoreState, HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.dispatcher import (
     async_dispatcher_connect,
@@ -2618,6 +2618,8 @@ class PumpSteerSensor(RestoreEntity):
                     now,
                     zones,
                     self.hass.states,
+                    ha_running=getattr(self.hass, "state", CoreState.running)
+                    is CoreState.running,
                     outdoor=self._temperature_state(cfg, "real_outdoor_entity"),
                     outdoor_max_age_minutes=max(
                         0,
