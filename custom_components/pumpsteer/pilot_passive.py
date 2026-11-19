@@ -5,11 +5,20 @@ command and never turns inferred electrical power or compressor status into heat
 """
 
 from collections import deque
-from datetime import timedelta, timezone
+from datetime import datetime, timedelta, timezone
 import math
+from typing import NamedTuple
+
 from .pilot_vendor.adaptive_model import AdaptiveThermalModel
 from .pilot_vendor.learning_interval import IntervalCollector
 from .pilot_vendor.learning_manager import LearningManager
+
+
+class _PilotReport(NamedTuple):
+    identity: tuple[str, str | None]
+    reported_at: datetime
+    value: float
+    measured_at: datetime | None
 
 
 class PilotPassive:
@@ -317,6 +326,160 @@ class PilotPassive:
             "heat_min": heat_min,
             "heat_max": heat_max,
         }
+
+    @staticmethod
+    def response_intervals(evidence, reports, *, through, output_clamp):
+        """Replay one qualified source per role, using only evidence received by `through`.
+
+        Both inputs are in capture order. Reports have `role` (outdoor, receiver
+        or heat), `source`, `value`, and an explicit `qualified` decision from the
+        caller. `at` is capture time, `reported_at` is the source report time,
+        `measured_at` is optional physical time, and `valid_until` is the latest
+        time the source contract can substantiate the held value.
+        A heat report needs a contemporaneous HeatOperation decision and a
+        qualified duty or normalized intensity signal. The receiver must be
+        verified separately from dispatch. `through` bounds the observed run.
+        Holds integrate known time without creating samples.
+        Returns offline intervals without changing the chain or fitting a model.
+        """
+        from heapq import merge
+        from itertools import groupby
+
+        from .pilot_forecast import _timestamp
+        from .pilot_vendor.pump_response import virtual_request
+        from .thermal_intelligence.runtime import _number
+
+        cutoff = _timestamp(through)
+        span = _number(output_clamp)
+        if cutoff is None or span is None or span <= 0:
+            return []
+
+        def ordered(rows, shared):
+            previous = None
+            for row in rows:
+                at = _timestamp(row.get("at"))
+                if at is None or (previous is not None and at < previous):
+                    raise ValueError("Uncertain capture order")
+                if at > cutoff:
+                    break
+                previous = at
+                if not shared or row.get("kind") in {"context", "interruption", "output"}:
+                    yield at.timestamp(), shared, row
+
+        roles = {"outdoor", "receiver", "heat"}
+        collector = IntervalCollector(15, require_indoor=False)
+        intervals = []
+        held = {}
+        seen: dict[str, _PilotReport] = {}
+        eligible = False
+
+        def advance(at):
+            if collector.last is None:
+                return
+            covered_until = min(at, *held.values())
+            while collector.last < covered_until:
+                # Respect the vendor collector's gap guard within a proven hold.
+                stop = min(covered_until, collector.start + collector.seconds, collector.last + 300)
+                row = collector.observe(stop, *collector.previous)
+                if row is not None:
+                    intervals.append(row)
+            if covered_until < at:
+                collector.reset()
+
+        def qualified_value(row, role):
+            raw = row.get("value")
+            if row.get("qualified") is not True:
+                return None
+            if role != "heat":
+                value = _number(raw)
+                return value if value is not None and -50 <= value <= 60 else None
+            semantics = row.get("semantics")
+            value = float(raw) if isinstance(raw, bool) and semantics == "space_heat_duty" else _number(raw)
+            if value is None or not 0 <= value <= 1 or semantics not in {"space_heat_duty", "space_heat_intensity"}:
+                return None
+            if semantics == "space_heat_duty" and value not in (0.0, 1.0):
+                return None
+            operation = row.get("operation")
+            expected_mode = "space_heating" if value > 0 else "idle"
+            if isinstance(operation, dict) and operation.get("learning_qualified") is True and operation.get("mode") == expected_mode:
+                return value
+            return None
+
+        def revoke(role, effective):
+            intervals[:] = [sample for sample in intervals if sample.end <= effective]
+            collector.reset()
+            held.pop(role, None)
+
+        try:
+            timeline = merge(ordered(evidence, True), ordered(reports, False), key=lambda event: event[0])
+            for at, group in groupby(timeline, key=lambda event: event[0]):
+                advance(at)
+                for _, shared, row in group:
+                    if shared:
+                        kind = row["kind"]
+                        if kind in {"context", "interruption"}:
+                            collector.reset()
+                            held.clear()
+                            eligible = (kind == "context" and "reported_capture_at" not in row
+                                        and row.get("regime") in {"normal_pi", "braking_stable", "preheating"}
+                                        and row.get("use_ohmigo_input") is True and row.get("gos_active") is False)
+                        elif (row.get("transport") == "ohmigo" and "receiver" in held
+                              and _number(row.get("requested")) != seen["receiver"].value):
+                            held.pop("receiver")
+                        continue
+
+                    role = row.get("role")
+                    if role not in roles:
+                        continue
+                    source = row.get("source")
+                    identity = (source, row.get("semantics"))
+                    reported = _timestamp(row.get("reported_at"))
+                    physical = _timestamp(row.get("measured_at"))
+                    expiry = _timestamp(row.get("valid_until"))
+                    value = qualified_value(row, role)
+                    prior = seen.get(role)
+                    if (reported is None or reported.timestamp() > at
+                            or (row.get("measured_at") is not None and (physical is None or physical > reported))):
+                        held.pop(role, None)
+                        continue
+                    effective = (physical or reported).timestamp()
+                    if (value is None or not isinstance(source, str) or not source
+                            or expiry is None or expiry.timestamp() <= at):
+                        if row.get("qualified") is True and prior is not None and effective < at:
+                            revoke(role, effective)
+                        else:
+                            held.pop(role, None)
+                        continue
+                    if prior is not None:
+                        if identity != prior.identity:
+                            # A different source or intensity scale requires a separate replay.
+                            return []
+                        repeated_measurement = physical is not None and physical == prior.measured_at
+                        same_value = value == prior.value
+                        same_report = reported == prior.reported_at and physical == prior.measured_at
+                        if same_value and (same_report or repeated_measurement):
+                            continue
+                        out_of_order = reported <= prior.reported_at or (
+                            physical is not None and prior.measured_at is not None and physical <= prior.measured_at
+                        )
+                        if out_of_order or (effective < at and not same_value):
+                            # Revoke affected windows; a late change is never applied retroactively.
+                            revoke(role, effective)
+                        if out_of_order:
+                            continue
+                    seen[role] = _PilotReport(identity, reported, value, physical)
+                    held[role] = expiry.timestamp()
+
+                if eligible and roles <= held.keys() and min(held.values()) > at:
+                    outdoor = seen["outdoor"].value
+                    request = virtual_request(outdoor, seen["receiver"].value, span)
+                    collector.observe(at, None, outdoor, seen["heat"].value, request)
+                else:
+                    collector.reset()
+            advance(cutoff.timestamp())
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return []
+        return intervals
 
     def observe_response(
         self,

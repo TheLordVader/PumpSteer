@@ -144,6 +144,14 @@ class ThermalIntelligence:
     def context_id(self) -> int:
         return self._segment
 
+    def pilot_response_intervals(self, reports, *, through, output_clamp):
+        """Replay qualified source reports against this chain's control boundaries."""
+        from ..pilot_passive import PilotPassive
+
+        return PilotPassive.response_intervals(
+            self._events, reports, through=through, output_clamp=output_clamp
+        )
+
     @property
     def current_command(self) -> dict[str, Any] | None:
         return dict(self._last_command) if self._last_command else None
