@@ -512,10 +512,16 @@ class PilotPassive:
                         if kind in {"context", "interruption"}:
                             collector.reset()
                             held.clear()
-                            eligible = (kind == "context" and "reported_capture_at" not in row
-                                        and row.get("regime") in {"normal_pi", "braking_stable", "preheating"}
-                                        and (house or row.get("use_ohmigo_input") is True)
-                                        and row.get("gos_active") is False)
+                            command_supported = (
+                                row.get("use_ohmigo_input") is True
+                                and row.get("gos_active") is False
+                            )
+                            eligible = (
+                                kind == "context"
+                                and "reported_capture_at" not in row
+                                and row.get("regime") in {"normal_pi", "braking_stable", "preheating"}
+                                and (house or command_supported)
+                            )
                         elif (row.get("transport") == "ohmigo" and "receiver" in held
                               and _number(row.get("requested")) != seen["receiver"].value):
                             held.pop("receiver")

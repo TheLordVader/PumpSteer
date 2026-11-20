@@ -235,7 +235,13 @@ def test_shared_audit_freezes_pilot_and_restores_completed_pairs():
 
 
 def _start_cycle(
-    runtime, at, temperature, outdoor=5, *, heat_source="binary_sensor.space_heat"
+    runtime,
+    at,
+    temperature,
+    outdoor=5,
+    *,
+    heat_source="binary_sensor.space_heat",
+    gos_active=False,
 ):
     from test_thermal_intelligence_runtime import _cycle
 
@@ -248,7 +254,7 @@ def _start_cycle(
     if temperature is None:
         cycle["indoor"] = None
         cycle["sources"][0]["value"] = None
-    cycle.update(gos_active=False, pilot_heat_source=heat_source)
+    cycle.update(gos_active=gos_active, pilot_heat_source=heat_source)
     runtime.begin_cycle(cycle, use_ohmigo_input=False)
 
 
@@ -325,8 +331,9 @@ def test_continuously_on_heat_does_not_qualify_a_model():
         pytest.param("sensor.space_heat_percent", (0.2, 0.8), id="inverter"),
     ],
 )
+@pytest.mark.parametrize("gos_active", [False, True], ids=["no-gos", "gos"])
 def test_runtime_fits_pilot_and_scores_a_later_observation_in_the_controller_audit(
-    request, heat_source, heat_levels
+    request, heat_source, heat_levels, gos_active
 ):
     from custom_components.pumpsteer.thermal_intelligence.runtime import (
         ThermalIntelligence,
@@ -340,7 +347,9 @@ def test_runtime_fits_pilot_and_scores_a_later_observation_in_the_controller_aud
         end = time(hour * 3600)
         weather = (3, 10, 6)[hour % 3]
         heat = heat_levels[hour % 2]
-        _start_cycle(runtime, end, indoor, weather, heat_source=heat_source)
+        _start_cycle(
+            runtime, end, indoor, weather, heat_source=heat_source, gos_active=gos_active
+        )
         _inputs(
             runtime, hour * 3600, outdoor=weather, heat=heat, heat_source=heat_source
         )
@@ -377,7 +386,14 @@ def test_runtime_fits_pilot_and_scores_a_later_observation_in_the_controller_aud
             runtime, seconds, outdoor=weather, heat=heat_levels[1], heat_source=heat_source
         )
     observed = end + timedelta(minutes=30)
-    _start_cycle(runtime, observed, indoor - 0.15, weather, heat_source=heat_source)
+    _start_cycle(
+        runtime,
+        observed,
+        indoor - 0.15,
+        weather,
+        heat_source=heat_source,
+        gos_active=gos_active,
+    )
     _inputs(
         runtime,
         25 * 3600 + 1800,
@@ -413,14 +429,21 @@ def test_runtime_fits_pilot_and_scores_a_later_observation_in_the_controller_aud
     # A heartbeat during SAFE cannot seed the next normal operating interval.
     _inputs(runtime, 25 * 3600 + 1860, heat=heat_levels[1], heat_source=heat_source)
     resumed = lost_at + timedelta(seconds=10)
-    _start_cycle(runtime, resumed, indoor - 0.2, weather, heat_source=heat_source)
+    _start_cycle(
+        runtime,
+        resumed,
+        indoor - 0.2,
+        weather,
+        heat_source=heat_source,
+        gos_active=gos_active,
+    )
     assert not runtime.pilot_inputs_valid(resumed)
     runtime._pilot_attempted_end = None
     token, snapshot = runtime.prepare_fit_job(resumed)
     from test_thermal_intelligence_runtime import _cycle
 
     new_source = _cycle(resumed, [("sensor.room", 1, indoor, 0)], mode="normal")
-    new_source.update(gos_active=False, pilot_heat_source="binary_sensor.replacement")
+    new_source.update(gos_active=gos_active, pilot_heat_source="binary_sensor.replacement")
     runtime.begin_cycle(new_source, use_ohmigo_input=False)
     assert not runtime.apply_fit_result(token, runtime.static_fit(snapshot))
 
@@ -428,8 +451,9 @@ def test_runtime_fits_pilot_and_scores_a_later_observation_in_the_controller_aud
 @pytest.mark.parametrize(
     "external_heat,intensity", [(False, False), (True, False), (False, True)]
 )
+@pytest.mark.parametrize("gos_active", [False, True], ids=["ohmigo", "gos-only"])
 def test_controller_collects_heat_changes_between_ticks_with_one_sensor(
-    request, monkeypatch, external_heat, intensity
+    request, monkeypatch, external_heat, intensity, gos_active
 ):
     import asyncio
     from importlib import import_module
@@ -445,8 +469,9 @@ def test_controller_collects_heat_changes_between_ticks_with_one_sensor(
         thermal_heat_activity_entity=heat_source,
         thermal_detection_method="verified",
         adaptive_braking_enabled=False,
-        modbus_service="",
     )
+    unused_output = "ohmigo_entity" if gos_active else "modbus_service"
+    sensor._config_entry.options.pop(unused_output)
     if external_heat:
         sensor._config_entry.options["thermal_external_heat_entity"] = (
             "binary_sensor.stove"
@@ -477,6 +502,7 @@ def test_controller_collects_heat_changes_between_ticks_with_one_sensor(
     asyncio.run(sensor._do_update())
     assert heat_source in callbacks
     outputs = len(sensor.hass.services.calls)
+    assert outputs == 1
     for minute in sorted(set(range(4, 60, 4)) | {10, 40}):
         clock[0] = began + timedelta(minutes=minute)
         if external_heat and minute == 20:
@@ -506,6 +532,7 @@ def test_controller_collects_heat_changes_between_ticks_with_one_sensor(
         states[entity].last_reported = clock[0]
     states[heat_source] = heat_state(False, clock[0])
     asyncio.run(sensor._do_update())
+    assert len(sensor.hass.services.calls) == 2
     history = sensor._thermal_intelligence.export_state()["pilot_house"]["intervals"]
     if external_heat:
         assert not history
@@ -514,6 +541,40 @@ def test_controller_collects_heat_changes_between_ticks_with_one_sensor(
         assert len(history) == 1 and history[0]["heat"] == pytest.approx(expected_heat)
     assert sensor._thermal_intelligence.model.parameters() is None
     assert sensor._attributes["adaptive_braking"]["multiplier"] == 1
+
+
+@pytest.mark.parametrize("boundary", ["transport_change", "dispatch_failed"])
+def test_gos_house_interval_resets_at_a_transport_boundary(boundary):
+    from custom_components.pumpsteer.thermal_intelligence.runtime import (
+        ThermalIntelligence,
+    )
+
+    runtime = ThermalIntelligence(pilot_only=True)
+    _start_cycle(runtime, time(0), 20, gos_active=True)
+    _inputs(runtime, 0)
+    assert runtime.pilot_inputs_valid(time(0))
+    runtime.collect_pilot_house(time(0))
+    for seconds in range(240, 1800, 240):
+        _inputs(runtime, seconds)
+    runtime.record_output(
+        {"at": time(1750), "transport": "generic", "status": "dispatched_unverified"}
+    )
+    assert runtime.pilot_inputs_valid(time(1750))
+    segment = runtime.pilot_context_id
+
+    if boundary == "dispatch_failed":
+        runtime.record_output(
+            {"at": time(1800), "transport": "generic", "status": boundary}
+        )
+    else:
+        _start_cycle(runtime, time(1800), 20.1)
+    assert runtime.pilot_context_id != segment
+    assert not runtime.pilot_inputs_valid(time(1800))
+
+    _start_cycle(runtime, time(3600), 20.2, gos_active=boundary == "dispatch_failed")
+    _inputs(runtime, 3600)
+    assert runtime.pilot_inputs_valid(time(3600))
+    assert runtime.collect_pilot_house(time(3600)) is None
 
 
 def test_pilot_retracts_completed_interval_when_a_dated_heat_change_arrives_late():

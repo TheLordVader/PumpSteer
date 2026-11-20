@@ -253,7 +253,7 @@ class ThermalIntelligence:
     def pilot_inputs_valid(self, now) -> bool:
         cycle = self._active_cycle or {}
         return (cycle.get("regime") in {"normal_pi", "braking_stable", "preheating"}
-                and cycle.get("gos_active") is False and bool(cycle.get("pilot_heat_source"))
+                and bool(cycle.get("pilot_heat_source"))
                 and self._pilot_inputs.keys() >= {"outdoor", "heat"}
                 and all(row["qualified"] and _timestamp(row["at"]) <= now < _timestamp(row["valid_until"])
                         for row in self._pilot_inputs.values()))
@@ -282,7 +282,8 @@ class ThermalIntelligence:
             return None
         # Segment identity establishes context even when its original event
         # has rotated out. A retained report before the start is still needed.
-        context = {"kind": "context", "at": inputs[0]["at"], "gos_active": False,
+        context = {"kind": "context", "at": inputs[0]["at"],
+                   "gos_active": self._active_cycle.get("gos_active"),
                    "regime": self._active_cycle["regime"]}
         interval = PilotPassive.house_interval([context], inputs, start=start, end=end)
         if interval is None:
@@ -675,7 +676,13 @@ class ThermalIntelligence:
             if status == "dispatch_failed":
                 self._count("dispatch_failures", at)
             self._last_command = None
-            self._interrupt("ohmigo_" + status, at)
+            # A heat-driven house interval can have no Ohmigo receiver.
+            if not (self.pilot_only and status == "not_configured"):
+                self._interrupt("ohmigo_" + status, at)
+        elif self.pilot_only and transport == "generic" and status in {
+            "dispatch_failed", "skipped", "invalid_configuration", "render_failed",
+        }:
+            self._interrupt("generic_" + status, at)
         if not repeated:
             self._append("output", at, **row, physical_application_verified=False)
 

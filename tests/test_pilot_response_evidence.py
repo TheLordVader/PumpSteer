@@ -136,6 +136,14 @@ def test_command_reception_and_shared_segment_are_required():
                                              through=time(1500), output_clamp=12) == []
 
 
+def test_gos_context_cannot_train_command_response_even_with_a_receiver_report():
+    evidence = ThermalIntelligence()
+    cycle = _cycle(START, [("room", 1, 20.0, 0)], mode="normal") | {"gos_active": True}
+    evidence.begin_cycle(cycle, use_ohmigo_input=True)
+    reports = sources() + [report("heat", 0, 1)]
+    assert evidence.pilot_response_intervals(reports, through=time(900), output_clamp=12) == []
+
+
 def test_new_dispatch_without_matching_receiver_creates_unknown_time():
     evidence = runtime()
     evidence.record_output({"at": time(450), "transport": "ohmigo", "requested": 2.0,

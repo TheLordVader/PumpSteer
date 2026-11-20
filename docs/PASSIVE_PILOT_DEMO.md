@@ -21,6 +21,11 @@ Intelligence passiv och adaptiv bromsning avstängd. Kandidaten bygger på
   ForecastAudit jämför med oförändrad innetemperatur vid samma senare godkända
   observation. Horisonterna är 30, 60 och 120 minuter. [ForecastAudit](../custom_components/pumpsteer/pilot_forecast_audit.py)
 
+Husmodellen använder observerad rumsvärme även när Base skickar via Generic
+Output (GOS) i en installation utan Ohmigo. Transportbyten och kända utskicksfel
+bryter pågående intervall. Kommandokalibreringen har fortfarande en GOS-spärr och
+kräver separat verifierad mottagardata. [Intervallhantering](../custom_components/pumpsteer/pilot_passive.py)
+
 Den rapporterade värmeandelen beskriver drift eller belastning. En separat
 värmemätning behövs för att uttrycka levererad värme i kW. Förutsättningarna för
 att lära sig husets respons är minst 24 kvalificerade träningstimmar och
@@ -33,7 +38,7 @@ arbetskopia i en separat Python 3.14.10-miljö och behöver ingen HA-server.
 
 ```sh
 python -m pip install 'homeassistant==2026.11.2' 'pytest==9.2.0' \
-  'pytest-asyncio==1.4.1.post1' 'numpy==2.5.4'
+  'pytest-asyncio==1.4.1.post1'
 python -B -m pytest -vv -o asyncio_default_fixture_loop_scope=function \
   tests/test_passive_pilot_house.py \
   tests/test_pilot_response_evidence.py \
@@ -44,14 +49,15 @@ python -B -m pytest -q -o asyncio_default_fixture_loop_scope=function
 
 | Prov | Vad som verifieras |
 |---|---|
-| `on-off` och `inverter` | I vardera fallet används 25 syntetiska träningstimmar och en senare observation bildar ett prognospar. Inverterfallet växlar mellan 20 och 80 % utan att stanna. |
+| `on-off` och `inverter` | Med och utan GOS används 25 syntetiska träningstimmar per fall. En senare observation bildar ett prognospar. Inverterfallet växlar mellan 20 och 80 % utan att stanna. |
 | Kontinuerlig binär värmesignal | För liten variation ger `gain_frozen`. |
 | Asynkrona rapporter | Ändringar mellan kontrollcykler bevaras. Gamla eller återpublicerade mätningar och luckor ger ingen falsk värmehistorik. |
+| GOS och kommandokalibrering | Husmodellen samlar med enbart GOS. Byte av transport eller misslyckat GOS-utskick bryter intervallet. GOS-händelser kvalificerar aldrig kommandokalibreringen. |
 | Base och Store | Identiska styrvärden och tjänsteanrop med och utan passiv TI. Långsam läsning, återförsök eller avslutande lagring håller endast tillbaka den passiva kedjan. |
 
-128 riktade tester och hela sviten på 1 741 testfall passerade. I ett separat
-syntetiskt Core-prov gav åtta kontrollcykler samma PI-, broms- och SAFE-resultat
-och samma 16 Ohmigo- och GOS-anrop som `81632a4`.
+Alla 1 749 regressionstester passerade. I ett separat syntetiskt Core-prov gav
+åtta kontrollcykler samma PI-, broms- och SAFE-resultat och samma 16 Ohmigo- och
+GOS-anrop som `81632a4`.
 
 ## Vad som återstår att belägga
 
@@ -59,8 +65,8 @@ Verklig drift har gett observationer av driftläge och belastning. Det befintlig
 fältunderlaget saknar kvalificerade Pilot-intervall och oberoende prognospar för
 den här modellen. Prognosnytta mot referensen återstår att visa. ForecastAudit
 bedömer accepterade temperaturändringar. Resultatet beskriver den täckta delen
-av driften. Konfigurerad Generic Output kan styra som vanligt, medan husmodellens
-insamling och prognos väntar i den konfigurationen.
+av driften. Verklig drift måste visa att källan kan skilja rumsvärme från andra
+lägen och att Pilot slår referensen på senare, oberoende utfall.
 
 I Store-provet kunde kandidaten läsa gemensam historik och ett äldre prognospar.
 `81632a4` kunde läsa den gemensamma historiken ur kandidatens Store. Den nya
@@ -79,5 +85,9 @@ till vårt Configure-flöde och våra sensorattribut. Panelens skrivande reglage
 besparingsuppskattning behöver granskas var för sig. Prioritera hjälptexter och
 driftförklaringar. Kandidaten använder sitt nuvarande HA-formulär. [v2.3.0-koden](https://github.com/JohanAlvedal/PumpSteer/tree/v2.3.0/custom_components/pumpsteer)
 
-Husmodellen återanvänds från Heat Pump Pilot. Källrevision och Apache 2.0-licens
-finns i den vendorerade koden. [Källhänvisning](../custom_components/pumpsteer/pilot_vendor/__init__.py)
+## Beroenden och licenser
+
+Integrationen använder HA:s Recorder och har en tom `requirements`-lista.
+PumpSteers licens är AGPL-3.0. Husmodellen kommer från Heat Pump Pilot under
+Apache-2.0. Den kvarvarande RTM-koden har MIT-licens. Källrevisioner och
+licenstexter följer med koden. [PumpSteer](../LICENSE) · [Pilot](../custom_components/pumpsteer/pilot_vendor/__init__.py) · [RTM](../custom_components/pumpsteer/thermal_intelligence/NOTICE)
