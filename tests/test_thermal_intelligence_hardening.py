@@ -539,7 +539,9 @@ def test_executor_fit_runs_off_event_loop_thread_and_does_not_block_dispatch():
             return await loop.run_in_executor(pool, blocking_worker, func, *args)
 
         fake_hass = MagicMock()
-        fake_hass.async_create_task = lambda coro: asyncio.create_task(coro)
+        fake_hass.async_create_background_task = (
+            lambda coro, name, *, eager_start: asyncio.create_task(coro)
+        )
         fake_hass.async_add_executor_job = mock_async_add_executor_job
 
         sensor = PumpSteerSensor.__new__(PumpSteerSensor)
@@ -568,7 +570,7 @@ def test_executor_fit_runs_off_event_loop_thread_and_does_not_block_dispatch():
         assert sensor._thermal_fit_task is not None
 
         # Wait until background worker has actually started in the executor thread
-        await fit_started.wait()
+        await asyncio.wait_for(fit_started.wait(), 2)
 
         # 1. Prove fitting runs off the event-loop thread
         assert len(worker_threads) == 1
