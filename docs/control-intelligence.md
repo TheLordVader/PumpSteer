@@ -135,7 +135,7 @@ blocks remaining writes and relay activation without clearing PI or ramp state.
 The next normal control cycle recalculates; there is no immediate double integration.
 If a first output was already accepted before the invalidation, it cannot be unsent.
 
-### Example source contract, not a proven Tallåsen installation
+### Example source contract
 
 [ebusds HTTP API](https://github.com/john30/ebusd/wiki/3.2.-HTTP-client) returns a
 per-message `lastup` and its values in a JSON object; [HA REST](https://www.home-assistant.io/integrations/rest/)
@@ -155,9 +155,8 @@ proof. A normal cache-reading GET avoids initiating bus polling; do not add
 `required`, `maxage` or `poll` merely to make data appear fresh. At startup a new
 qualified source timestamp is required, including when an adapter restores state.
 
-The observed Husdata/H66 signals have no verified per-observation timestamp, and
-their balance decoding remains unverified. Neither active limiter is currently
-established as usable with those signals; no H66 settings were changed.
+Per-observation timestamps and verified decoding of the balance signal are
+required before using such telemetry with an active limiter.
 
 ## Rejected/unproven interventions
 
@@ -285,10 +284,10 @@ for sufficient reports to match their known configured source variants; a genuin
 changed composition relearns rather than remaining permanently paused. No new
 listener, polling, database, service, output path or model dependency is introduced.
 
-For a later Tallåsen installation GO: verify candidate file hashes, back up HA
-and preserve the actually installed integration/settings after verifying their
-commit and file hashes (latest preflight: `b273afc`), install only candidate
-integration files and perform the agreed Core restart. Verify normal SAFE recovery,
+For an approved installation, verify candidate file hashes, back up HA and
+verify the commit and file hashes of the installed version. Preserve the previous
+integration and settings before installing the candidate files and performing
+the agreed Core restart. Verify normal SAFE recovery,
 PI/prices, ordinary Ohmigo output and Relay Guard before enabling this option.
 Then observe sample count, fit residual, three holdouts, gate reasons, brake factor,
 virtual outdoor command and room-temperature floor during actual price periods.

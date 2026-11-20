@@ -234,7 +234,9 @@ def test_shared_audit_freezes_pilot_and_restores_completed_pairs():
     assert restored.fixed_pending is None
 
 
-def _start_cycle(runtime, at, temperature, outdoor=5):
+def _start_cycle(
+    runtime, at, temperature, outdoor=5, *, heat_source="binary_sensor.space_heat"
+):
     from test_thermal_intelligence_runtime import _cycle
 
     cycle = _cycle(
@@ -246,14 +248,19 @@ def _start_cycle(runtime, at, temperature, outdoor=5):
     if temperature is None:
         cycle["indoor"] = None
         cycle["sources"][0]["value"] = None
-    cycle.update(gos_active=False, pilot_heat_source="binary_sensor.space_heat")
+    cycle.update(gos_active=False, pilot_heat_source=heat_source)
     runtime.begin_cycle(cycle, use_ohmigo_input=False)
 
 
-def _inputs(runtime, seconds, *, outdoor=5, heat=1):
+def _inputs(
+    runtime, seconds, *, outdoor=5, heat=1, heat_source="binary_sensor.space_heat"
+):
     at = time(seconds)
     runtime.record_pilot_input(at, "outdoor", "sensor.outdoor", (at, outdoor, None))
-    runtime.record_pilot_input(at, "heat", "binary_sensor.space_heat", (at, heat, None))
+    observed_at = (
+        at - timedelta(seconds=1) if heat_source.startswith("sensor.") else None
+    )
+    runtime.record_pilot_input(at, "heat", heat_source, (at, heat, observed_at))
 
 
 def test_runtime_collects_without_serving_new_rc_and_restores_closed_house_intervals():
@@ -311,8 +318,15 @@ def test_continuously_on_heat_does_not_qualify_a_model():
     assert "candidate" not in result
 
 
+@pytest.mark.parametrize(
+    ("heat_source", "heat_levels"),
+    [
+        pytest.param("binary_sensor.space_heat", (0, 1), id="on-off"),
+        pytest.param("sensor.space_heat_percent", (0.2, 0.8), id="inverter"),
+    ],
+)
 def test_runtime_fits_pilot_and_scores_a_later_observation_in_the_controller_audit(
-    request,
+    request, heat_source, heat_levels
 ):
     from custom_components.pumpsteer.thermal_intelligence.runtime import (
         ThermalIntelligence,
@@ -325,9 +339,11 @@ def test_runtime_fits_pilot_and_scores_a_later_observation_in_the_controller_aud
     for hour in range(26):
         end = time(hour * 3600)
         weather = (3, 10, 6)[hour % 3]
-        heat = hour % 2
-        _start_cycle(runtime, end, indoor, weather)
-        _inputs(runtime, hour * 3600, outdoor=weather, heat=heat)
+        heat = heat_levels[hour % 2]
+        _start_cycle(runtime, end, indoor, weather, heat_source=heat_source)
+        _inputs(
+            runtime, hour * 3600, outdoor=weather, heat=heat, heat_source=heat_source
+        )
         runtime.collect_pilot_house(end)
         if hour == 24:
             sensor._update_shared_thermal_audit(end, sensor._cfg())
@@ -335,7 +351,9 @@ def test_runtime_fits_pilot_and_scores_a_later_observation_in_the_controller_aud
         if hour == 25:
             break
         for seconds in range(hour * 3600 + 240, (hour + 1) * 3600, 240):
-            _inputs(runtime, seconds, outdoor=weather, heat=heat)
+            _inputs(
+                runtime, seconds, outdoor=weather, heat=heat, heat_source=heat_source
+            )
         indoor += 0.07 * (weather - indoor) + 1.4 * heat + 0.25
     job = runtime.prepare_fit_job(end)
     assert job is not None
@@ -344,33 +362,43 @@ def test_runtime_fits_pilot_and_scores_a_later_observation_in_the_controller_aud
     assert runtime.prepare_fit_job(end) is None
     assert runtime.summary()["pilot_house_intervals"] == 25
     forecast = runtime.pilot_forecast(end)
-    assert forecast["heat"] == 0  # Last completed hour, though heat is now on.
+    assert forecast["heat"] == pytest.approx(heat_levels[0])  # Last completed hour.
     assert forecast["loss"] > 0 and forecast["gain"] > 0
     assert runtime.summary()["fit_trusted"] is False
+    assert runtime.summary()["active_control"] is False
 
     sensor._update_shared_thermal_audit(end, sensor._cfg())
     issued = sensor._plan_audit.fixed_pending
     assert issued["revision"].startswith(f"pilot:{end.timestamp()}:")
-    assert issued["curves"][0]["heat"] == 0
+    assert issued["curves"][0]["heat"] == pytest.approx(heat_levels[0])
 
     for seconds in range(25 * 3600 + 240, 25 * 3600 + 1800, 240):
-        _inputs(runtime, seconds, outdoor=weather, heat=1)
+        _inputs(
+            runtime, seconds, outdoor=weather, heat=heat_levels[1], heat_source=heat_source
+        )
     observed = end + timedelta(minutes=30)
-    _start_cycle(runtime, observed, indoor - 0.15, weather)
-    _inputs(runtime, 25 * 3600 + 1800, outdoor=weather, heat=1)
+    _start_cycle(runtime, observed, indoor - 0.15, weather, heat_source=heat_source)
+    _inputs(
+        runtime,
+        25 * 3600 + 1800,
+        outdoor=weather,
+        heat=heat_levels[1],
+        heat_source=heat_source,
+    )
     assert runtime.collect_pilot_house(observed) is None
     sensor._update_shared_thermal_audit(observed, sensor._cfg())
     result = sensor._plan_audit.fixed_records[-1]
-    assert result["curves"][0]["heat"] == 0
+    assert result["curves"][0]["heat"] == pytest.approx(heat_levels[0])
     assert result["actual"] == pytest.approx(indoor - 0.15)
     assert result["observed"] == observed.isoformat()
     assert result["model_order"] == ["pilot_house", "persistence"]
-    assert sensor._plan_audit.shared_summary()[issued["revision"]]["30"][
-        "assumption"
-    ] == ("constant_outdoor_and_latest_observed_house_heat_share")
+    comparison = sensor._plan_audit.shared_summary()[issued["revision"]]["30"]
+    assert comparison["count"] == 1
+    assert comparison["persistence_mae"] == pytest.approx(0.15)
+    assert comparison["assumption"] == "constant_outdoor_and_latest_observed_house_heat_share"
 
     lost_at = observed + timedelta(minutes=1)
-    runtime.record_pilot_input(lost_at, "heat", "binary_sensor.space_heat", None)
+    runtime.record_pilot_input(lost_at, "heat", heat_source, None)
     assert runtime.pilot_forecast(lost_at) is None
     sensor._update_shared_thermal_audit(lost_at, sensor._cfg())
     assert not sensor._plan_audit.fixed_pending["revision"].startswith("pilot:")
@@ -383,9 +411,9 @@ def test_runtime_fits_pilot_and_scores_a_later_observation_in_the_controller_aud
     assert runtime.apply_fit_result(token, runtime.static_fit(snapshot))
     assert runtime.pilot_forecast(lost_at) is None
     # A heartbeat during SAFE cannot seed the next normal operating interval.
-    _inputs(runtime, 25 * 3600 + 1860, heat=1)
+    _inputs(runtime, 25 * 3600 + 1860, heat=heat_levels[1], heat_source=heat_source)
     resumed = lost_at + timedelta(seconds=10)
-    _start_cycle(runtime, resumed, indoor - 0.2, weather)
+    _start_cycle(runtime, resumed, indoor - 0.2, weather, heat_source=heat_source)
     assert not runtime.pilot_inputs_valid(resumed)
     runtime._pilot_attempted_end = None
     token, snapshot = runtime.prepare_fit_job(resumed)
