@@ -1,9 +1,10 @@
 """Passive diagnostics cannot change real offline controller decisions or dispatches."""
 
 import asyncio
+import sys
 from copy import deepcopy
 from datetime import timedelta
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 from test_adaptive_braking import START, qualified
@@ -375,13 +376,244 @@ def test_disabled_adaptive_flag_does_not_label_residual_ramp_as_passive_safe(req
 
 def test_unload_catches_real_checkpoint_flush_io_failure(request, monkeypatch):
     _, candidate, _, _ = _pair(request.getfixturevalue("control"), monkeypatch)
-    reached = []
-    async def failed_save(payload):
-        reached.append(payload)
-        raise OSError("injected flush error")
-    candidate._pilot_persisted = {}
-    candidate._pilot_store = SimpleNamespace(async_delay_save=lambda *args: None,
-                                             async_save=failed_save)
-    asyncio.run(candidate.async_will_remove_from_hass())
-    assert len(reached) == 1
+
+    async def unload():
+        attempted = asyncio.Event()
+
+        async def failed_save(payload):
+            attempted.set()
+            raise OSError("injected flush error")
+
+        candidate._pilot_persisted = {}
+        candidate._pilot_store = SimpleNamespace(async_save=failed_save)
+        await candidate.async_will_remove_from_hass()
+        await asyncio.wait_for(attempted.wait(), 1)
+
+    asyncio.run(unload())
     assert candidate._temperature_unloaded
+
+
+@pytest.fixture
+def store_module(monkeypatch):
+    storage = ModuleType("homeassistant.helpers.storage")
+    storage.Store = object
+    monkeypatch.setitem(sys.modules, storage.__name__, storage)
+
+
+@pytest.mark.parametrize("startup", [True, False])
+def test_pending_store_read_keeps_both_outputs_live(
+    request, monkeypatch, store_module, startup
+):
+    base, candidate, states, clock = _pair(request.getfixturevalue("control"), monkeypatch)
+    candidate.hass.data = {}
+    candidate.hass.is_running = True
+    candidate._config_entry.add_update_listener = lambda callback: lambda: None
+
+    async def no_extra():
+        return None
+
+    candidate.async_get_last_extra_data = no_extra
+
+    async def exercise():
+        entered, release = asyncio.Event(), asyncio.Event()
+        marker = {
+            "at": (clock[0] - timedelta(minutes=10)).isoformat(),
+            "transport": "ohmigo",
+            "status": "service_completed_unverified",
+            "requested": 4.0,
+        }
+        previous = type(candidate._thermal_intelligence)()
+        previous.record_output(marker)
+        history = previous.export_state()
+        reads, saves = [], []
+
+        async def read():
+            reads.append(True)
+            entered.set()
+            await release.wait()
+            return {"version": 1, "thermal_intelligence": history, "old_key": [1, 2]}
+
+        candidate._pilot_store = SimpleNamespace(
+            async_load=read,
+            async_delay_save=lambda callback, delay: saves.append(callback()),
+        )
+        candidate._pilot_store_read_failed = not startup
+        try:
+            if startup:
+                await asyncio.wait_for(candidate.async_added_to_hass(), 1)
+                clock[0] += timedelta(seconds=1)
+            for outdoor in ("-6.3", "-8.3"):
+                clock[0] += timedelta(minutes=8)
+                states["sensor.outdoor"].state = outdoor
+                _report(states, clock, unit_of_measurement="°C")
+                await base.async_update()
+                await asyncio.wait_for(candidate.async_update(), 1)
+                await asyncio.wait_for(entered.wait(), 1)
+                _assert_primary_parity(base, candidate)
+            assert len(candidate.hass.services.calls) == 4
+            assert len(reads) == 1 and not saves
+            assert not candidate._thermal_intelligence.has_evidence
+
+            release.set()
+            await asyncio.wait_for(candidate._pilot_store_load_task, 1)
+            restored = candidate._thermal_intelligence.export_state()["events"]
+            assert restored[0] == history["events"][0]
+            assert restored[-1]["reason"] == "restart"
+            clock[0] += timedelta(minutes=8)
+            _report(states, clock, unit_of_measurement="°C")
+            await base.async_update()
+            await candidate.async_update()
+            _assert_primary_parity(base, candidate)
+            assert saves[-1]["old_key"] == [1, 2]
+            assert saves[-1]["thermal_intelligence"]["events"][0] == restored[0]
+        finally:
+            release.set()
+
+    asyncio.run(exercise())
+
+
+def test_disabling_ti_requests_final_checkpoint_without_waiting_for_disk(
+    request, monkeypatch
+):
+    _, candidate, states, clock = _pair(request.getfixturevalue("control"), monkeypatch)
+    checkpoints = []
+
+    async def slow_write(payload):
+        await asyncio.Event().wait()
+
+    candidate._pilot_store = SimpleNamespace(
+        async_delay_save=lambda snapshot, delay: checkpoints.append((snapshot(), delay)),
+        async_save=slow_write,
+    )
+
+    async def exercise():
+        await candidate.async_update()
+        clock[0] += timedelta(minutes=8)
+        _report(states, clock, unit_of_measurement="°C")
+        entry = candidate._config_entry
+        entry.options["thermal_intelligence_enabled"] = False
+        await asyncio.wait_for(
+            candidate.async_options_update_listener(candidate.hass, entry), 1
+        )
+        assert len(candidate.hass.services.calls) == 4
+        saved, delay = checkpoints[-1]
+        assert delay == 0
+        assert saved["thermal_intelligence"]["events"][-1]["reason"] == "disabled"
+
+    asyncio.run(exercise())
+
+
+def test_replacement_dispatches_before_the_old_checkpoint_finishes(
+    request, monkeypatch, store_module
+):
+    _, candidate, states, clock = _pair(request.getfixturevalue("control"), monkeypatch)
+    candidate.hass.data = {}
+
+    async def exercise():
+        writing, release = asyncio.Event(), asyncio.Event()
+        written = []
+
+        async def write(payload):
+            writing.set()
+            await release.wait()
+            written.append(payload)
+
+        candidate._pilot_store = SimpleNamespace(
+            async_delay_save=lambda *args: None, async_save=write
+        )
+        candidate._plan_audit.plan_unverifiable = 2
+        await candidate.async_update()
+        try:
+            await asyncio.wait_for(candidate.async_will_remove_from_hass(), 1)
+            await asyncio.wait_for(writing.wait(), 1)
+
+            async def read():
+                return written[-1]
+
+            replacement = PumpSteerSensor(candidate.hass, candidate._config_entry)
+            replacement._get_prices = candidate._get_prices
+            replacement._forecast_temps = candidate._forecast_temps
+            replacement._pilot_store = SimpleNamespace(async_load=read)
+            replacement._schedule_pilot_store_load()
+            clock[0] += timedelta(minutes=8)
+            _report(states, clock, unit_of_measurement="°C")
+            await asyncio.wait_for(replacement.async_update(), 1)
+            assert len(replacement.hass.services.calls) == 4
+            assert not written and not replacement._thermal_intelligence.has_evidence
+
+            release.set()
+            await asyncio.wait_for(replacement._pilot_store_load_task, 1)
+            assert replacement._plan_audit.plan_unverifiable == 2
+            events = replacement._thermal_intelligence.export_state()["events"]
+            assert events[:-1] == written[0]["thermal_intelligence"]["events"]
+            assert [event["reason"] for event in events[-2:]] == ["unload", "restart"]
+        finally:
+            release.set()
+
+    asyncio.run(exercise())
+
+
+def test_cancelled_store_load_cannot_restore_after_ti_is_reenabled(
+    request, monkeypatch, store_module
+):
+    _, candidate, states, clock = _pair(request.getfixturevalue("control"), monkeypatch)
+    candidate.hass.is_running = True
+    candidate._config_entry.add_update_listener = lambda callback: lambda: None
+
+    async def no_extra():
+        return None
+
+    candidate.async_get_last_extra_data = no_extra
+
+    async def exercise():
+        reading, cancelled, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        reads = []
+
+        async def read():
+            reads.append(True)
+            if len(reads) > 1:
+                return {"version": 1, "plan_audit": {"unverifiable": 7}}
+            reading.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                await release.wait()
+            return {"version": 1, "plan_audit": {"unverifiable": 3}}
+
+        candidate._pilot_store = SimpleNamespace(
+            async_load=read, async_delay_save=lambda *args: None
+        )
+        setup = asyncio.create_task(candidate.async_added_to_hass())
+        try:
+            done, _ = await asyncio.wait({setup}, timeout=1)
+            assert setup in done, "Store read blocked entity setup"
+            setup.result()
+            await asyncio.wait_for(reading.wait(), 1)
+            task = candidate._pilot_store_load_task
+            entry = candidate._config_entry
+            entry.options["thermal_intelligence_enabled"] = False
+            await candidate.async_options_update_listener(candidate.hass, entry)
+            await asyncio.wait_for(cancelled.wait(), 1)
+            entry.options["thermal_intelligence_enabled"] = True
+            clock[0] += timedelta(minutes=8)
+            _report(states, clock, unit_of_measurement="°C")
+            await candidate.async_options_update_listener(candidate.hass, entry)
+            assert len(candidate.hass.services.calls) == 2
+            assert candidate._pilot_store_load_task is task
+            release.set()
+            await asyncio.wait_for(task, 1)
+            assert not candidate._plan_audit_loaded
+            assert candidate._pilot_persisted is None
+
+            clock[0] += timedelta(minutes=8)
+            _report(states, clock, unit_of_measurement="°C")
+            await asyncio.wait_for(candidate.async_update(), 1)
+            await asyncio.wait_for(candidate._pilot_store_load_task, 1)
+            assert len(candidate.hass.services.calls) == 4
+            assert candidate._plan_audit.plan_unverifiable == 7
+        finally:
+            release.set()
+            await setup
+
+    asyncio.run(exercise())

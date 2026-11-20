@@ -106,6 +106,7 @@ _RESTORE_BRAKE_RAMP = "brake_ramp"
 _RESTORE_BRAKE_LAST_T = "brake_last_t"
 _RESTORE_BRAKE_LAST_EXPENSIVE_T = "brake_last_expensive_t"
 _RESTORE_WAS_BRAKING = "was_braking_last_cycle"
+_PILOT_UNLOAD_WRITES = f"{DOMAIN}.pilot_unload_writes"
 
 _PASSIVE_HEATPUMP_OPTIONS = frozenset(
     {
@@ -207,6 +208,7 @@ class PumpSteerSensor(RestoreEntity):
         self._plan_audit = ForecastAudit()
         self._plan_audit_loaded = False
         self._pilot_store_read_failed = False
+        self._pilot_store_load_task: asyncio.Task | None = None
         self._plan_cycle_identity = None
         self._pilot_persisted = None
         self._pilot_sources = None
@@ -587,8 +589,6 @@ class PumpSteerSensor(RestoreEntity):
         self._temperature_unloaded = False
         await super().async_added_to_hass()
         self._setup_power_telemetry()
-        if self._cfg().get("thermal_intelligence_enabled") is True:
-            await self._load_pilot_store()
 
         self._remove_update_listener = self._config_entry.add_update_listener(
             self.async_options_update_listener
@@ -690,6 +690,8 @@ class PumpSteerSensor(RestoreEntity):
             self._thermal_model.restore_adaptive(adaptive_saved.get("evidence"))
 
         self._attributes["adaptive_braking"] = dict(self._adaptive_braking)
+        if self._cfg().get("thermal_intelligence_enabled") is True:
+            self._schedule_pilot_store_load()
 
         # Wait until Home Assistant is fully started before the first real update.
         # If HA is already running (for example on reload), update immediately.
@@ -704,6 +706,7 @@ class PumpSteerSensor(RestoreEntity):
     async def async_will_remove_from_hass(self) -> None:
         """Cancel options update listener on unload."""
         self._temperature_unloaded = True
+        self._cancel_pilot_store_load()
         alarm_task = getattr(self, "_heatpump_alarm_task", None)
         if alarm_task is not None:
             alarm_task.cancel()
@@ -719,12 +722,12 @@ class PumpSteerSensor(RestoreEntity):
             await asyncio.gather(fit_task, return_exceptions=True)
         self._input_temperatures = {}
         async_dispatcher_send(self.hass, self._input_temperature_signal)
-        if self._cfg().get("thermal_intelligence_enabled") is True:
+        if self._pilot_store_ready():
             try:
-                self._thermal_intelligence.suspend("unload", dt_util.now())
-                self._plan_audit.cancel_plans("unload")
-                await self._save_pilot_store()
-                await self._flush_pilot_store()
+                if self._cfg().get("thermal_intelligence_enabled") is True:
+                    self._thermal_intelligence.suspend("unload", dt_util.now())
+                    self._plan_audit.cancel_plans("unload")
+                self._schedule_pilot_unload_write()
             except Exception:
                 _LOGGER.exception("Passive plan audit cleanup failed")
         self._stop_power_telemetry()
@@ -741,6 +744,10 @@ class PumpSteerSensor(RestoreEntity):
     ) -> None:
         """Handle updated options."""
         self._config_entry = entry
+        thermal_enabled = self._cfg().get("thermal_intelligence_enabled") is True
+        thermal_was_enabled = (
+            self._control_config.get("thermal_intelligence_enabled") is True
+        )
         control_config = {
             k: v
             for k, v in self._cfg().items()
@@ -753,21 +760,18 @@ class PumpSteerSensor(RestoreEntity):
                 await self.async_update()
             return
         self._control_config = control_config
-        if (
-            self._heat_operation is not None
-            and self._cfg().get("thermal_intelligence_enabled") is True
-        ):
+        if thermal_was_enabled:
             try:
-                await self._save_pilot_store()
-                await self._flush_pilot_store()
-            except Exception:
-                _LOGGER.exception("Passive heat history cleanup failed")
-        if self._cfg().get("thermal_intelligence_enabled") is not True:
-            try:
-                self._plan_audit.cancel_plans("disabled")
-                await self._save_pilot_store()
-                await self._flush_pilot_store()
-                self._pilot_store = None
+                if not thermal_enabled:
+                    self._cancel_pilot_store_load()
+                    if self._pilot_store_ready():
+                        now = dt_util.now()
+                        self._thermal_intelligence.suspend("disabled", now)
+                        self._plan_audit.cancel_shared("disabled", now)
+                    self._plan_audit.cancel_plans("disabled")
+                payload = self._pilot_checkpoint_payload()
+                if payload is not None:
+                    self._pilot_store.async_delay_save(lambda: payload, 0)
             except Exception:
                 _LOGGER.exception("Passive plan audit cleanup failed")
         self._setup_power_telemetry()
@@ -787,10 +791,10 @@ class PumpSteerSensor(RestoreEntity):
         self._pilot_plan = self._unavailable_pilot_plan("options_changed")
         self._pilot_plan_next = None
         self._pilot_weather_raw = None
-        self._pilot_restore = None
+        self._pilot_restore = self._pilot_persisted if thermal_enabled else None
         self._pilot_saved = None
-        if self._cfg().get("thermal_intelligence_enabled") is True:
-            await self._load_pilot_store()
+        if thermal_enabled and not self._plan_audit_loaded:
+            self._schedule_pilot_store_load()
         if self._update_in_progress:
             self._options_update_pending = True
             return
@@ -1159,6 +1163,8 @@ class PumpSteerSensor(RestoreEntity):
             checkpoint = getattr(self, "_thermal_store_last_at", None)
             thermal["last_checkpoint_requested_at"] = checkpoint.isoformat() if checkpoint else None
             thermal["store_read_failed"] = self._pilot_store_read_failed
+            load = self._pilot_store_load_task
+            thermal["store_loading"] = load is not None and not load.done()
             try:
                 thermal_audit = self._plan_audit.fixed_summary(self._fixed_audit_identity(self._cfg()))
             except Exception:
@@ -1322,10 +1328,11 @@ class PumpSteerSensor(RestoreEntity):
         outdoor: Optional[float],
         now: datetime,
     ) -> None:
-        try:
-            self._thermal_intelligence.suspend("safe_mode", now)
-        except Exception:
-            _LOGGER.debug("Thermal Intelligence suspension failed", exc_info=True)
+        if self._pilot_store_ready():
+            try:
+                self._thermal_intelligence.suspend("safe_mode", now)
+            except Exception:
+                _LOGGER.debug("Thermal Intelligence suspension failed", exc_info=True)
         self._control_modifier_state = None
         self._adaptive_braking = {
             "state": "base",
@@ -1390,7 +1397,10 @@ class PumpSteerSensor(RestoreEntity):
                 "last_updated": now.isoformat(),
                 "receiver_state": "unverified",
             }
-        if self._cfg().get("thermal_intelligence_enabled") is True:
+        if (
+            self._cfg().get("thermal_intelligence_enabled") is True
+            and self._pilot_store_ready()
+        ):
             try:
                 self._plan_audit.cancel_plans("safe_mode")
                 await self._save_pilot_store()
@@ -1714,6 +1724,7 @@ class PumpSteerSensor(RestoreEntity):
                     output_observer=(
                         self._record_thermal_output
                         if self._cfg().get("thermal_intelligence_enabled") is True
+                        and self._pilot_store_ready()
                         else None
                     ),
                 )
@@ -1729,6 +1740,11 @@ class PumpSteerSensor(RestoreEntity):
             self._attributes["receiver_state"] = "unverified"
 
     def _record_thermal_output(self, event) -> None:
+        if (
+            self._temperature_unloaded
+            or self._cfg().get("thermal_intelligence_enabled") is not True
+        ):
+            return
         try:
             self._thermal_intelligence.record_output(event)
         except Exception:
@@ -2695,7 +2711,11 @@ class PumpSteerSensor(RestoreEntity):
             "outdoor_active": identity[1],
             "physical_measurement_time": "unknown",
         }
-        if cfg.get("thermal_intelligence_enabled") is True:
+        thermal_enabled = cfg.get("thermal_intelligence_enabled") is True
+        if thermal_enabled and not self._pilot_store_ready():
+            self._schedule_pilot_store_load()
+        self._plan_cycle_identity = None
+        if thermal_enabled and self._pilot_store_ready():
             try:
                 if indoor is None or outdoor is None:
                     self._plan_audit.cancel_shared("temperature_unavailable", now)
@@ -2705,7 +2725,7 @@ class PumpSteerSensor(RestoreEntity):
                         self._temperature_state(cfg, "indoor_temp_entity"),
                         self._fixed_audit_identity(cfg),
                     )
-                await self._save_pilot_store()
+                    self._plan_cycle_identity = self._plan_current_identity(cfg)
             except Exception:
                 self._plan_audit.cancel_shared("fixed_audit_error", now)
                 _LOGGER.debug("Passive fixed-horizon audit unavailable", exc_info=True)
@@ -2713,8 +2733,6 @@ class PumpSteerSensor(RestoreEntity):
             "indoor_temperature": indoor,
             "outdoor_temperature": outdoor,
         }
-        if cfg.get("thermal_intelligence_enabled") is True:
-            self._plan_cycle_identity = self._plan_current_identity(cfg)
         target = self._helper_value_with_fallback(
             helper_key="target_temperature",
             cfg=cfg,
@@ -4022,7 +4040,10 @@ class PumpSteerSensor(RestoreEntity):
                 ("real_outdoor_entity", "outdoor_temperature"),
             )
         }
-        if cfg.get("thermal_intelligence_enabled") is True:
+        collect = (
+            cfg.get("thermal_intelligence_enabled") is True and self._pilot_store_ready()
+        )
+        if collect:
             try:
                 self._thermal_intelligence.begin_cycle(
                     self._thermal_cycle(
@@ -4044,7 +4065,11 @@ class PumpSteerSensor(RestoreEntity):
             cfg,
             expected,
         )
-        if cfg.get("thermal_intelligence_enabled") is True:
+        if (
+            collect
+            and not self._temperature_unloaded
+            and self._cfg().get("thermal_intelligence_enabled") is True
+        ):
             try:
                 self._update_shared_thermal_audit(now, cfg)
             except Exception:
@@ -4059,8 +4084,6 @@ class PumpSteerSensor(RestoreEntity):
                 self._thermal_intelligence._fit_in_progress = False
                 _LOGGER.debug("Passive thermal fit scheduling failed", exc_info=True)
             try:
-                if self._pilot_store_read_failed:
-                    await self._load_pilot_store()
                 if self._temperature_inputs_match(cfg, expected):
                     self._observe_plan_outcomes(cfg, dt_util.now())
                     # Keep heat/price diagnostics, retire the separate live
@@ -4352,37 +4375,76 @@ class PumpSteerSensor(RestoreEntity):
             self.hass, entity_ids, changed
         )
 
+    def _start_pilot_store_task(self, work, operation):
+        """Run Store work outside the Home Assistant startup and unload barriers."""
+        name = f"pumpsteer_store_{operation}_{self._config_entry.entry_id}"
+        try:
+            start = getattr(self.hass, "async_create_background_task", None)
+            if start is not None:
+                return start(work, name, eager_start=False)
+            return getattr(self.hass, "async_create_task", asyncio.create_task)(work)
+        except Exception:
+            work.close()
+            raise
+
+    def _pilot_store_ready(self) -> bool:
+        return not self._pilot_store_read_failed and (
+            self._pilot_store_load_task is None or self._plan_audit_loaded
+        )
+
+    def _schedule_pilot_store_load(self) -> None:
+        task = self._pilot_store_load_task
+        if self._temperature_unloaded or (task is not None and not task.done()):
+            return
+        try:
+            self._pilot_store_load_task = self._start_pilot_store_task(
+                self._load_pilot_store(), "load"
+            )
+        except Exception:
+            self._pilot_store_read_failed = True
+            _LOGGER.warning(
+                "Passive thermal history load could not be scheduled", exc_info=True
+            )
+
+    def _cancel_pilot_store_load(self) -> None:
+        task = self._pilot_store_load_task
+        if task is not None and not task.done():
+            task.cancel()
+
     async def _load_pilot_store(self):
         """Restore only historical model evidence, never a fresh measurement."""
         try:
-            from homeassistant.helpers.storage import Store
-
+            writes = getattr(self.hass, "data", {}).get(_PILOT_UNLOAD_WRITES, {})
+            previous = writes.get(self._config_entry.entry_id)
+            if previous is not None:
+                # A replacement sensor starts Base while only its Store reader waits.
+                await asyncio.shield(previous)
             if self._pilot_store is None:
-                self._pilot_store = Store(
-                    self.hass, 1, f"pumpsteer.pilot.{self._config_entry.entry_id}"
-                )
-            try:
-                saved = await self._pilot_store.async_load()
-            except Exception:
-                saved = None
-                self._pilot_store_read_failed = (
-                    self._pilot_store_read_failed or self._pilot_persisted is None
-                )
-                _LOGGER.warning(
-                    "Passive thermal history could not be read", exc_info=True
-                )
-            else:
-                self._pilot_store_read_failed = False
-                if saved is not None and (
-                    not isinstance(saved, dict) or saved.get("version") != 1
-                ):
-                    # Do not replace a payload written by an unknown version.
-                    self._pilot_store_read_failed = True
-            if self._pilot_store_read_failed:
+                from homeassistant.helpers.storage import Store
+
+                key = f"pumpsteer.pilot.{self._config_entry.entry_id}"
+                try:
+                    self._pilot_store = Store(
+                        self.hass, 1, key, serialize_in_event_loop=False
+                    )
+                except TypeError:
+                    self._pilot_store = Store(self.hass, 1, key)
+            saved = await self._pilot_store.async_load()
+            task = asyncio.current_task()
+            if (
+                self._temperature_unloaded
+                or self._cfg().get("thermal_intelligence_enabled") is not True
+                or (task is not None and task.cancelling())
+            ):
                 return
-            if isinstance(saved, dict) and saved.get("version") == 1:
-                if self._pilot_persisted is None:
-                    self._pilot_persisted = saved
+            if saved is not None and (
+                not isinstance(saved, dict) or saved.get("version") != 1
+            ):
+                # Keep payloads produced by an unknown Store version on disk.
+                self._pilot_store_read_failed = True
+                return
+            if saved is not None and self._pilot_persisted is None:
+                self._pilot_persisted = saved
             if (
                 isinstance(self._pilot_persisted, dict)
                 and self._pilot_persisted.get("version") == 1
@@ -4409,43 +4471,76 @@ class PumpSteerSensor(RestoreEntity):
                             self._pilot_persisted.get("plan_audit"), dt_util.now()
                         )
             self._plan_audit_loaded = True
+            self._pilot_store_read_failed = False
         except Exception:
+            self._pilot_store_read_failed = True
             self._pilot_restore = None
             _LOGGER.warning(
                 "Passive thermal history could not be restored", exc_info=True
             )
 
-    async def _flush_pilot_store(self):
-        """Finish any pending history write before this instance is discarded."""
+    def _pilot_checkpoint_payload(self):
+        if self._pilot_store is None or not self._pilot_store_ready():
+            return None
+        if self._pilot_persisted is None and not self._thermal_intelligence.has_evidence:
+            return None
+        payload = {
+            **(self._pilot_persisted or {}),
+            "version": 1,
+            "plan_audit": self._plan_audit.export_plan(),
+        }
         if (
-            not self._pilot_store_read_failed
-            and self._pilot_store is not None
-            and self._pilot_persisted is not None
+            self._heat_operation is not None
+            and self._heat_operation_signature is not None
         ):
-            if (
-                self._heat_operation is not None
-                and self._heat_operation_signature is not None
-            ):
-                payload = dict(self._pilot_persisted)
-                payload["heat_operation"] = {
-                    "sources": list(self._heat_operation_signature),
-                    "samples": self._heat_operation.export(),
-                }
-                self._pilot_persisted = payload
-            self._pilot_persisted = {
-                **self._pilot_persisted, "plan_audit": self._plan_audit.export_plan()
+            payload["heat_operation"] = {
+                "sources": list(self._heat_operation_signature),
+                "samples": self._heat_operation.export(),
             }
-            if self._thermal_intelligence.has_evidence:
-                self._pilot_persisted = {
-                    **self._pilot_persisted,
-                    "thermal_intelligence": self._thermal_intelligence.export_state(),
-                }
-            await self._pilot_store.async_save(self._pilot_persisted)
+        if self._thermal_intelligence.has_evidence:
+            payload["thermal_intelligence"] = self._thermal_intelligence.export_state()
+        self._pilot_persisted = payload
+        return payload
+
+    async def _flush_pilot_store(self):
+        """Write the final checkpoint from the background writer."""
+        if (payload := self._pilot_checkpoint_payload()) is not None:
+            await self._pilot_store.async_save(payload)
+
+    def _schedule_pilot_unload_write(self) -> None:
+        if self._pilot_store is None:
+            return
+        if getattr(self.hass, "is_stopping", False):
+            # HA cancels background tasks before firing its final-write event.
+            if (payload := self._pilot_checkpoint_payload()) is not None:
+                self._pilot_store.async_delay_save(lambda: payload, 0)
+            return
+        writes = getattr(self.hass, "data", {}).setdefault(_PILOT_UNLOAD_WRITES, {})
+        entry_id = self._config_entry.entry_id
+
+        async def write():
+            try:
+                await self._flush_pilot_store()
+            except Exception:
+                _LOGGER.exception("Passive plan audit cleanup failed")
+
+        task = self._start_pilot_store_task(write(), "unload_write")
+        writes[entry_id] = task
+
+        def forget(done):
+            if writes.get(entry_id) is done:
+                writes.pop(entry_id)
+
+        task.add_done_callback(forget)
 
     async def _save_pilot_store(self):
         """Save bounded model or plan evidence, only when it changes."""
         pilot = self._pilot
-        if self._pilot_store is None or self._pilot_store_read_failed:
+        if (
+            self._pilot_store is None
+            or self._temperature_unloaded
+            or not self._pilot_store_ready()
+        ):
             return
         # One Store file means every diagnostic update rewrites the thermal
         # payload too. Bound the whole-file checkpoint rate while it is present.
