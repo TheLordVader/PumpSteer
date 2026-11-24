@@ -1,9 +1,10 @@
 # PumpSteer 3.0 med passiv Heat Pump Pilot
 
 Pilot lär sig hur innetemperaturen reagerar under vanlig drift. Base beräknar
-och skickar styrvärden precis som i referensen `81632a4`. I demon är Thermal
-Intelligence passiv och adaptiv bromsning avstängd. Kandidaten bygger på
-`47d6b77`, där den passiva kedjan, ForecastAudit och Store-rättningen ingår.
+och skickar styrvärden. I demon är Thermal Intelligence passiv och adaptiv
+bromsning avstängd. Kandidatens integrationskod kommer från `6dd5f75` och
+innehåller ForecastAudit och Store-rättningen från `47d6b77`. Base jämförs
+mot `81632a4`.
 
 ## Från värmesignal till jämförbar prognos
 
@@ -27,9 +28,10 @@ bryter pågående intervall. Kommandokalibreringen har fortfarande en GOS-spärr
 kräver separat verifierad mottagardata. [Intervallhantering](../custom_components/pumpsteer/pilot_passive.py)
 
 Den rapporterade värmeandelen beskriver drift eller belastning. En separat
-värmemätning behövs för att uttrycka levererad värme i kW. Förutsättningarna för
-att lära sig husets respons är minst 24 kvalificerade träningstimmar och
-tillräcklig variation. Base kan användas utan värmetelemetri.
+värmemätning behövs för att uttrycka levererad värme i kW. Pilot behöver minst
+24 kvalificerade träningstimmar och tolv avslutade intervall i modellens
+72-timmarsfönster. Väder och värme måste variera så att deras bidrag kan
+skiljas åt. Base kan användas utan värmetelemetri.
 
 ### Frivilliga signaler från värmepumpen
 
@@ -65,7 +67,10 @@ driften diagnostiskt. Den tidsatta intensiteten hålls då otillgänglig för Pi
 ## Kör demonstrationen lokalt
 
 Testerna använder syntetiska givare och mottagare. De körs från kandidatens
-arbetskopia i en separat Python 3.14.10-miljö och behöver ingen HA-server.
+arbetskopia i en separat Python 3.14.10-miljö och behöver ingen HA-server,
+produktionskonfiguration eller driftlogg.
+Använd en Git-klon med full historik för regressionssviten. Tre tester läser
+den äldre Base-referensen `b273afc` med `git show`.
 
 ```sh
 python -m pip install 'homeassistant==2026.11.2' 'pytest==9.2.0' \
@@ -74,47 +79,88 @@ python -B -m pytest -vv -o asyncio_default_fixture_loop_scope=function \
   tests/test_passive_pilot_house.py \
   tests/test_pilot_response_evidence.py \
   tests/test_thermal_passive_faults.py
+python -B tests/probes/check_passive_pilot_native_ha.py
 python -B tests/probes/check_configure_native_ha.py
 python -B -m pytest tests/ -q -o asyncio_default_fixture_loop_scope=function
 ```
 
-| Prov | Vad som verifieras |
-|---|---|
-| `on-off` och `inverter` | Med och utan GOS används 25 syntetiska träningstimmar per fall. En senare observation bildar ett prognospar. Inverterfallet växlar mellan 20 och 80 % utan att stanna. |
-| Kontinuerlig binär värmesignal | För liten variation ger `gain_frozen`. |
-| Asynkrona rapporter | Ändringar mellan kontrollcykler bevaras. Gamla eller återpublicerade mätningar och luckor ger ingen falsk värmehistorik. |
-| GOS och kommandokalibrering | Husmodellen samlar med enbart GOS. Byte av transport eller misslyckat GOS-utskick bryter intervallet. GOS-händelser kvalificerar aldrig kommandokalibreringen. |
-| Base och Store | Identiska styrvärden och tjänsteanrop med och utan passiv TI. Långsam läsning, återförsök eller avslutande lagring håller endast tillbaka den passiva kedjan. |
+Core-provet följer 52 syntetiska timmar per värmepumpstyp, från HA:s
+temperatur- och värmerapporter till modellpassning och frysta prognospar.
+Varmvatten, saknad aktualitet och för gammalt driftläge blockerar lärande i
+berörda intervall. Provet kontrollerar att prognosen använder den frysta
+kurvan vid observationens faktiska tidpunkt och att modellens träningsdata
+föregår prognosen.
 
-Demokandidaten passerade 1 749 regressionstester. I ett separat syntetiskt Core-prov gav
-åtta kontrollcykler samma PI-, broms- och SAFE-resultat och samma 16 Ohmigo- och
-GOS-anrop som `81632a4`.
+| Syntetiskt system | Avslutade intervall | Passningsstatus | Pilot–referenspar vid 30 / 60 / 120 min | Matchande Ohmigo-/GOS-anrop med TI av/på |
+|---|---:|---|---:|---:|
+| Till/från | 45 | `learning` | 6 / 6 / 4 | 1 070 |
+| Inverter | 42 | `learning` | 7 / 8 / 3 | 1 070 |
+
+Regressionssviten innehåller 1 760 tester. Den täcker bland annat otillräcklig
+variation (`gain_frozen`), GOS utan Ohmigo, transportbyten, gamla och sena
+rapporter samt blockerad Store. Configure-provet täcker sparlogiken för alla
+94 fält i HA Core 2026.11.2. En separat syntetisk jämförelse mot `81632a4`
+kontrollerar åtta cykler med PI, prisbromsning och SAFE samt 16 utskick.
 
 ## Vad som återstår att belägga
 
-Verklig drift har gett observationer av driftläge och belastning. Det befintliga
-fältunderlaget saknar kvalificerade Pilot-intervall och oberoende prognospar för
-den här modellen. Prognosnytta mot referensen återstår att visa. ForecastAudit
-bedömer accepterade temperaturändringar. Resultatet beskriver den täckta delen
-av driften. Verklig drift måste visa att källan kan skilja rumsvärme från andra
-lägen och att Pilot slår referensen på senare, oberoende utfall.
+Det befintliga fältunderlaget saknar kvalificerade Pilot-intervall och
+oberoende prognospar för den här modellen. Verklig drift behöver visa att
+källan kan skilja rumsvärme från andra lägen och att Pilot slår referensen
+på senare, oberoende utfall. ForecastAudit utvärderar accepterade
+temperaturändringar. Rapportera därför täckning och bortfall tillsammans
+med prognosfelet.
 
-I Store-provet kunde kandidaten läsa gemensam historik och ett äldre prognospar.
-`81632a4` kunde läsa den gemensamma historiken ur kandidatens Store. Den nya
-Pilot-kurvan kräver kandidatkoden, så spara kopior av Store från båda revisionerna
-vid en eventuell återgång.
+## Passivt fältprov och återgång
+
+1. **Kvalificera en källa.** Bekräfta värmesignalens innebörd, enhet, källtid
+   och giltighet under naturlig modulering eller cykling samt varmvatten och
+   stopp. Vid okänd aktualitet återstår källverifiering före fältprovet.
+2. **Förbered installation och stopp.** Kontrollera faktisk HA Core-version
+   och integrationsfiler. Ta en verifierad backup av integrationen, dess
+   konfiguration och PumpSteers Store utanför `custom_components`. Bind
+   installations- och provrutinen till basens och kandidatens fulla SHA.
+   Verifiera stopp vid deadline, återförsök, manuell reservrutin och återgång
+   i isolerad miljö. Sätt en sluttid och använd en övervakare.
+3. **Bekräfta passivitet.** Börja med TI och adaptiv bromsning av. Följ
+   ordinarie styrvärden och, om de finns, Relay Guard och mottagarens värden.
+   Efter separat godkänd TI-start ska multiplikatorn vara 1,0 och
+   `passive_field_trial_safe` sann. `legacy_adaptive_enabled`,
+   `legacy_adaptive_return_pending`, `active_control` och `fit_trusted`
+   ska vara falska. Bekräfta att nästa Store-checkpoint lyckas.
+4. **Följ naturlig drift.** Arkivera privat före historikrotation. Räkna
+   kvalificerade timmar och avslutade intervall, följ passningsstatus och
+   redovisa bortfall med orsak. Notera kända externa värmekällor och avbrott
+   i utvärderingen med de tidsgränser som faktiskt går att belägga. Jämför
+   Pilot och referensen på samma senare observationer per horisont och
+   modellrevision, med antal separata episoder och absolutfel.
+5. **Verifiera avslut.** Stoppa vid sluttiden eller tidigare vid styravvikelse,
+   lagringsfel eller problematisk belastning. Journalför stoppbegäran,
+   sparad avstängning och verifierat avstängd runtime var för sig. Vid
+   åtkomstbortfall gäller återförsök eller manuell reservrutin. Kontrollera
+   båda flaggorna, multiplikatorn och normal styrning. Ett normalt provslut
+   kräver bara avstängning av TI.
+6. **Återgå vid kandidatfel.** Spara kandidatens Store och provunderlag
+   privat före återställning. Återställ verifierade integrationsfiler,
+   PumpSteers egna inställningar och dess tidigare Store från backupen.
+   Kontrollera efter en separat godkänd start att integrationen är laddad,
+   båda funktionerna är avstängda och Base styr normalt.
+
+I det isolerade Store-provet läste kandidaten råhistorik och ett sparat
+Pilot-par. `81632a4` läste råhistoriken ur kandidatens Store. Behåll alltid
+kandidatkopian eftersom den äldre revisionen saknar stöd för Pilot-paren.
 
 ## Kopplingen till Johans v2.3.0
 
-Båda använder HA-domänen `pumpsteer`. En gemensam version behöver en kodbas.
-Grundreglagen kan återanvändas via befintliga entitets-ID:n och panelens
-registeruppslagning. I ett isolerat Configure-prov bevarades `show_panel` och
-`savings_kwh_per_c_hour` vid sparning.
-
-En senare port av panelen behöver anpassa prisplan, förklaringar och inställningar
-till vårt Configure-flöde och våra sensorattribut. Panelens skrivande reglage och
-besparingsuppskattning behöver granskas var för sig. Prioritera hjälptexter och
-driftförklaringar. Kandidaten använder sitt nuvarande HA-formulär. [v2.3.0-koden](https://github.com/JohanAlvedal/PumpSteer/tree/v2.3.0/custom_components/pumpsteer)
+Båda använder HA-domänen `pumpsteer`. Johans panel slår upp entiteter via
+config entry och entitetsregistret och ändrar värden via HA:s tjänster för
+nummer, brytare och datum. Börja en eventuell senare anpassning med
+hjälptexter och visning av drift. Skrivande reglage, prisplanens attribut och
+besparingsberäkningen behöver var sin kompatibilitetskontroll mot den kodbasen.
+Kandidaten använder sitt nuvarande HA-formulär.
+[Panelregistrering](https://github.com/JohanAlvedal/PumpSteer/blob/1011e5de6ab737f8c0832af501b4ddf1b157635b/custom_components/pumpsteer/panel.py) ·
+[Reglage](https://github.com/JohanAlvedal/PumpSteer/blob/1011e5de6ab737f8c0832af501b4ddf1b157635b/custom_components/pumpsteer/frontend/pumpsteer-panel.js) ·
+[Besparingsberäkning](https://github.com/JohanAlvedal/PumpSteer/blob/1011e5de6ab737f8c0832af501b4ddf1b157635b/custom_components/pumpsteer/savings.py)
 
 ## Beroenden och licenser
 
