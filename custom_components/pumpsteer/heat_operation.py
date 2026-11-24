@@ -86,12 +86,14 @@ class HeatOperation:
             return None
         observed = report.source_observed_at or report.reported_at
         mode_deadlines = []
-        for source, blocks, mode_source in (
-            (water, 1, True), (radiator, 0, True), (compressor, 0, False)
+        for source, blocks, mode_source, require_time in (
+            (water, 1, True, True),
+            (radiator, 0, True, intensity),
+            (compressor, 0, False, False),
         ):
-            # A selected mode is part of the provenance of a modulation sample.
-            # A self-contained on/off heat indicator needs no supporting inputs.
-            required = intensity and mode_source and source is not None
+            # A selected hot-water guard must be known for both heat inputs.
+            # A self-contained binary heat indicator needs no extra sensors.
+            required = require_time and source is not None
             context = PilotPassive.input_report(
                 source, now, timestamp_attribute=timestamp_attribute,
                 reported_after=reported_after, allow_report_only=not required,

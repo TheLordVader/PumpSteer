@@ -263,6 +263,13 @@ class ThermalIntelligence:
                 and all(row["qualified"] and _timestamp(row["at"]) <= now < _timestamp(row["valid_until"])
                         for row in self._pilot_inputs.values()))
 
+    def pilot_learning_progress(self, now):
+        """Report progress from the shared learner and require live input coverage."""
+        count = len(self._pilot_intervals)
+        if not self.pilot_inputs_valid(now):
+            return count, "heat_signal_unavailable"
+        return count, self._pilot_fit.get("status") or "insufficient_history"
+
     def collect_pilot_house(self, now):
         """Close at a distinct observed indoor endpoint, using only prior evidence."""
         if not self.pilot_only or not self.pilot_inputs_valid(now):

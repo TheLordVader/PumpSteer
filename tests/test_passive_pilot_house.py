@@ -176,6 +176,18 @@ def test_dated_intensity_rejects_unqualified_selected_mode(role, mode, source_ti
     ) is None
 
 
+@pytest.mark.parametrize("source_time", [None, time(800)])
+def test_selected_hot_water_mode_cannot_be_unknown_for_binary_duty(source_time):
+    at = time(1200)
+    heat = _state("on", at)
+    water = _state("off", at, changed=time(1100))
+    if source_time is not None:
+        water.attributes["measurement_time"] = source_time
+    assert HeatOperation.learning_report(
+        at, heat, water=water, allow_report_only=True
+    ) is None
+
+
 def test_dated_heat_report_keeps_both_clocks_and_rejects_a_pre_restart_sample():
     at, observed = time(1200), time(1198)
     heat = _state("off", at)
@@ -460,7 +472,12 @@ def test_runtime_fits_pilot_and_scores_a_later_observation_in_the_controller_aud
     )
 
     runtime = ThermalIntelligence(pilot_only=True)
-    sensor, _, _ = request.getfixturevalue("control")
+    sensor, _, clock = request.getfixturevalue("control")
+    sensor._config_entry.options.update(
+        thermal_intelligence_enabled=True,
+        thermal_detection_method="verified",
+        thermal_heat_activity_entity=heat_source,
+    )
     sensor._thermal_intelligence = runtime
     indoor = 20.0
     for hour in range(26):
@@ -495,6 +512,10 @@ def test_runtime_fits_pilot_and_scores_a_later_observation_in_the_controller_aud
     assert forecast["loss"] > 0 and forecast["gain"] > 0
     assert runtime.summary()["fit_trusted"] is False
     assert runtime.summary()["active_control"] is False
+    clock[0] = end
+    attrs = sensor.extra_state_attributes
+    assert attrs["thermal_intelligence_learning_intervals"] == 25
+    assert attrs["thermal_intelligence_status"] == "learning"
 
     sensor._update_shared_thermal_audit(end, sensor._cfg())
     issued = sensor._plan_audit.fixed_pending

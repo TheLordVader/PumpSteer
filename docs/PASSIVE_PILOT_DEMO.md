@@ -36,6 +36,9 @@ tillräcklig variation. Base kan användas utan värmetelemetri.
 - En till/från-pump kan använda en verifierad binär signal som skiljer aktiv
   rumsvärme från verifierat stopp. Lämna signalen otillgänglig under varmvatten,
   avfrostning och okänd drift. Kompressorstatus ensam skiljer inte de lägena.
+  En självständig binär källa kan använda HA:s rapporttid i läget Verifierad
+  när färska rapporter och bortfall är belagda. En signal som bara meddelar
+  värdebyten ger ingen ny täckning under en längre tyst period.
 - För en inverter används den befintliga verifierade rumsvärmesignalen i procent.
   En källa med verifierad frekvens eller inverterineffekt kan lämna den andelen
   genom att beräkna `100 × värde / fast verifierad referens` i samma enhet.
@@ -43,12 +46,12 @@ tillräcklig variation. Base kan användas utan värmetelemetri.
   `measurement_time` och ge varje ändrad källa eller referens ett eget entitets-ID.
   Använd noll för verifierat stopp och markera saknad, motstridig eller okänd
   information som otillgänglig. Råa Hz och W accepteras inte som värmeandel.
-- Ett separat valt radiator- eller varmvattenläge måste ha giltig källtid när
-  Pilot använder en procentkälla. En sådan observation upphör att gälla senast
+- Ett separat valt varmvattenläge måste ha giltig källtid för båda indatatyperna.
+  Ett valt radiatorläge har samma krav för procentkällan. En observation upphör att gälla senast
   när den äldsta av de relevanta uppgifterna når den befintliga femminutersgränsen.
-  En färsk HA-rapport kan inte förnya en gammal källtid. Befintlig råhistorik och
-  färdiga prognospar bevaras, medan en tidigare passning med samma procentkälla
-  och en nu vald lägeskontroll får kvalificeras på nytt.
+  En färsk HA-rapport kan inte förnya en gammal källtid. Råhistorik och färdiga
+  prognospar bevaras. Passningen börjar om när samma värmekälla får ett nytt
+  krav på en separat lägessignals källtid.
 - Verifierad inverterineffekt med enheten W eller kW kan även användas för
   befintlig energidiagnostik inom den mätningens omfattning. Frekvens, elektrisk
   ineffekt och total eleffekt från en separat elmätare är olika signaler.
@@ -72,7 +75,7 @@ python -B -m pytest -vv -o asyncio_default_fixture_loop_scope=function \
   tests/test_pilot_response_evidence.py \
   tests/test_thermal_passive_faults.py
 python -B tests/probes/check_configure_native_ha.py
-python -B -m pytest -q -o asyncio_default_fixture_loop_scope=function
+python -B -m pytest tests/ -q -o asyncio_default_fixture_loop_scope=function
 ```
 
 | Prov | Vad som verifieras |
@@ -83,7 +86,7 @@ python -B -m pytest -q -o asyncio_default_fixture_loop_scope=function
 | GOS och kommandokalibrering | Husmodellen samlar med enbart GOS. Byte av transport eller misslyckat GOS-utskick bryter intervallet. GOS-händelser kvalificerar aldrig kommandokalibreringen. |
 | Base och Store | Identiska styrvärden och tjänsteanrop med och utan passiv TI. Långsam läsning, återförsök eller avslutande lagring håller endast tillbaka den passiva kedjan. |
 
-Alla 1 749 regressionstester passerade. I ett separat syntetiskt Core-prov gav
+Demokandidaten passerade 1 749 regressionstester. I ett separat syntetiskt Core-prov gav
 åtta kontrollcykler samma PI-, broms- och SAFE-resultat och samma 16 Ohmigo- och
 GOS-anrop som `81632a4`.
 
