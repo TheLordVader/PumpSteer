@@ -10,7 +10,7 @@ from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from ..pilot_passive import PilotPassive
+from ..pilot_passive import PILOT_REPORT_MAX_AGE, PilotPassive
 from ..pilot_vendor.adaptive_model import AdaptiveThermalModel
 from ..pilot_vendor.learning_interval import LearningInterval
 from .rtm_core import ModelConfig, RCThermalModel, Sample
@@ -20,7 +20,6 @@ _STATE_VERSION = 2
 _MAX_RECORDS = 2048
 _MAX_GAP_MINUTES = 60.0
 _OUTDOOR_MAX_AGE = timedelta(hours=3)
-_PILOT_HEAT_MAX_AGE = timedelta(minutes=5)
 _PILOT_HISTORY_HOURS = 336
 _PILOT_SOURCE_TIME_VERSION = 1
 _COUNTER_LIMIT = 2**63 - 1
@@ -179,8 +178,9 @@ class ThermalIntelligence:
         source_key = {"heat": "pilot_heat_source", "outdoor": "outdoor_source"}.get(role)
         if source_key is None or source != self._active_cycle.get(source_key):
             return
-        age_limit = _PILOT_HEAT_MAX_AGE if role == "heat" else _OUTDOOR_MAX_AGE
-        reported, value, observed = report if report is not None else (None, None, None)
+        age_limit = PILOT_REPORT_MAX_AGE if role == "heat" else _OUTDOOR_MAX_AGE
+        reported, value, observed = report[:3] if report is not None else (None, None, None)
+        context_deadline = _timestamp(getattr(report, "context_valid_until", None))
         reported = _timestamp(reported)
         value = _number(value)
         observed_at = _timestamp(observed)
@@ -190,10 +190,14 @@ class ThermalIntelligence:
             reported is None or reported > at or value is None
             or (observed is not None and (observed_at is None or observed_at > reported))
             or not timedelta(0) <= at - age_origin < age_limit
+            or (context_deadline is not None and context_deadline <= at)
             or (intensity and (observed_at is None or not 0 <= value <= 1))
             or (role == "heat" and not intensity and value not in (0, 1))
         ):
             reported, value, observed_at = None, None, None
+        deadline = age_origin + age_limit if reported is not None else None
+        if deadline is not None and context_deadline is not None:
+            deadline = min(deadline, context_deadline)
         prior = self._pilot_inputs.get(role)
         prior_source, prior_observed = self._pilot_source_times.get(role, (None, None))
         needs_source_time = source_time_required or observed is not None or prior_source == source
@@ -202,7 +206,8 @@ class ThermalIntelligence:
                                     and observed_at <= prior_observed)
         ):
             if (observed_at == prior_observed and prior is not None and prior["qualified"]
-                    and observed_at is not None and value == prior["value"]):
+                    and observed_at is not None and value == prior["value"]
+                    and deadline >= _timestamp(prior["valid_until"])):
                 return  # A republication cannot extend this observation's validity.
             reported, value, observed_at = None, None, None
         if prior is not None:
@@ -246,7 +251,7 @@ class ThermalIntelligence:
             value=value, reported_at=reported.isoformat() if reported is not None else None,
             source_observed_at=observed_at.isoformat() if observed_at is not None else None,
             source_time_required=needs_source_time,
-            valid_until=(age_origin + age_limit).isoformat() if reported is not None else None,
+            valid_until=deadline.isoformat() if reported is not None else None,
             qualified=reported is not None, physical_time_known=False, **fields,
         )
 
@@ -257,6 +262,13 @@ class ThermalIntelligence:
                 and self._pilot_inputs.keys() >= {"outdoor", "heat"}
                 and all(row["qualified"] and _timestamp(row["at"]) <= now < _timestamp(row["valid_until"])
                         for row in self._pilot_inputs.values()))
+
+    def pilot_learning_progress(self, now):
+        """Report progress from the shared learner and require live input coverage."""
+        count = len(self._pilot_intervals)
+        if not self.pilot_inputs_valid(now):
+            return count, "heat_signal_unavailable"
+        return count, self._pilot_fit.get("status") or "insufficient_history"
 
     def collect_pilot_house(self, now):
         """Close at a distinct observed indoor endpoint, using only prior evidence."""

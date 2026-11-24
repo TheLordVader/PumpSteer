@@ -389,10 +389,26 @@ class PumpSteerSensor(RestoreEntity):
             "thermal_intelligence_operation_detail",
         ):
             attrs.pop(key, None)
-        if self._cfg().get("thermal_intelligence_enabled") is True:
+        cfg = self._cfg()
+        if cfg.get("thermal_intelligence_enabled") is True:
             interrupted = (
                 attrs.get("mode") == MODE_SAFE or attrs.get("status") == "error"
             )
+            status = self._pilot_status
+            intervals = self._pilot.house_intervals if self._pilot else 0
+            shared_learning = (
+                not interrupted and self._pilot_store_ready()
+                and self._pilot_heat_entity(cfg) is not None
+                and status != "learning_error"
+            )
+            if shared_learning:
+                intervals, observed_status = self._thermal_intelligence.pilot_learning_progress(
+                    dt_util.now()
+                )
+                if observed_status != "heat_signal_unavailable" or status not in (
+                    "hot_water_active", "hot_water_mode_unavailable"
+                ):
+                    status = observed_status
             attrs["thermal_intelligence_operating_mode"] = (
                 "unknown" if interrupted else self._pilot_operating_mode
             )
@@ -407,13 +423,13 @@ class PumpSteerSensor(RestoreEntity):
             attrs["thermal_intelligence_status"] = (
                 "suspended_safe"
                 if attrs.get("mode") == MODE_SAFE
-                else self._pilot_status
+                else status
             )
             if attrs.get("mode") == MODE_SAFE:
                 reason = "safe_mode"
             elif attrs.get("status") == "error":
                 reason = "update_error"
-            elif self._pilot_status in {
+            elif shared_learning or status in {
                 "heat_signal_not_configured",
                 "heat_signal_unavailable",
                 "temperature_report_unavailable",
@@ -421,7 +437,7 @@ class PumpSteerSensor(RestoreEntity):
                 "hot_water_mode_unavailable",
                 "history_unavailable",
             }:
-                reason = self._pilot_status
+                reason = status
             elif not self._pilot_price_forecast:
                 reason = "timestamped_price_forecast_unavailable"
             elif not self._pilot_forecast_available:
@@ -429,9 +445,7 @@ class PumpSteerSensor(RestoreEntity):
             else:
                 reason = "validated_model_and_weather_issue_time_unavailable"
             attrs["thermal_intelligence_reason"] = reason
-            attrs["thermal_intelligence_learning_intervals"] = (
-                self._pilot.house_intervals if self._pilot else 0
-            )
+            attrs["thermal_intelligence_learning_intervals"] = intervals
             plan = (
                 self._pilot_plan
                 if not interrupted
@@ -1810,6 +1824,8 @@ class PumpSteerSensor(RestoreEntity):
         self._pilot_input_entities = entities
 
     def _capture_pilot_inputs(self, now, cfg, event=None) -> None:
+        from types import SimpleNamespace
+
         from .control_intelligence import external_heat_status
         from .heat_operation import HeatOperation
         from .pilot_passive import PilotPassive
@@ -1819,11 +1835,16 @@ class PumpSteerSensor(RestoreEntity):
             return
         outdoor = self._temperature_identity(cfg)[1]
         entity = event.data.get("entity_id") if event is not None else None
+        missing = SimpleNamespace(state="unavailable")
 
         def get_state(source):
-            if source and source == entity:
-                return event.data.get("new_state")
-            return self.hass.states.get(source) if source else None
+            if not source:
+                return None
+            state = (
+                event.data.get("new_state") if source == entity
+                else self.hass.states.get(source)
+            )
+            return state if state is not None else missing
 
         runtime = self._thermal_intelligence
         cutoff = self._temperature_reported_after
@@ -1995,6 +2016,20 @@ class PumpSteerSensor(RestoreEntity):
         )
         outdoor_state = self._temperature_state(cfg, "real_outdoor_entity")
         identity = self._temperature_identity(cfg)
+        heat_source = self._pilot_heat_entity(cfg)
+        pilot_time_contract = (
+            cfg.get("control_measurement_time_attribute", "measurement_time"),
+            cfg.get("thermal_detection_method") == "verified",
+        )
+        radiator_mode = cfg.get("thermal_heating_mode_entity")
+        water_mode = cfg.get("thermal_hot_water_mode_entity")
+        if heat_source and heat_source.startswith("sensor.") and (radiator_mode or water_mode):
+            # Earlier intervals did not require this context's source time.
+            pilot_time_contract += (
+                radiator_mode, cfg.get("thermal_heating_mode_inverted") is True, water_mode,
+            )
+        elif heat_source and water_mode:
+            pilot_time_contract += (water_mode,)
         return {
             "at": at,
             "indoor": indoor,
@@ -2003,11 +2038,8 @@ class PumpSteerSensor(RestoreEntity):
             "outdoor": outdoor,
             "outdoor_reported_at": getattr(outdoor_state, "last_reported", None),
             "outdoor_source": identity[1],
-            "pilot_heat_source": self._pilot_heat_entity(cfg),
-            "pilot_time_contract": (
-                cfg.get("control_measurement_time_attribute", "measurement_time"),
-                cfg.get("thermal_detection_method") == "verified",
-            ),
+            "pilot_heat_source": heat_source,
+            "pilot_time_contract": pilot_time_contract,
             "requested_virtual_outdoor": fake_temp,
             "mode": mode,
             "brake_factor": extra.get("brake_factor", 0.0),

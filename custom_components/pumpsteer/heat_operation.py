@@ -9,7 +9,7 @@ import math
 from statistics import median
 
 from .pilot_forecast import _timestamp
-from .pilot_passive import PilotPassive
+from .pilot_passive import PILOT_REPORT_MAX_AGE, PilotPassive
 from .pilot_power_ledger import PowerLedger
 
 
@@ -85,12 +85,22 @@ class HeatOperation:
         if report is None:
             return None
         observed = report.source_observed_at or report.reported_at
-        for source, blocks, mode_source in ((water, 1, True), (radiator, 0, True), (compressor, 0, False)):
+        mode_deadlines = []
+        for source, blocks, mode_source, require_time in (
+            (water, 1, True, True),
+            (radiator, 0, True, intensity),
+            (compressor, 0, False, False),
+        ):
+            # A selected hot-water guard must be known for both heat inputs.
+            # A self-contained binary heat indicator needs no extra sensors.
+            required = require_time and source is not None
             context = PilotPassive.input_report(
                 source, now, timestamp_attribute=timestamp_attribute,
-                reported_after=reported_after, allow_report_only=True,
+                reported_after=reported_after, allow_report_only=not required,
             )
             if context is None:
+                if required:
+                    return None
                 continue
             if context.value == blocks and (mode_source or report.value > 0):
                 return None
@@ -98,6 +108,18 @@ class HeatOperation:
                 changed = _timestamp(getattr(source, "last_changed", None))
                 if changed is not None and changed > observed:
                     return None
+                if required:
+                    if (
+                        changed is None
+                        or changed > context.reported_at
+                        or context.source_observed_at is None
+                    ):
+                        return None
+                    mode_deadlines.append(
+                        context.source_observed_at + PILOT_REPORT_MAX_AGE
+                    )
+        if mode_deadlines:
+            return report._replace(context_valid_until=min(mode_deadlines))
         return report
 
     def observe(

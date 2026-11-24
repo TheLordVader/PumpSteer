@@ -1,0 +1,8 @@
+# PumpSteer – gemensamma projektregler
+
+- Utgå från den gemensamma arbetskopians gren, exakta `HEAD` och lokala ändringar. Läs [PROJECT_STATUS.md](PROJECT_STATUS.md) och [Pilotens provbeskrivning](docs/PASSIVE_PILOT_DEMO.md). Bevara opublicerat arbete, tester, återgångspunkter, licenser och källproveniens.
+- **En skrivare åt gången på den delade arbetsytan.** På projektets delade arbetsyta tilldelar administratören skrivrätt med `project-writer`. Kontrollera tilldelningen före skrivning, avsluta skrivande processer före överlämning och lämna `project-writer none` efteråt. Vid oklar tilldelning eller omonterad lagring gäller läsläge.
+- Base med PI ansvarar för regleringen. Behåll komfortgränser, Ohmigos skydd, Relay Guard och manuell eller fysisk reservrutin. Passiv Pilot och diagnostik får aldrig bli aktiv styrning. Ett tjänstekvitto är otillräckligt som bevis för fysisk åtgärd.
+- Hantera start, omladdning, föråldrat tillstånd, indatabortfall och säker återhämtning uttryckligt. Skilj verifierad rumsvärme från varmvatten, avfrostning och okänt driftläge. Bevara källtider, proveniens och säkra fallback-beteenden.
+- Kör offlineprov med syntetiska data, simulerade givare och mottagare. Verifiera berörda reglerslingor, signalförlust och återkomst samt återgång. Driftdata, privata installationsdetaljer, hemligheter, Store, loggar och backuper stannar utanför Git och den gemensamma arbetsytan.
+- Ändringar i Home Assistant eller installerad PumpSteer, utrustningskommandon, fältprov, aktivering, omstart, återställning, nya behörigheter och GitHub-publicering kräver uttryckligt GO för åtgärden. Utveckling sker i ägarens fork på avgränsade grenar. Upstream `JohanAlvedal/PumpSteer` och dess skrivskydd lämnas i fred.
