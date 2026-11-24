@@ -13,6 +13,8 @@ from .pilot_vendor.adaptive_model import AdaptiveThermalModel
 from .pilot_vendor.learning_interval import IntervalCollector
 from .pilot_vendor.learning_manager import LearningManager
 
+PILOT_REPORT_MAX_AGE = timedelta(minutes=5)
+
 
 class _PilotReport(NamedTuple):
     identity: tuple[str, str | None]
@@ -25,6 +27,7 @@ class PilotInputReport(NamedTuple):
     reported_at: datetime
     value: float
     source_observed_at: datetime | None
+    context_valid_until: datetime | None = None
 
 
 class PilotPassive:
@@ -209,7 +212,7 @@ class PilotPassive:
         temperature=False,
         intensity=False,
         reported_after=None,
-        max_age=timedelta(minutes=5),
+        max_age=PILOT_REPORT_MAX_AGE,
     ):
         if state is None or (getattr(state, "attributes", {}) or {}).get("restored"):
             return None
@@ -285,7 +288,7 @@ class PilotPassive:
         timestamp_attribute="measurement_time",
         allow_report_only=False,
         reported_after=None,
-        max_age=timedelta(minutes=5),
+        max_age=PILOT_REPORT_MAX_AGE,
         temperature=False,
         intensity=False,
     ) -> PilotInputReport | None:

@@ -1810,6 +1810,8 @@ class PumpSteerSensor(RestoreEntity):
         self._pilot_input_entities = entities
 
     def _capture_pilot_inputs(self, now, cfg, event=None) -> None:
+        from types import SimpleNamespace
+
         from .control_intelligence import external_heat_status
         from .heat_operation import HeatOperation
         from .pilot_passive import PilotPassive
@@ -1819,11 +1821,16 @@ class PumpSteerSensor(RestoreEntity):
             return
         outdoor = self._temperature_identity(cfg)[1]
         entity = event.data.get("entity_id") if event is not None else None
+        missing = SimpleNamespace(state="unavailable")
 
         def get_state(source):
-            if source and source == entity:
-                return event.data.get("new_state")
-            return self.hass.states.get(source) if source else None
+            if not source:
+                return None
+            state = (
+                event.data.get("new_state") if source == entity
+                else self.hass.states.get(source)
+            )
+            return state if state is not None else missing
 
         runtime = self._thermal_intelligence
         cutoff = self._temperature_reported_after
@@ -1995,6 +2002,18 @@ class PumpSteerSensor(RestoreEntity):
         )
         outdoor_state = self._temperature_state(cfg, "real_outdoor_entity")
         identity = self._temperature_identity(cfg)
+        heat_source = self._pilot_heat_entity(cfg)
+        pilot_time_contract = (
+            cfg.get("control_measurement_time_attribute", "measurement_time"),
+            cfg.get("thermal_detection_method") == "verified",
+        )
+        radiator_mode = cfg.get("thermal_heating_mode_entity")
+        water_mode = cfg.get("thermal_hot_water_mode_entity")
+        if heat_source and heat_source.startswith("sensor.") and (radiator_mode or water_mode):
+            # Earlier intervals did not require this context's source time.
+            pilot_time_contract += (
+                radiator_mode, cfg.get("thermal_heating_mode_inverted") is True, water_mode,
+            )
         return {
             "at": at,
             "indoor": indoor,
@@ -2003,11 +2022,8 @@ class PumpSteerSensor(RestoreEntity):
             "outdoor": outdoor,
             "outdoor_reported_at": getattr(outdoor_state, "last_reported", None),
             "outdoor_source": identity[1],
-            "pilot_heat_source": self._pilot_heat_entity(cfg),
-            "pilot_time_contract": (
-                cfg.get("control_measurement_time_attribute", "measurement_time"),
-                cfg.get("thermal_detection_method") == "verified",
-            ),
+            "pilot_heat_source": heat_source,
+            "pilot_time_contract": pilot_time_contract,
             "requested_virtual_outdoor": fake_temp,
             "mode": mode,
             "brake_factor": extra.get("brake_factor", 0.0),

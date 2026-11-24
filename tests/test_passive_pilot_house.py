@@ -73,9 +73,10 @@ def test_verified_space_heat_does_not_need_fresh_supporting_bits():
     verified = _state("on", at)
     assert HeatOperation.learning_report(at, verified) is None
     stale = _state("off", at - timedelta(minutes=30))
-    assert HeatOperation.learning_report(
+    report = HeatOperation.learning_report(
         at, verified, compressor=stale, radiator=stale, allow_report_only=True
-    ) == (at, 1, None)
+    )
+    assert (report.reported_at, report.value, report.source_observed_at) == (at, 1, None)
     assert (
         HeatOperation.learning_report(
             at, verified, compressor=_state("off", at), allow_report_only=True
@@ -89,9 +90,10 @@ def test_verified_space_heat_does_not_need_fresh_supporting_bits():
         is None
     )
     assert HeatOperation.learning_report(at, None, compressor=_state("on", at)) is None
-    assert HeatOperation.learning_report(
+    report = HeatOperation.learning_report(
         at, _state("off", at), allow_report_only=True
-    ) == (at, 0, None)
+    )
+    assert (report.reported_at, report.value, report.source_observed_at) == (at, 0, None)
 
 
 @pytest.mark.parametrize("source_time", [time(0), time(1201), "not-a-date", None])
@@ -160,12 +162,26 @@ def test_intensity_requires_a_dated_percentage_of_space_heating():
     assert HeatOperation.learning_report(at, load, intensity=True) is None
 
 
+@pytest.mark.parametrize("role,mode", [("radiator", "on"), ("water", "off")])
+@pytest.mark.parametrize("source_time", [None, time(800), time(1201)])
+def test_dated_intensity_rejects_unqualified_selected_mode(role, mode, source_time):
+    at = time(1200)
+    load = _state("35", at, unit="%")
+    load.attributes["measurement_time"] = time(1198)
+    mode = _state(mode, at, changed=time(1100))
+    if source_time is not None:
+        mode.attributes["measurement_time"] = source_time
+    assert HeatOperation.learning_report(
+        at, load, intensity=True, **{role: mode}
+    ) is None
+
+
 def test_dated_heat_report_keeps_both_clocks_and_rejects_a_pre_restart_sample():
     at, observed = time(1200), time(1198)
     heat = _state("off", at)
     heat.attributes["observed"] = observed.isoformat()
     report = HeatOperation.learning_report(at, heat, timestamp_attribute="observed")
-    assert report == (at, 0, observed)
+    assert (report.reported_at, report.value, report.source_observed_at) == (at, 0, observed)
     assert (
         HeatOperation.learning_report(
             at, heat, timestamp_attribute="observed", reported_after=time(1199)
@@ -267,6 +283,110 @@ def _inputs(
         at - timedelta(seconds=1) if heat_source.startswith("sensor.") else None
     )
     runtime.record_pilot_input(at, "heat", heat_source, (at, heat, observed_at))
+
+
+def test_selected_mode_bounds_the_load_and_a_removed_entity_breaks_coverage(control):
+    sensor, states, _ = control
+    cfg = sensor._config_entry.options
+    heat, mode = "sensor.space_heat_percent", "binary_sensor.radiator_mode"
+    cfg.update(
+        thermal_detection_method="verified",
+        thermal_heat_activity_entity=heat,
+        thermal_heating_mode_entity=mode,
+    )
+    at = time(1200)
+    states["sensor.outdoor"] = _state(5, at, unit="°C")
+    states[heat] = _state(70, at, unit="%")
+    states[heat].attributes["measurement_time"] = time(1198)
+    states[mode] = _state("on", time(1165), changed=time(1100))
+    states[mode].attributes["measurement_time"] = time(1160)
+    runtime = sensor._thermal_intelligence
+    _start_cycle(runtime, at, 20, heat_source=heat)
+    sensor._capture_pilot_inputs(at, cfg)
+
+    assert runtime.pilot_inputs_valid(time(1459))
+    assert not runtime.pilot_inputs_valid(time(1460))
+    load = next(
+        row for row in reversed(runtime.export_state()["events"])
+        if row.get("pilot_role") == "heat"
+    )
+    assert load["source_observed_at"] == time(1198).isoformat()
+    assert load["valid_until"] == time(1460).isoformat()
+
+    states[mode].last_reported = states[heat].last_reported = time(1260)
+    states[heat].attributes["measurement_time"] = time(1258)
+    sensor._capture_pilot_inputs(time(1260), cfg)
+    assert runtime.pilot_inputs_valid(time(1459))
+    assert not runtime.pilot_inputs_valid(time(1460))
+
+    del states[mode]
+    sensor._capture_pilot_inputs(time(1270), cfg)
+    assert not runtime.pilot_inputs_valid(time(1270))
+
+
+@pytest.mark.parametrize("low,high,reference", [
+    pytest.param(35, 70, 100, id="frequency-in-hz"),
+    pytest.param(1120, 2240, 3200, id="input-power-in-watts"),
+])
+def test_controller_collects_only_the_qualified_modulated_hour(control, low, high, reference):
+    sensor, states, _ = control
+    cfg = sensor._config_entry.options
+    heat, valve = "sensor.space_heat_percent", "binary_sensor.hot_water_valve"
+    cfg.update(
+        thermal_detection_method="verified",
+        thermal_heat_activity_entity=heat,
+        thermal_heating_mode_entity=valve,
+        thermal_heating_mode_inverted=True,
+    )
+    runtime = sensor._thermal_intelligence
+    outputs = list(sensor.hass.services.calls)
+
+    # Synthetic producer uses one fixed, validated scale and the source clock.
+    # A floor or cap would hide either a wrong scale or an unqualified mode.
+    for seconds in range(60, 7261, 60):
+        at = time(seconds)
+        if seconds in (60, 3660, 7260):
+            indoor = 20 + (seconds - 60) / 36000
+            states["sensor.indoor"] = _state(indoor, at, unit="°C")
+            states["sensor.outdoor"] = _state(5, at, unit="°C")
+            runtime.begin_cycle(
+                sensor._thermal_cycle(at, indoor, 5, 5, "normal", {}, cfg),
+                use_ohmigo_input=False,
+            )
+        water = 4260 <= seconds < 4860
+        last_switch = 30 if seconds < 4260 else 4250 if water else 4850
+        states[valve] = _state(
+            "on" if water else "off", at - timedelta(seconds=3),
+            changed=time(last_switch),
+        )
+        states[valve].attributes["measurement_time"] = at - timedelta(seconds=4)
+        if seconds < 960:
+            raw = low
+        elif 2760 <= seconds < 3660:
+            raw = 0
+        else:
+            raw = high
+        states[heat] = _state(100 * raw / reference, at, unit="%")
+        states[heat].attributes["measurement_time"] = at - timedelta(seconds=1)
+        sensor._capture_pilot_inputs(at, cfg)
+        if water:
+            assert not runtime.pilot_inputs_valid(at)
+        if seconds in (60, 3660, 7260):
+            runtime.collect_pilot_house(at)
+
+    intervals = runtime.export_state()["pilot_house"]["intervals"]
+    assert len(intervals) == 1
+    assert intervals[0]["heat"] == pytest.approx(0.4375)
+    assert sensor.hass.services.calls == outputs
+
+    cfg["thermal_heating_mode_inverted"] = False
+    runtime.begin_cycle(
+        sensor._thermal_cycle(time(7261), indoor, 5, 5, "normal", {}, cfg),
+        use_ohmigo_input=False,
+    )
+    history = runtime.export_state()
+    assert history["pilot_house"]["intervals"] == []
+    assert any(row.get("pilot_role") == "heat" for row in history["events"])
 
 
 def test_runtime_collects_without_serving_new_rc_and_restores_closed_house_intervals():

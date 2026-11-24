@@ -31,6 +31,34 @@ värmemätning behövs för att uttrycka levererad värme i kW. Förutsättninga
 att lära sig husets respons är minst 24 kvalificerade träningstimmar och
 tillräcklig variation. Base kan användas utan värmetelemetri.
 
+### Frivilliga signaler från värmepumpen
+
+- En till/från-pump kan använda en verifierad binär signal som skiljer aktiv
+  rumsvärme från verifierat stopp. Lämna signalen otillgänglig under varmvatten,
+  avfrostning och okänd drift. Kompressorstatus ensam skiljer inte de lägena.
+- För en inverter används den befintliga verifierade rumsvärmesignalen i procent.
+  En källa med verifierad frekvens eller inverterineffekt kan lämna den andelen
+  genom att beräkna `100 × värde / fast verifierad referens` i samma enhet.
+  Välj en belastningskälla åt gången. Bevara observationens källtid i
+  `measurement_time` och ge varje ändrad källa eller referens ett eget entitets-ID.
+  Använd noll för verifierat stopp och markera saknad, motstridig eller okänd
+  information som otillgänglig. Råa Hz och W accepteras inte som värmeandel.
+- Ett separat valt radiator- eller varmvattenläge måste ha giltig källtid när
+  Pilot använder en procentkälla. En sådan observation upphör att gälla senast
+  när den äldsta av de relevanta uppgifterna når den befintliga femminutersgränsen.
+  En färsk HA-rapport kan inte förnya en gammal källtid. Befintlig råhistorik och
+  färdiga prognospar bevaras, medan en tidigare passning med samma procentkälla
+  och en nu vald lägeskontroll får kvalificeras på nytt.
+- Verifierad inverterineffekt med enheten W eller kW kan även användas för
+  befintlig energidiagnostik inom den mätningens omfattning. Frekvens, elektrisk
+  ineffekt och total eleffekt från en separat elmätare är olika signaler.
+
+Verifiera nya givare mot utrustningens egen avläsning vid minst två naturliga
+belastningsnivåer, ett stopp och en växling mellan rumsvärme och varmvatten.
+Kontrollera att rapporteringen kan skilja nya observationer från cachade eller
+återpublicerade värden. Om den endast ger mottagningstid kan värdena beskriva
+driften diagnostiskt. Den tidsatta intensiteten hålls då otillgänglig för Pilot.
+
 ## Kör demonstrationen lokalt
 
 Testerna använder syntetiska givare och mottagare. De körs från kandidatens
